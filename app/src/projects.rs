@@ -90,21 +90,52 @@ pub fn remove(path: &Path) -> Vec<PathBuf> {
     list
 }
 
+/// Points `GITTEN_PROJECTS` at one file for the lifetime of this value, and
+/// puts whatever was there back on drop — a panicking test included. The
+/// override is one process-global variable, so the guard is the whole
+/// cleanup story: a body that unwinds cannot leak its spelling of the
+/// variable into every test that runs after it.
+#[doc(hidden)]
+pub struct EnvOverride {
+    prev: Option<std::ffi::OsString>,
+}
+
+impl EnvOverride {
+    /// Overrides the store path for as long as the guard lives.
+    pub fn set(file: &Path) -> Self {
+        let prev = std::env::var_os("GITTEN_PROJECTS");
+        std::env::set_var("GITTEN_PROJECTS", file);
+        Self { prev }
+    }
+}
+
+impl Drop for EnvOverride {
+    fn drop(&mut self) {
+        match self.prev.take() {
+            Some(prev) => std::env::set_var("GITTEN_PROJECTS", prev),
+            None => std::env::remove_var("GITTEN_PROJECTS"),
+        }
+    }
+}
+
+/// Serializes every test that redirects the store through the env override.
+///
+/// `GITTEN_PROJECTS` is one process-global variable, and this crate's own
+/// tests are not the only ones that point it somewhere: a lock shared by
+/// every redirecting test — wherever they live — is what keeps two of them
+/// from holding different overrides at once.
+#[doc(hidden)]
+pub fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    SERIAL
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
-
-    /// The store resolves its file through a process-global env var, so every
-    /// test that points it at a scratch file holds this while it runs.
-    static SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
-
-    fn serial() -> std::sync::MutexGuard<'static, ()> {
-        SERIAL
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-    }
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join("gitten-projects-tests");
@@ -115,29 +146,29 @@ mod tests {
     }
 
     /// Points `path()` at a fresh scratch file, runs `body`, then unsets the
-    /// override and removes the file. Serialized: the env var is global.
+    /// override and removes the file. Serialized: the env var is global, and
+    /// the guard is what makes that true even when `body` panics.
     fn with_scratch(name: &str, body: impl FnOnce(&Path)) {
-        let _guard = serial();
+        let _guard = env_lock();
         let file = scratch(name);
-        std::env::set_var("GITTEN_PROJECTS", &file);
+        let _override = EnvOverride::set(&file);
         body(&file);
-        std::env::remove_var("GITTEN_PROJECTS");
         let _ = std::fs::remove_file(&file);
     }
 
     #[test]
     fn the_env_override_names_the_file() {
-        let _guard = serial();
+        let _guard = env_lock();
         let file = scratch("override");
-        std::env::set_var("GITTEN_PROJECTS", &file);
+        let _override = EnvOverride::set(&file);
         assert_eq!(path(), file);
-        std::env::remove_var("GITTEN_PROJECTS");
     }
 
     #[test]
     fn without_an_override_it_lives_under_target() {
-        let _guard = serial();
-        std::env::remove_var("GITTEN_PROJECTS");
+        let _guard = env_lock();
+        let _override = EnvOverride::set(Path::new("/nonexistent/gitten-projects-mru"));
+        drop(_override);
         assert_eq!(path(), PathBuf::from("target/gitten-projects"));
     }
 

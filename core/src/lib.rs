@@ -8,14 +8,22 @@ use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Arc;
 
+pub use crate::source::DiffSource;
+
 pub mod align;
+pub mod bisect;
+pub mod clipboard;
 pub mod command;
+pub mod conflict;
 pub mod differ;
+pub mod edit;
 pub mod font;
 pub mod graph;
 pub mod host;
 pub mod markdown;
+pub mod operation;
 pub mod patch;
+pub mod patchclip;
 pub mod path;
 pub mod prepared;
 pub mod rebase;
@@ -24,10 +32,12 @@ pub mod rows;
 pub mod runs;
 pub mod search;
 pub mod select;
+pub mod source;
 pub mod status;
 pub mod syntax;
 pub mod theme;
 pub mod view;
+pub mod worktrees;
 pub mod wrap;
 
 // ---------------------------------------------------------------- commit log

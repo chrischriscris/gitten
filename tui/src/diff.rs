@@ -43,6 +43,7 @@ use crate::scrollbar::{self, Bar};
 use gitten_core::host::Host;
 use gitten_core::rows::{expand, RowRef};
 use gitten_core::runs::Run;
+use gitten_core::search::TextIndex;
 use gitten_core::select::{self, Caret, RowId, Selection, Text as _};
 use gitten_core::view::Viewport;
 use gitten_core::FileDiff;
@@ -78,6 +79,10 @@ pub struct Diff {
     /// demand is a scan of `order` per file: 5,953 files against a million rows
     /// is six billion comparisons for a keypress. One scan per reflow instead.
     headers: Vec<usize>,
+    /// Where each hunk's first row landed in `order`, ascending — the hunk
+    /// jump list, built in the same pass as the headers and under the same
+    /// rule: cached because it only moves when the order table does.
+    hunks: Vec<usize>,
     /// The width and wrap the rows were last expanded for. A resize that does
     /// not cross a column boundary compares equal here and stops.
     applied: (usize, &'static str),
@@ -100,7 +105,52 @@ pub struct Diff {
     /// True between a press and a release on the text, so a motion event that
     /// belongs to nothing does not extend a selection made minutes ago.
     dragging: bool,
+    /// The rows the keyboard marked (`select.mark`), over visual rows — the
+    /// same address the cursor uses, normalized on read.
+    marks: Option<(usize, usize)>,
+    /// True while a mark is armed and the motions extend it.
+    marking: bool,
+    /// What the hunk verbs aim at: the whole hunk under the keyboard, or the
+    /// marked lines. lazygit's `a`, and the unit the status line names.
+    line_unit: bool,
+    /// The cursor an armed destructive question was asked on, when one
+    /// stands. Any move of the keyboard disarms it — a yes addressed to a
+    /// row that is no longer under the keyboard is not a yes. See `moved`.
+    armed: Option<usize>,
     bar: Bar,
+    /// The standing search's query, kept across the reflows and layout
+    /// changes it survives — `None` when no search stands.
+    search_query: Option<String>,
+    /// The folded row texts the standing query scans, and the matches it
+    /// found. Built on the first use against the rows as they stand, and
+    /// dropped — never recomputed eagerly — whenever the rows change under
+    /// it: a layout change has no row correspondence, and a reflow moves
+    /// every break. The next keystroke against the standing query refolds
+    /// from the rows then current, which is the honest answer for a search
+    /// of text that is no longer the text it matched.
+    search: Option<Search>,
+}
+
+/// One standing search over the rows: the query, the fold, the matches.
+struct Search {
+    folded: TextIndex,
+    /// Rows (of `order`) whose text matches the query, ascending.
+    matches: Vec<usize>,
+}
+
+/// What the hunk verbs aim at, as [`Diff::patch_selection`] reports it.
+pub enum PatchSelection {
+    /// The whole hunk under the keyboard.
+    Whole {
+        path: String,
+        hunk: gitten_core::Hunk,
+    },
+    /// The marked lines, grouped per touched hunk: the hunk as drawn and
+    /// the inclusive line range marked within it.
+    Lines {
+        path: String,
+        parts: Vec<(gitten_core::Hunk, usize, usize)>,
+    },
 }
 
 /// Where every row's selectable text comes from, for [`gitten_core::select`].
@@ -149,6 +199,7 @@ impl Diff {
             order: Vec::new(),
             widest: 0,
             headers: Vec::new(),
+            hunks: Vec::new(),
             applied: (usize::MAX, ""),
             cols: 0,
             view: Viewport::new(),
@@ -158,7 +209,13 @@ impl Diff {
             file_count: 0,
             sel: None,
             dragging: false,
+            marks: None,
+            marking: false,
+            line_unit: false,
+            armed: None,
             bar: Bar::default(),
+            search_query: None,
+            search: None,
         };
         view.rebuild(host, 0.0);
         view
@@ -187,6 +244,8 @@ impl Diff {
         // The width has to be re-applied: the presentations are new objects and
         // have never been told how wide they are.
         self.applied = (usize::MAX, "");
+        // New rows: the fold is stale, and nothing here refolds eagerly.
+        self.search = None;
         self.view.set_len(self.order.len());
         self.view.go_to_fraction(at);
         self.reflow(host);
@@ -235,6 +294,9 @@ impl Diff {
         self.order = built.order;
         self.widest = built.widest;
         self.index_headers();
+        // The rows moved under any standing search: the fold is stale, and
+        // the query is kept — the next keystroke refolds from what stands.
+        self.search = None;
         self.view.set_len(self.order.len());
         self.view.go_to(built.anchor);
         // Every caret caches the visual rows its line occupies, and a reflow
@@ -272,6 +334,33 @@ impl Diff {
                 self.headers.push(at);
             }
         }
+        self.index_hunks();
+    }
+
+    /// Where every hunk's first row is, in visual rows, ascending — the jump
+    /// list `diff.next-hunk`/`diff.prev-hunk` walk. Built beside the headers
+    /// in the same pass over `order`, and the same honesty applies: a
+    /// presentation whose hunk map answers nothing offers no jumps rather
+    /// than wrong ones, and an extension's presentation needs nothing but a
+    /// [`gitten_core::rows::Flat`] with exact spans.
+    fn index_hunks(&mut self) {
+        self.hunks.clear();
+        let mut standing: Option<(u16, usize, usize)> = None;
+        for (at, r) in self.order.iter().enumerate() {
+            let Some(rows) = self.owners.get(r.owner as usize) else {
+                continue;
+            };
+            let Some((file, hunk)) = rows.hunk_at(r.index as usize) else {
+                continue;
+            };
+            // A hunk begins where its (file, hunk) pair first appears; every
+            // later row of the same hunk is somebody's continuation.
+            let key = (r.owner, file, hunk);
+            if standing != Some(key) {
+                self.hunks.push(at);
+                standing = Some(key);
+            }
+        }
     }
 
     // ----------------------------------------------------------------- commands
@@ -298,18 +387,22 @@ impl Diff {
 
     pub fn move_by(&mut self, by: isize) {
         self.view.move_by(by);
+        self.moved();
     }
 
     pub fn down(&mut self) {
         self.view.down();
+        self.moved();
     }
 
     pub fn up(&mut self) {
         self.view.up();
+        self.moved();
     }
 
     pub fn page(&mut self, pages: isize) {
         self.view.page(pages);
+        self.moved();
     }
 
     /// Scrolls the viewport without moving the cursor. The wheel.
@@ -324,10 +417,12 @@ impl Diff {
 
     pub fn to_top(&mut self) {
         self.view.to_top();
+        self.moved();
     }
 
     pub fn to_bottom(&mut self) {
         self.view.to_bottom();
+        self.moved();
     }
 
     /// Moves the cursor to the header of the next or previous file.
@@ -354,6 +449,7 @@ impl Diff {
         };
         if let Some(t) = target {
             self.view.go_to(t);
+            self.moved();
         }
     }
 
@@ -361,6 +457,258 @@ impl Diff {
     /// picker lists.
     pub fn headers(&self) -> &[usize] {
         &self.headers
+    }
+
+    /// Moves the keyboard to the first row of the next — or previous — hunk.
+    ///
+    /// The jump list is the hunk map every presentation carries, so a
+    /// presentation that draws no hunks offers no jumps rather than wrong
+    /// ones, and the edges stop rather than wrap: a jump that left the diff
+    /// would be a jump nobody asked for.
+    pub fn jump_hunk(&mut self, by: isize) {
+        let cursor = self.view.cursor();
+        let target = match by.is_negative() {
+            true => self
+                .hunks
+                .partition_point(|&h| h < cursor)
+                .checked_sub(1)
+                .and_then(|i| self.hunks.get(i))
+                .copied(),
+            false => self
+                .hunks
+                .get(self.hunks.partition_point(|&h| h <= cursor))
+                .copied(),
+        };
+        if let Some(t) = target {
+            self.view.go_to(t);
+            self.moved();
+        }
+    }
+
+    // ----------------------------------------------------------------- marks
+
+    /// The cursor moved. An armed mark grows to cover the new position; a
+    /// destructive question asked on the old one dies — moving away is the
+    /// whole of the "no" a twice-pressed key can hear.
+    fn moved(&mut self) {
+        if self.marking {
+            let at = self.view.cursor();
+            self.marks = Some(match self.marks {
+                Some((anchor, _)) => (anchor, at),
+                None => (at, at),
+            });
+        }
+        self.armed = None;
+    }
+
+    /// `select.mark`, lazygit's `v`: arm a range at the cursor, extend it by
+    /// moving, and `v` again takes it off. A range of one row is a real
+    /// range — the mark is what the next action is aimed at, and one row is
+    /// a legal aim. In line-selection mode the range is what the staging
+    /// verbs slice; in hunk mode it marks rows to move through and stages
+    /// nothing by itself.
+    pub fn select_mark(&mut self) {
+        if self.marks.is_some() {
+            self.marks = None;
+            self.marking = false;
+            return;
+        }
+        let at = self.view.cursor();
+        self.marks = Some((at, at));
+        self.marking = true;
+    }
+
+    /// The marked range, normalized — anchors first, over visual rows.
+    pub fn marks(&self) -> Option<(usize, usize)> {
+        self.marks.map(|(a, b)| (a.min(b), a.max(b)))
+    }
+
+    /// Whether a mark is armed and the arrows extend it.
+    pub fn is_marking(&self) -> bool {
+        self.marking
+    }
+
+    /// How many rows are marked, for a status line.
+    pub fn mark_note(&self) -> Option<String> {
+        self.marks().map(|(a, b)| format!("{} marked", b - a + 1))
+    }
+
+    /// `diff.toggle-line-selection`, lazygit's `a`: what the hunk verbs aim
+    /// at — the whole hunk under the keyboard, or the marked lines. Returns
+    /// the new state for the status line; leaving line mode takes its stale
+    /// line mark with it, because a mark made for line slicing is not a
+    /// hunk answer.
+    pub fn toggle_line_selection(&mut self) -> bool {
+        self.line_unit = !self.line_unit;
+        if !self.line_unit {
+            self.marks = None;
+            self.marking = false;
+        }
+        self.line_unit
+    }
+
+    /// Whether the hunk verbs currently aim at lines rather than the whole
+    /// hunk.
+    pub fn line_selection(&self) -> bool {
+        self.line_unit
+    }
+
+    /// Arms the destructive question on the cursor's row, or spends an arm
+    /// already standing there. `false` means the question now stands and
+    /// the caller says so; `true` means it was answered on the same spot
+    /// and the verb may run.
+    pub fn confirm_or_arm_discard(&mut self) -> bool {
+        let at = self.view.cursor();
+        match self.armed {
+            Some(armed) if armed == at => {
+                self.armed = None;
+                true
+            }
+            _ => {
+                self.armed = Some(at);
+                false
+            }
+        }
+    }
+
+    // ----------------------------------------------------------------- search
+
+    /// The standing search, for pre-filling a second `/`.
+    pub fn search_query(&self) -> Option<&str> {
+        self.search_query.as_deref()
+    }
+
+    /// Whether there are rows with text to search at all. An empty pane has
+    /// none, and neither has a presentation that draws no text — a search
+    /// over it would be a search of nothing, and says so.
+    pub fn has_search_text(&self) -> bool {
+        self.order.iter().any(|r| {
+            let rows = match self.owners.get(r.owner as usize) {
+                Some(rows) => rows,
+                None => return false,
+            };
+            (0..2).any(|part| rows.selectable(r.index as usize, part).is_some())
+        })
+    }
+
+    /// The query changed — live, once per keystroke. Folds the rows on the
+    /// first use (never per frame, never per keystroke more than once),
+    /// rematches, and puts the keyboard on the first match at or after the
+    /// cursor, wrapping: the eye is on the row it matches, not on a count.
+    pub fn search_edit(&mut self, query: &str) {
+        let query = query.trim().to_string();
+        self.search_query = (!query.is_empty()).then_some(query);
+        if self.search_query.is_some() {
+            self.ensure_fold();
+            self.rematch();
+            self.jump_to_match(1);
+        } else {
+            self.search = None;
+        }
+    }
+
+    /// `search.next` / `search.prev`: the next match after — or before — the
+    /// keyboard, wrapping. No standing query, or no matches: nothing, and
+    /// the status line says what stands.
+    pub fn search_next(&mut self, by: isize) {
+        if self.search_query.is_some() {
+            self.ensure_fold();
+            self.rematch();
+            self.jump_to_match(by);
+        }
+    }
+
+    /// Takes the search off — the one door `search.clear` opens. The cursor
+    /// stays where the search left it.
+    pub fn search_clear(&mut self) {
+        self.search_query = None;
+        self.search = None;
+    }
+
+    /// What the search found, for the status row while one stands: the
+    /// ordinal of the match the keyboard is on over the count, or the bare
+    /// count when the keyboard is not on a match — and `no matches` when
+    /// there are none. Honest about all three.
+    pub fn match_note(&self) -> Option<String> {
+        let search = self.search.as_ref()?;
+        if search.matches.is_empty() {
+            return Some("no matches".into());
+        }
+        let cursor = self.view.cursor();
+        match search.matches.iter().position(|&m| m == cursor) {
+            Some(i) => Some(format!("{}/{}", i + 1, search.matches.len())),
+            None => Some(format!("{} matches", search.matches.len())),
+        }
+    }
+
+    /// Folds the rows' texts, once — the standing search's whole index. One
+    /// walk of `order`, the texts borrowed and lowercased into the fold; the
+    /// rows themselves are never copied.
+    fn ensure_fold(&mut self) {
+        if self.search.is_some() {
+            return;
+        }
+        let folded = TextIndex::new(self.order.iter().map(|r| {
+            let rows = &self.owners[r.owner as usize];
+            let mut text = String::new();
+            for part in 0..2 {
+                if let Some(t) = rows.selectable(r.index as usize, part) {
+                    if !text.is_empty() {
+                        text.push(' ');
+                    }
+                    text.push_str(t);
+                }
+            }
+            text
+        }));
+        self.search = Some(Search {
+            folded,
+            matches: Vec::new(),
+        });
+    }
+
+    /// Rebuilds the match table against the fold and the standing query.
+    fn rematch(&mut self) {
+        let Some(query) = self.search_query.as_ref() else {
+            return;
+        };
+        if let Some(search) = self.search.as_mut() {
+            search.matches = search.folded.indices(query);
+        }
+    }
+
+    /// Puts the keyboard on the next match in `by`'s direction, wrapping —
+    /// strictly beyond the cursor, so `n` from a match lands on the next
+    /// one, and one match alone stays put.
+    fn jump_to_match(&mut self, by: isize) {
+        let Some(target) = self.match_after(by) else {
+            return;
+        };
+        self.view.go_to(target);
+    }
+
+    /// The row [`Diff::jump_to_match`] lands on.
+    fn match_after(&self, by: isize) -> Option<usize> {
+        let search = self.search.as_ref()?;
+        if search.matches.is_empty() {
+            return None;
+        }
+        let cursor = self.view.cursor() as isize;
+        Some(match by.is_negative() {
+            false => search
+                .matches
+                .iter()
+                .find(|&&m| m as isize > cursor)
+                .copied()
+                .unwrap_or(search.matches[0]),
+            true => search
+                .matches
+                .iter()
+                .rev()
+                .find(|&&m| (m as isize) < cursor)
+                .copied()
+                .unwrap_or(*search.matches.last().unwrap()),
+        })
     }
 
     /// Scrolls sideways. A no-op with wrapping on, where nothing is off the edge.
@@ -442,6 +790,7 @@ impl Diff {
         // The cursor follows the mouse: a click is a place, and everything a key
         // does next — copy, jump, open — acts on the row the cursor is on.
         self.view.go_to(visual);
+        self.moved();
         let Some((part, caret)) = self.locate(col, visual) else {
             self.sel = None;
             return;
@@ -660,6 +1009,99 @@ impl Diff {
         Some((path, loaded.hunks.get(hunk)?.clone()))
     }
 
+    /// The file under the keyboard with every hunk the diff drew for it —
+    /// what whole-file verbs aim at. `None` when the keyboard sits on no
+    /// hunk at all: headers and empty stretches name no file, and a verb
+    /// that guessed from the nearest one would aim where nobody pointed.
+    pub fn current_file_hunks(&self) -> Option<(String, Vec<gitten_core::Hunk>)> {
+        let (path, _) = self.current_hunk()?;
+        let loaded = self.files.iter().find(|f| f.path == path)?;
+        Some((path, loaded.hunks.clone()))
+    }
+
+    /// What the hunk verbs aim at, in the terms the shared hunk job reads:
+    /// the whole hunk under the keyboard, or the marked lines grouped per
+    /// hunk. In line mode with no mark standing, the one line under the
+    /// keyboard is the aim — the same one-row range a fresh mark is.
+    ///
+    /// `Err` is the refusal, worded for the status line: the keyboard not
+    /// on a hunk at all, a mark that spans files, a selection over no line,
+    /// or a presentation that does not address lines — the side-by-side
+    /// layout pairs a removal and its addition on one row, and it says so
+    /// rather than guessing which half a verb means.
+    pub fn patch_selection(&self) -> Result<PatchSelection, String> {
+        if !self.line_unit {
+            let (path, hunk) = self
+                .current_hunk()
+                .ok_or_else(|| "the keyboard is not on a hunk".to_string())?;
+            return Ok(PatchSelection::Whole { path, hunk });
+        }
+        let range = self.marks().unwrap_or_else(|| {
+            let at = self.view.cursor();
+            (at, at)
+        });
+        let mut any_line = false;
+        let mut any_hunk = false;
+        let mut paths: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        // Per touched hunk: the loaded hunk and the inclusive line range
+        // the selection covers. The addresses come from the presentations'
+        // own line maps, via the same `(owner, index)` pair `current_hunk`
+        // reads — and wrapped rows fold to their line, because a mark was
+        // made over what was visible and a line is what staging means.
+        let mut parts: Vec<(gitten_core::Hunk, usize, usize)> = Vec::new();
+        for row in range.0..=range.1 {
+            let Some(r) = self.order.get(row) else {
+                continue;
+            };
+            let Some(rows) = self.owners.get(r.owner as usize) else {
+                continue;
+            };
+            let logical = r.index as usize;
+            if let Some((file, hunk, line)) = rows.line_at(logical) {
+                any_line = true;
+                any_hunk = true;
+                let Some(entry) = rows.files().get(file) else {
+                    continue;
+                };
+                paths.insert(entry.path.clone());
+                let Some(loaded) = self.files.iter().find(|f| f.path == entry.path) else {
+                    continue;
+                };
+                let Some(h) = loaded.hunks.get(hunk) else {
+                    continue;
+                };
+                match parts.iter_mut().find(|(known, _, _)| known == h) {
+                    Some((_, lo, hi)) => {
+                        *lo = (*lo).min(line);
+                        *hi = (*hi).max(line);
+                    }
+                    None => parts.push((h.clone(), line, line)),
+                }
+            } else if rows.hunk_at(logical).is_some() {
+                any_hunk = true;
+            }
+        }
+        if !any_line {
+            return Err(match any_hunk {
+                true => "this layout does not address single lines — switch layouts (s)".into(),
+                false => "no lines under the selection".into(),
+            });
+        }
+        if paths.len() > 1 {
+            let shown: Vec<&str> = paths.iter().map(|p| p.as_str()).collect();
+            return Err(format!(
+                "a line selection covers one file — this one spans {} and {}",
+                shown[0],
+                shown[1..].join(", ")
+            ));
+        }
+        let path = paths
+            .into_iter()
+            .next()
+            .ok_or_else(|| "no lines under the selection".to_string())?;
+        Ok(PatchSelection::Lines { path, parts })
+    }
+
     /// Swaps in a refreshed diff, keeping the reading position numerically.
     ///
     /// A write leaves no hunk identity to anchor to — the hunk just staged may
@@ -675,10 +1117,14 @@ impl Diff {
         }
         let (cursor, top, shift) = (self.view.cursor(), self.view.top(), self.shift);
         // A refresh is the repository saying things moved: a selection was
-        // anchored to how they were, and a drag was holding rows that may
-        // not be there.
+        // anchored to how they were, a drag was holding rows that may
+        // not be there, a mark and an armed question were addressed to
+        // rows that no longer exist.
         self.sel = None;
         self.dragging = false;
+        self.marks = None;
+        self.marking = false;
+        self.armed = None;
         self.files = files;
         self.owners = self.layouts.build(self.current, host);
         let built = assemble(&self.files, host, &mut self.owners);
@@ -812,6 +1258,21 @@ impl Diff {
         {
             out.push_str(" · ");
             out.push_str(&report);
+        }
+        // A standing search says where the keyboard is among its matches —
+        // the same sentence the prompt carried, outliving it.
+        if let Some(note) = self.match_note() {
+            out.push_str(" · ");
+            out.push_str(&note);
+        }
+        // What the hunk verbs will act on, when that is not the obvious
+        // whole hunk: the unit a space or a discard will mean.
+        if self.line_unit {
+            out.push_str(" · line selection");
+        }
+        if let Some(note) = self.mark_note() {
+            out.push_str(" · ");
+            out.push_str(&note);
         }
         out
     }

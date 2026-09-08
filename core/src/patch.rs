@@ -33,9 +33,52 @@
 //! the gap is a line-model change (`Option<bool>` on the pair, threaded
 //! through acquisition), not a change here.
 
-use crate::{Hunk, LineKind};
+use crate::{DiffLine, Hunk, LineKind};
+
+/// What a `\ No newline at end of file` marker needs, per side: how many
+/// lines the side holds, and whether its last one is newline-terminated.
+///
+/// Neither fact lives in a [`Hunk`] — a hunk's lines are text without their
+/// terminators — so the caller that read the content supplies them: the
+/// counts are each side's line count and the booleans are whether the raw
+/// bytes ended in `\n`. A patch that never reaches a side's final line pays
+/// for none of this; the marker is written only under a line that *is* the
+/// side's last.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sides {
+    /// How many lines the old side holds.
+    pub old_lines: usize,
+    /// Whether the old side's final line is newline-terminated.
+    pub old_final_newline: bool,
+    /// How many lines the new side holds.
+    pub new_lines: usize,
+    /// Whether the new side's final line is newline-terminated.
+    pub new_final_newline: bool,
+}
+
+impl Sides {
+    /// [`emit`]'s historical reading: both sides as if terminated, so no
+    /// marker is ever written. Exactly right for content that ends in a
+    /// newline, and — for content that does not — the shape `git apply`
+    /// refuses rather than misapplies.
+    pub const fn unbounded() -> Self {
+        Self {
+            old_lines: usize::MAX,
+            old_final_newline: true,
+            new_lines: usize::MAX,
+            new_final_newline: true,
+        }
+    }
+}
 
 /// The unified diff that applies exactly `chosen` — nothing around them.
+///
+/// [`emit_with`] is the general form and carries the sides' final-line
+/// facts; this is the historical spelling, which assumes every side is
+/// newline-terminated and writes no marker. A patch built from content
+/// that lacks the final newline is refused by `git apply` verbatim rather
+/// than misapplied — the caller that knows the sides should prefer
+/// [`emit_with`] and say it properly.
 ///
 /// One file per call, because that is what a hunk belongs to; several hunks
 /// of that file ride together as one patch, which keeps a future multi-hunk
@@ -51,6 +94,47 @@ use crate::{Hunk, LineKind};
 /// The bytes are UTF-8 by construction: the path arrived through the lossy
 /// decode every diff takes, and the lines are shared handles out of it.
 pub fn emit(path: &str, chosen: &[&Hunk]) -> Vec<u8> {
+    emit_inner(path, chosen, &Sides::unbounded())
+}
+
+/// [`emit`], with the sides' final-line facts: a line that is its side's
+/// last and is not newline-terminated is written the way git itself writes
+/// it — bare, followed by `\\ No newline at end of file` — so a patch
+/// against content that lacks the final newline *applies* instead of being
+/// refused.
+///
+/// One shape cannot be said and is refused rather than faked: a context
+/// line on which the two sides disagree about the terminator — the old
+/// side's final line without a newline that the new side carries on
+/// past. The line model sees one text where the bytes differ, the marker
+/// would have to be written and not written at once, and the honest answer
+/// is the refusal: a partial patch cannot say both sides at once, and the
+/// whole-file door can.
+pub fn emit_with(path: &str, chosen: &[&Hunk], sides: &Sides) -> Result<Vec<u8>, String> {
+    // The disagreement lives in the chosen lines, so it is cheap to see
+    // before anything is built: a context line that is its old side's last
+    // must also be its new side's last (or neither), whenever a marker
+    // would be involved.
+    for hunk in chosen {
+        for l in &hunk.lines {
+            if l.kind != LineKind::Context {
+                continue;
+            }
+            let old_final = l.old_no.is_some_and(|n| n as usize == sides.old_lines);
+            let new_final = l.new_no.is_some_and(|n| n as usize == sides.new_lines);
+            let old_marked = old_final && !sides.old_final_newline;
+            let new_marked = new_final && !sides.new_final_newline;
+            if old_marked != new_marked {
+                return Err(format!(
+                    "{path} changes its final newline here — a partial patch cannot say both sides at once; stage or discard it whole from the files pane"
+                ));
+            }
+        }
+    }
+    Ok(emit_inner(path, chosen, sides))
+}
+
+fn emit_inner(path: &str, chosen: &[&Hunk], sides: &Sides) -> Vec<u8> {
     let mut body: Vec<u8> = Vec::new();
     // The sides are decided across the whole selection, not per hunk: two
     // chosen hunks of a brand-new file must agree there is no old side.
@@ -71,7 +155,28 @@ pub fn emit(path: &str, chosen: &[&Hunk]) -> Vec<u8> {
                 LineKind::Removed => b'-',
             });
             body.extend_from_slice(l.text.as_bytes());
-            body.push(b'\n');
+            // The marker replaces the terminator, exactly as git writes
+            // it: the line bare, then the marker line. Only a line that
+            // *is* its side's last can carry one — any other line is
+            // followed by more content and terminated like any other.
+            let final_of_side =
+                |no: Option<u32>, total: usize| no.is_some_and(|n| n as usize == total);
+            let marked = match l.kind {
+                LineKind::Context => {
+                    final_of_side(l.old_no, sides.old_lines) && !sides.old_final_newline
+                }
+                LineKind::Added => {
+                    final_of_side(l.new_no, sides.new_lines) && !sides.new_final_newline
+                }
+                LineKind::Removed => {
+                    final_of_side(l.old_no, sides.old_lines) && !sides.old_final_newline
+                }
+            };
+            if marked {
+                body.extend_from_slice(b"\n\\ No newline at end of file\n");
+            } else {
+                body.push(b'\n');
+            }
         }
     }
     if body.is_empty() {
@@ -136,6 +241,103 @@ fn coords(hunk: &Hunk) -> String {
         n => format!("{},{}", first.unwrap_or(0), n),
     };
     format!("@@ -{} +{} @@\n", side(old, o_count), side(new, n_count))
+}
+
+/// Which unchosen changes a line window keeps, and which it drops.
+///
+/// The verbs aim at different trees, and the same span means different
+/// things to each — and the direction of `git apply` decides which side of
+/// the patch the patch is matched against. A stage is forward: the
+/// patch's preimage is the index, which holds every removal, chosen or
+/// not, so an unchosen removal travels as context (genuinely on both
+/// sides: in the index, and in the index the stage produces) while an
+/// unchosen addition is on neither side and drops out. An unstage and a
+/// discard are reverse: `git apply --reverse` matches the patch's *post*
+/// image against the tree being rewritten, which holds every addition —
+/// so an unchosen addition travels as context and an unchosen removal, on
+/// neither side, drops out. Either way the patch describes a real pair of
+/// texts, which is what keeps `git apply` willing: a hunk whose preimage
+/// skips a line the file has, or that ends a mid-file hunk on a removal,
+/// is a patch git refuses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unselected {
+    /// Staging: unchosen removals stay (as context), unchosen additions drop.
+    KeepRemovals,
+    /// Unstaging and discarding — the reverse verbs: unchosen additions
+    /// stay (as context), unchosen removals drop.
+    KeepAdditions,
+}
+
+/// The hunk that stages exactly the marked rows of one hunk: the marked
+/// window `lo..=hi`, widened by up to three context rows on each side —
+/// widening that walks past an unchosen change to reach it.
+///
+/// Three rules make the window appliable and nothing more. Every row
+/// *inside* the marked window travels as the change it is — a range stages
+/// all the changes it spans, which is what a dragged selection means. The
+/// widening takes context rows only, up to three, and counts past an
+/// unchosen change without taking it — the unchosen lines it steps over
+/// are then ruled by `keep`: kept as context where both sides of the
+/// patch genuinely hold them, dropped where neither does. And the header
+/// is left empty: [`emit_with`] recomputes coordinates from the lines, so
+/// a slice is addressable wherever it falls.
+///
+/// `None` means the window stages nothing — an empty range, a range past
+/// the hunk's end, or every line in it context — and the caller says so;
+/// "nothing selected" is a sentence about the screen.
+pub fn line_window(hunk: &Hunk, lo: usize, hi: usize, keep: Unselected) -> Option<Hunk> {
+    let lines = &hunk.lines;
+    if lo > hi || hi >= lines.len() {
+        return None;
+    }
+    let mut start = lo;
+    let mut taken = 0;
+    while start > 0 && taken < 3 {
+        match lines[start - 1].kind {
+            LineKind::Context => {
+                start -= 1;
+                taken += 1;
+            }
+            // An unchosen change is stepped over, not taken: it is ruled
+            // by `keep` below, and it does not spend the context budget.
+            _ => start -= 1,
+        }
+    }
+    let mut end = hi;
+    taken = 0;
+    while end + 1 < lines.len() && taken < 3 {
+        match lines[end + 1].kind {
+            LineKind::Context => {
+                end += 1;
+                taken += 1;
+            }
+            _ => end += 1,
+        }
+    }
+    let mut out: Vec<DiffLine> = Vec::with_capacity(end - start + 1);
+    let mut changed = false;
+    for (i, l) in lines.iter().enumerate().skip(start).take(end - start + 1) {
+        let chosen = (lo..=hi).contains(&i);
+        let kind = match (l.kind, chosen) {
+            (LineKind::Context, _) | (_, true) => l.kind,
+            (LineKind::Added, false) => match keep {
+                Unselected::KeepRemovals => continue,
+                Unselected::KeepAdditions => LineKind::Context,
+            },
+            (LineKind::Removed, false) => match keep {
+                Unselected::KeepRemovals => LineKind::Context,
+                Unselected::KeepAdditions => continue,
+            },
+        };
+        changed |= kind != LineKind::Context;
+        let mut line = l.clone();
+        line.kind = kind;
+        out.push(line);
+    }
+    changed.then(|| Hunk {
+        header: String::new(),
+        lines: out,
+    })
 }
 
 // ---------------------------------------------------------------------- tests
@@ -449,5 +651,138 @@ diff --git a/w.txt b/w.txt
         let patch = text(&emit("w.txt", &[&hunk]));
         assert!(patch.contains("-alpha\r\n"), "the CR rode along as content");
         assert!(patch.contains("+beta\n"), "and the plain line stayed plain");
+    }
+
+    // ------------------------------------------------------ line windows
+
+    /// A replacement hunk: context, a removal paired with an addition,
+    /// context — the shape every line-selection question is asked in.
+    fn replacement() -> Hunk {
+        one("\
+diff --git a/f.txt b/f.txt
+@@ -1,5 +1,5 @@
+ alpha
+-STAGED CHANGE
++WORKTREE CHANGE
+ keep three
+ omega
+")
+    }
+
+    #[test]
+    fn a_window_widens_by_context_and_steps_over_an_unchosen_change() {
+        let hunk = replacement();
+        // Selecting the removal alone: the unchosen addition is stepped
+        // over to reach the context beyond it, and what happens to it is
+        // the verb's word.
+        let plus = hunk
+            .lines
+            .iter()
+            .position(|l| l.kind == LineKind::Removed)
+            .expect("a removal");
+        let staged =
+            line_window(&hunk, plus, plus, Unselected::KeepRemovals).expect("a changed line");
+        let kinds: Vec<LineKind> = staged.lines.iter().map(|l| l.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                LineKind::Context,
+                LineKind::Removed,
+                LineKind::Context,
+                LineKind::Context
+            ],
+            "staging keeps the unchosen removal as context and drops the addition: {kinds:?}"
+        );
+        let discarded =
+            line_window(&hunk, plus, plus, Unselected::KeepAdditions).expect("a changed line");
+        let kinds: Vec<LineKind> = discarded.lines.iter().map(|l| l.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                LineKind::Context,
+                LineKind::Removed,
+                LineKind::Context,
+                LineKind::Context,
+                LineKind::Context
+            ],
+            "discarding keeps the unchosen addition as context: {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn a_window_of_every_line_is_the_hunk_itself() {
+        let hunk = replacement();
+        let whole = line_window(&hunk, 0, hunk.lines.len() - 1, Unselected::KeepRemovals)
+            .expect("a changed line");
+        assert_eq!(
+            whole.lines, hunk.lines,
+            "nothing unchosen, nothing rewritten"
+        );
+    }
+
+    #[test]
+    fn a_window_over_context_alone_stages_nothing() {
+        let hunk = replacement();
+        assert!(line_window(&hunk, 0, 0, Unselected::KeepRemovals).is_none());
+        assert!(line_window(&hunk, 99, 100, Unselected::KeepRemovals).is_none());
+        assert!(line_window(&hunk, 2, 1, Unselected::KeepRemovals).is_none());
+    }
+
+    // ------------------------------------------------- final-newline facts
+
+    #[test]
+    fn the_marker_rides_each_sides_own_last_line() {
+        // Both sides end without the newline: the removal and the addition
+        // each carry the marker git itself would write.
+        let hunk = one("\
+diff --git a/f.txt b/f.txt
+@@ -1,2 +1,2 @@
+ alpha
+-end
++END
+");
+        let sides = Sides {
+            old_lines: 2,
+            old_final_newline: false,
+            new_lines: 2,
+            new_final_newline: false,
+        };
+        let patch = text(&emit_with("f.txt", &[&hunk], &sides).expect("both sides agree"));
+        assert!(
+            patch.contains("-end\n\\ No newline at end of file\n"),
+            "{patch}"
+        );
+        assert!(
+            patch.contains("+END\n\\ No newline at end of file\n"),
+            "{patch}"
+        );
+        // And the historical spelling — every line as if terminated — is
+        // what plain `emit` still answers.
+        assert!(
+            !text(&emit("f.txt", &[&hunk])).contains("No newline"),
+            "emit assumes terminators"
+        );
+    }
+
+    #[test]
+    fn the_unsayable_newline_change_refuses() {
+        // The old side's last line becomes the new side's middle: context
+        // in the line model, different bytes in the files, and no patch
+        // that says both.
+        let hunk = one("\
+diff --git a/f.txt b/f.txt
+@@ -1,2 +1,3 @@
+ alpha
+ end
++appended
+");
+        let sides = Sides {
+            old_lines: 2,
+            old_final_newline: false,
+            new_lines: 3,
+            new_final_newline: false,
+        };
+        let err = emit_with("f.txt", &[&hunk], &sides).expect_err("refuses");
+        assert!(err.contains("final newline"), "{err}");
     }
 }

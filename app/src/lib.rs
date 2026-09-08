@@ -35,6 +35,7 @@
 //! match start.loaded.data {
 //!     acquire::Data::Diff(files) => { /* draw */ }
 //!     acquire::Data::Commits(commits) => { /* draw */ }
+//!     acquire::Data::Conflict(..) => { /* a launch never opens on one */ }
 //! }
 //! ```
 //!
@@ -57,6 +58,7 @@ pub mod cli;
 pub mod config;
 pub mod env;
 pub mod jobs;
+pub mod patchwork;
 pub mod projects;
 pub mod verbs;
 
@@ -451,6 +453,8 @@ mod tests {
                 new: vec!["fake contents".into()],
                 old_oid: None,
                 new_oid: Some("3333333333333333333333333333333333333333".into()),
+                old_final_newline: true,
+                new_final_newline: true,
                 binary: false,
             }])
         }

@@ -162,6 +162,19 @@ impl Hunks {
         let s = self.spans.get(i.checked_sub(1)?)?;
         (index < s.start + s.rows).then_some((s.file, s.hunk))
     }
+
+    /// The diff line under logical row `index`: `(file, hunk, line)`, the
+    /// line's own offset within its hunk's `lines`. The address the
+    /// line-level staging verbs read, and the reason a span records its
+    /// header row: `start` is the hunk header, `start + 1 + line` the line.
+    /// File headers and hunk headers answer `None` — a row that names no
+    /// line stages nothing.
+    pub fn line_at(&self, index: usize) -> Option<(usize, usize, usize)> {
+        let i = self.spans.partition_point(|s| s.start <= index);
+        let s = self.spans.get(i.checked_sub(1)?)?;
+        let line = index.checked_sub(s.start)?.checked_sub(1)?;
+        (line < s.rows - 1).then_some((s.file, s.hunk, line))
+    }
 }
 
 /// The rows of every file a presentation claimed, flat, with a wrap index.
@@ -247,6 +260,12 @@ impl Flat {
     /// hunks — today only the file headers. See [`Hunks::at`] for the address.
     pub fn hunk_at(&self, index: usize) -> Option<(usize, usize)> {
         self.hunks.at(index)
+    }
+
+    /// The diff line under logical row `index`. See [`Hunks::line_at`] for
+    /// the address.
+    pub fn line_at(&self, index: usize) -> Option<(usize, usize, usize)> {
+        self.hunks.line_at(index)
     }
 
     pub fn moved(&self) -> usize {
@@ -408,6 +427,21 @@ pub trait Present {
     /// way, and a recorded index that answers nothing on [`Present::files`]
     /// degrades to "no hunk here" rather than to the wrong hunk.
     fn hunk_at(&self, _index: usize) -> Option<(usize, usize)> {
+        None
+    }
+
+    /// The diff line under logical row `index`: `(file, hunk, line)` — the
+    /// line's offset within its hunk's own `lines`, the file numbered as
+    /// [`Present::files`] spells it. The address the line-level staging
+    /// verbs read.
+    ///
+    /// Defaulted to none, like `hunk_at`: a presentation that does not
+    /// record its hunk spans cannot say where its lines are, and the verbs
+    /// that act on one line refuse there rather than guess. The shipped
+    /// unified presentation derives it from the same spans `hunk_at` reads;
+    /// the side-by-side one pairs a removal and its addition on one row and
+    /// honestly answers nothing.
+    fn line_at(&self, _index: usize) -> Option<(usize, usize, usize)> {
         None
     }
 }
@@ -1125,6 +1159,25 @@ diff --git a/a.rs b/a.rs
         // And through the `Box` every frontend's registry stores them in.
         let boxed: Box<dyn Present> = Box::new(Bare(3));
         assert_eq!(boxed.hunk_at(1), None);
+    }
+
+    #[test]
+    fn line_at_answers_the_hunks_lines_and_nothing_else() {
+        // One hunk of four lines spanning rows 5..9: row 5 is the hunk
+        // header, rows 6..9 are its lines in order, and everything outside
+        // the span — file headers, hunk headers, the gaps between hunks —
+        // names no line at all.
+        let mut hunks = Hunks::default();
+        hunks.record(5, 5, 0, 2);
+        assert_eq!(hunks.line_at(4), None, "before the span");
+        assert_eq!(hunks.line_at(5), None, "the hunk header is no line");
+        assert_eq!(hunks.line_at(6), Some((0, 2, 0)));
+        assert_eq!(hunks.line_at(7), Some((0, 2, 1)));
+        assert_eq!(hunks.line_at(9), Some((0, 2, 3)), "the hunk's last line");
+        assert_eq!(hunks.line_at(10), None, "past the span");
+        // A second hunk of the same file keeps its own numbering.
+        hunks.record(20, 2, 0, 3);
+        assert_eq!(hunks.line_at(21), Some((0, 3, 0)));
     }
 
     #[test]

@@ -10,8 +10,9 @@
 //! the same queue — without a line changing here.
 
 use crate::jobs::Job;
-use gitten_core::rebase::TodoScript;
-use gitten_core::refs::{HeadState, Remote, ResetMode};
+use gitten_core::operation::Side;
+use gitten_core::rebase::{FixupKind, Plan, TodoScript};
+use gitten_core::refs::{HeadState, Remote, ResetMode, StashId, StashScope};
 use gitten_git::{Handle, Repo};
 
 /// The write itself: a closure over the trait, so an extension's verb and a
@@ -33,12 +34,40 @@ pub struct Write {
     done: Option<String>,
 }
 
+/// The band's count of commits, said the way a person says it.
+fn many_commits(n: usize) -> String {
+    match n {
+        1 => "1 commit".into(),
+        n => format!("{n} commits"),
+    }
+}
+
 /// The band's count of paths, said the way a person says it.
 fn many(n: usize) -> String {
     match n {
         1 => "1 path".into(),
         n => format!("{n} paths"),
     }
+}
+
+/// The sha `HEAD` holds, when the repository can say — the one fact a plan
+/// built over a window of history needs to still be true when it runs.
+///
+/// Detached is a sha like any other here: what a rebase replays is measured
+/// from where HEAD points, not from whether a branch name is attached to it.
+/// `None` for an unborn branch and for a read that failed, which are the two
+/// ways a repository has of not having a HEAD to compare.
+fn head_sha(repo: &dyn Repo) -> Option<String> {
+    match repo.head().ok()? {
+        HeadState::Branch { commit, .. } => commit,
+        HeadState::Detached { commit } => Some(commit),
+    }
+}
+
+/// A sha as a sentence says it: git's own eight characters, and the whole
+/// thing when it is shorter than that.
+fn abbreviated(sha: &str) -> &str {
+    &sha[..sha.len().min(8)]
 }
 
 impl Write {
@@ -134,6 +163,108 @@ impl Write {
         }))
     }
 
+    /// Writes exactly what a synthesized patch describes into the working
+    /// tree — `git apply`, the fourth corner the other three patch verbs
+    /// leave open. Bytes end to end, emptiness refused before the queue,
+    /// drift refused by git's own sentence at apply time.
+    pub fn apply_patch(repo: &Handle, patch: Vec<u8>) -> Result<Self, String> {
+        if patch.is_empty() {
+            return Err("an empty patch applies nothing".into());
+        }
+        Ok(Self::named("apply patch".into(), repo, move |r| {
+            r.apply_patch(&patch)
+        }))
+    }
+
+    /// Restores one path to the version a commit holds —
+    /// `git checkout <sha> -- <path>`, worktree and index together, which
+    /// is git's semantic and is said as such wherever this is offered.
+    /// DESTRUCTIVE when the path differs: the caller confirms before this
+    /// job is ever built.
+    pub fn checkout_file_from_commit(repo: &Handle, sha: Vec<u8>, path: Vec<u8>) -> Self {
+        let shown = String::from_utf8_lossy(&path).into_owned();
+        Self::named(format!("checkout {shown} from commit"), repo, move |r| {
+            r.checkout_file_from(&sha, &path)
+        })
+    }
+
+    /// Folds `files` into the commit `sha` names and replays what followed
+    /// it: detach at the commit, run each patch against its content
+    /// (`reverse` aims removals, forward aims additions), stage the paths,
+    /// amend without rewording, restore the reader's position, and replay
+    /// the descendants onto the replacement.
+    ///
+    /// One job, because the steps are one decision and the queue's finish
+    /// wave is the only honest place for the refresh: halfway generations
+    /// would draw a detached HEAD mid-graft as a state. A rebase that
+    /// stops on a conflict is a clean finish carrying the standing rebase
+    /// in its announcement — the lifecycle owns it from there — and
+    /// anything earlier failing restores the reader's position before
+    /// reporting, so a failed graft never strands a detached HEAD behind
+    /// it. A graft that finds the reader detached refuses outright: there
+    /// is no branch to carry the rewrite, and amending one would leave it
+    /// dangling. Files with empty patches are skipped; all empty is refused
+    /// before the queue.
+    pub fn graft_files(
+        repo: &Handle,
+        sha: Vec<u8>,
+        files: Vec<(Vec<u8>, Vec<u8>)>,
+        reverse: bool,
+    ) -> Result<Self, String> {
+        let live: Vec<(Vec<u8>, Vec<u8>)> =
+            files.into_iter().filter(|(_, p)| !p.is_empty()).collect();
+        if live.is_empty() {
+            return Err("an empty patch grafts nothing".into());
+        }
+        let short = String::from_utf8_lossy(&sha);
+        let short = short.chars().take(8).collect::<String>();
+        Ok(Self::named(
+            format!("graft {} files into {short}", live.len()),
+            repo,
+            move |r| graft(r, &sha, &live, reverse),
+        ))
+    }
+
+    /// Carries `patches` onto `branch`, creating it at HEAD first when it
+    /// does not exist yet: checkout (a dirty tree it cannot carry is git's own
+    /// refusal), then each patch onto the worktree in order, uncommitted —
+    /// the commit is the reader's next keypress, not this job's last
+    /// step. When creation was requested and the checkout fails, the new
+    /// branch is removed again, so a failed move leaves no empty branch
+    /// behind it.
+    pub fn move_patch_to_branch(
+        repo: &Handle,
+        branch: Vec<u8>,
+        create: bool,
+        patches: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<Self, String> {
+        if patches.iter().all(|(_, p)| p.is_empty()) {
+            return Err("an empty patch moves nothing".into());
+        }
+        let shown = String::from_utf8_lossy(&branch).into_owned();
+        let job = Self::named(format!("move patch onto {shown}"), repo, move |r| {
+            if create {
+                r.create_branch(&branch, None)?;
+            }
+            if let Err(e) = r.checkout(&branch) {
+                if create {
+                    let _ = r.delete_branch(&branch, true);
+                }
+                return Err(e);
+            }
+            for (_, patch) in &patches {
+                if !patch.is_empty() {
+                    r.apply_patch(patch)?;
+                }
+            }
+            Ok(())
+        })
+        .announcing(format!(
+            "patch on {shown} — uncommitted, commit it or leave it"
+        ));
+        Ok(job)
+    }
+
     /// Checks out one path's working-tree state away. DESTRUCTIVE: unstaged
     /// work ends here, which is why the caller confirms before this job is
     /// ever built.
@@ -182,6 +313,20 @@ impl Write {
             .announcing("amended HEAD")
     }
 
+    /// Commits the index as a fixup for `sha`: the message is git's marker
+    /// (`fixup! <subject>` and its `amend!` / `reword!` siblings), so no
+    /// prompt stands between the key and the commit. Non-destructive — it
+    /// only adds — so like [`Write::revert`] it takes no confirmation
+    /// dance; the finish announces the marker it wrote, because a key that
+    /// silently grows history is a key nobody trusts.
+    pub fn fixup_commit(repo: &Handle, sha: Vec<u8>, short: String, kind: FixupKind) -> Self {
+        let word = kind.word().to_string();
+        Self::named(format!("{word} {short}"), repo, move |r| {
+            r.commit_fixup(&sha, kind).map(|_| ())
+        })
+        .announcing(format!("{word} {short} created"))
+    }
+
     /// Rewrites this branch by installing `script` as git's own
     /// interactive-rebase plan over `upstream` — reorder, squash, fixup,
     /// drop and exec between picks, exactly as the plan says. The plan was
@@ -196,6 +341,116 @@ impl Write {
             r.rebase_todo(&upstream, &script)
         })
         .announcing(format!("rebased onto {shown}"))
+    }
+
+    /// Replaces HEAD's message and nothing else. The narrow sibling of
+    /// [`Write::amend`], and narrow on purpose: a keypress that said
+    /// *reword* must not commit whatever happens to be staged, which is
+    /// what a bare amend would do.
+    pub fn reword_head(repo: &Handle, message: String) -> Self {
+        Self::named("reword HEAD".into(), repo, move |r| r.reword_head(&message))
+            .announcing("reworded HEAD")
+    }
+
+    /// Rewrites this branch from an editable [`Plan`] — the todo UI's own
+    /// verb, and the only one that can carry a reworded message or an
+    /// amendment down to the layer with a filesystem to put them in. The
+    /// plan refuses every shape git would before any process runs; a
+    /// conflict, or an `edit` the plan asked for, hands back a standing
+    /// rebase for the lifecycle keys to carry on from.
+    /// DESTRUCTIVE: the caller confirms before this job is ever built.
+    ///
+    /// **Where HEAD was when this was built is part of the job.** A plan is
+    /// a window of history read at some earlier moment, and every row in it
+    /// names a sha. The queue's own generation rail catches a plan staled by
+    /// a *write of ours*; it says nothing about a commit typed in a terminal
+    /// or an amend in another client while the plan stood open, and after
+    /// one of those every sha in the plan names a commit the branch no
+    /// longer has. Replaying them is a rewrite nobody described. So HEAD is
+    /// read here — at the confirmation, which is where this is built — and
+    /// read again in the job, and a difference refuses before git runs.
+    ///
+    /// `None` is the honest answer from a repository that cannot say where
+    /// HEAD is: an unborn branch, or a read that failed. Nothing to compare
+    /// then, and the rebase itself is what refuses.
+    pub fn rebase_plan(repo: &Handle, plan: Plan) -> Self {
+        let shown = String::from_utf8_lossy(plan.upstream()).into_owned();
+        let count = plan.len();
+        let confirmed_at = head_sha(repo.as_ref());
+        Self::named(format!("rebase {count} onto {shown}"), repo, move |r| {
+            if let Some(was) = confirmed_at.as_deref() {
+                let now = head_sha(r);
+                if now.as_deref() != Some(was) {
+                    return Err(format!(
+                        "HEAD was {} when this plan was confirmed and is {} now — \
+                         something outside this queue rewrote the branch; \
+                         reopen the plan",
+                        abbreviated(was),
+                        now.as_deref().map(abbreviated).unwrap_or("nowhere"),
+                    ));
+                }
+            }
+            r.rebase_plan(&plan)
+        })
+        .announcing(format!("rewrote {} from {shown}", many_commits(count)))
+    }
+
+    /// Replays everything after `base` onto `onto` — `git rebase --onto`,
+    /// with the marked commit left exactly where it is and its children
+    /// moved. DESTRUCTIVE: the caller confirms before this job is ever
+    /// built, and names both ends of it, because a base that is not an
+    /// ancestor of HEAD replays a range nobody meant.
+    pub fn rebase_onto_base(repo: &Handle, onto: Vec<u8>, base: Vec<u8>) -> Self {
+        let target = String::from_utf8_lossy(&onto).into_owned();
+        let from = String::from_utf8_lossy(&base).into_owned();
+        Self::named(
+            format!("rebase onto {target} from {from}"),
+            repo,
+            move |r| r.rebase_onto_base(&onto, &base),
+        )
+        .announcing(format!("rebased onto {target}, from {from} up"))
+    }
+
+    /// Throws the whole working tree away — every uncommitted byte, tracked
+    /// and untracked, with no stash and no reflog behind it. Ignored files
+    /// stay. DESTRUCTIVE, the most so here: the caller confirms.
+    pub fn nuke_worktree(repo: &Handle) -> Self {
+        Self::named("nuke the working tree".into(), repo, |r| r.nuke_worktree())
+            .announcing("the working tree is back at HEAD")
+    }
+
+    /// Moves the current branch onto whatever its upstream holds, at the
+    /// strength given — the files pane's reset, aimed past every row at the
+    /// remote-tracking ref this branch is configured against.
+    ///
+    /// The aim is *read*, never assumed: the branch under HEAD, then its
+    /// configured upstream, and each way that can be missing refuses here
+    /// with a sentence instead of queueing a job git would answer with a
+    /// revspec error. The ref is named in full (`origin/main`, not
+    /// `@{upstream}`) so what a confirmation says and what git resolves are
+    /// the same string.
+    pub fn reset_upstream(repo: &Handle, mode: ResetMode) -> Result<Self, String> {
+        let branch = match repo.head()? {
+            HeadState::Branch { name, .. } => name,
+            HeadState::Detached { .. } => {
+                return Err("detached HEAD has no branch, so it has no upstream".into())
+            }
+        };
+        let upstream = repo
+            .branches()?
+            .iter()
+            .find(|b| b.name.as_bytes() == branch.as_bytes())
+            .and_then(|b| b.upstream.clone())
+            .ok_or_else(|| {
+                format!(
+                    "{} tracks no upstream to reset to",
+                    branch.to_string_lossy()
+                )
+            })?;
+        let mut target = upstream.remote.as_bytes().to_vec();
+        target.push(b'/');
+        target.extend_from_slice(upstream.branch.as_bytes());
+        Ok(Self::reset(repo, mode, target))
     }
 
     /// Moves the current branch onto `upstream`, replaying its own commits:
@@ -241,6 +496,39 @@ impl Write {
         .announcing(format!("picked {shown}"))
     }
 
+    /// Replays every copied commit onto the current branch, in the order
+    /// the clipboard arranged them — one `git cherry-pick` over the whole
+    /// slice, so a conflict stops the sequence where git stopped it and the
+    /// remainder stands for [`Write::cherry_pick_abort`] or
+    /// [`Write::cherry_pick_continue`] to carry. Nothing existing moves, so
+    /// no confirmation precedes it; the clipboard survives the paste, since
+    /// the same set is often wanted on a second branch.
+    pub fn cherry_pick_range(repo: &Handle, shas: Vec<Vec<u8>>) -> Self {
+        // The band counts rather than lists: a dozen shas is not a sentence,
+        // and the pane the picks land in shows them by name a frame later.
+        let n = shas.len();
+        let shown = if n == 1 {
+            String::from_utf8_lossy(&shas[0]).into_owned()
+        } else {
+            format!("{n} commits")
+        };
+        Self::named(format!("cherry-pick {shown}"), repo, move |r| {
+            r.cherry_pick_range(&shas)
+        })
+        .announcing(format!("picked {shown}"))
+    }
+
+    /// Hands HEAD's authorship to the current user and moves nothing else —
+    /// the tree and the message stand byte-still. A rewrite all the same, so
+    /// the caller confirms before this job is ever built; and HEAD only,
+    /// because a deeper commit's author is a rebase.
+    pub fn reset_author(repo: &Handle) -> Self {
+        Self::named("reset author".into(), repo, |r| r.reset_author())
+            // The new sha lands in a pane the key may not be over — the
+            // author key lives on the commits list, the band is everywhere.
+            .announcing("reset HEAD's author")
+    }
+
     /// Abandons an in-progress cherry-pick and puts branch, index and
     /// working tree back where the pick started — git's own guarantee.
     /// Nothing here to confirm: it only ever runs after a refusal named the
@@ -258,6 +546,121 @@ impl Write {
             r.cherry_pick_continue()
         })
         .announcing("cherry-pick continued")
+    }
+
+    /// Merges `target` into the current branch — regular (`--no-edit`,
+    /// fast-forwarding when git can) or squash (`--squash`, staging the
+    /// collision and committing nothing, which is why a squash's finish
+    /// names the commit the reader still owes). A conflict comes back
+    /// refused in git's words with its question standing for
+    /// [`Write::merge_abort`] or [`Write::merge_continue`].
+    pub fn merge(repo: &Handle, target: Vec<u8>, squash: bool) -> Self {
+        let shown = String::from_utf8_lossy(&target).into_owned();
+        let (name, done) = match squash {
+            false => (format!("merge {shown}"), format!("merged {shown}")),
+            true => (
+                format!("squash-merge {shown}"),
+                format!("squash-merged {shown}; commit to finish"),
+            ),
+        };
+        Self::named(name, repo, move |r| r.merge(&target, squash)).announcing(done)
+    }
+
+    /// Abandons an in-progress merge — branch, index and working tree back
+    /// where the merge started, git's own guarantee.
+    pub fn merge_abort(repo: &Handle) -> Self {
+        Self::named("merge abort".into(), repo, |r| r.merge_abort()).announcing("merge aborted")
+    }
+
+    /// Finishes an in-progress regular merge once the conflicts are
+    /// resolved; the message editor is answered `true` by the trait. A
+    /// squash merge has no merge state to continue and nothing offers this
+    /// for one.
+    pub fn merge_continue(repo: &Handle) -> Self {
+        Self::named("merge continue".into(), repo, |r| r.merge_continue())
+            .announcing("merge continued")
+    }
+
+    /// Steps over the commit a rebase stopped on — that commit's changes
+    /// leave the branch. The one lifecycle verb that destroys work rather
+    /// than restoring it, which is why only a rebase ever offers it.
+    pub fn rebase_skip(repo: &Handle) -> Self {
+        Self::named("rebase skip".into(), repo, |r| r.rebase_skip())
+            .announcing("rebase skipped the commit")
+    }
+
+    /// Abandons an in-progress revert — the tree back where the revert
+    /// started, git's own guarantee.
+    pub fn revert_abort(repo: &Handle) -> Self {
+        Self::named("revert abort".into(), repo, |r| r.revert_abort()).announcing("revert aborted")
+    }
+
+    /// Finishes an in-progress revert once the conflicts are resolved.
+    pub fn revert_continue(repo: &Handle) -> Self {
+        Self::named("revert continue".into(), repo, |r| r.revert_continue())
+            .announcing("revert continued")
+    }
+
+    /// Records one conflicted path as resolved, taking `side`'s answer —
+    /// the acquisition layer owns the how; this names it for the status
+    /// line and announces the choice, since a resolution that came from a
+    /// keypress should say which one it took.
+    pub fn resolve(repo: &Handle, path: Vec<u8>, side: Side) -> Self {
+        let shown = String::from_utf8_lossy(&path).into_owned();
+        let label = match side {
+            Side::Ours => "ours",
+            Side::Theirs => "theirs",
+            Side::Both => "both",
+            Side::Keep => "kept",
+        };
+        Self::named(format!("resolve {shown} ({label})"), repo, move |r| {
+            r.resolve(&path, side)
+        })
+        .announcing(format!("resolved {shown} ({label})"))
+    }
+
+    /// Applies region answers to a conflicted file — the merging view's
+    /// half-answered file, staged region by region. The repo re-reads and
+    /// re-validates against the file as it stands now; this job only names
+    /// the choices for the status line.
+    pub fn resolve_hunks(
+        repo: &Handle,
+        path: Vec<u8>,
+        choices: Vec<(usize, gitten_core::conflict::Answer)>,
+    ) -> Self {
+        let shown = String::from_utf8_lossy(&path).into_owned();
+        let named = choices
+            .iter()
+            .map(|(region, answer)| {
+                let word = match answer {
+                    gitten_core::conflict::Answer::Ours => "ours",
+                    gitten_core::conflict::Answer::Theirs => "theirs",
+                    gitten_core::conflict::Answer::Both => "both",
+                };
+                format!("{region}:{word}")
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        Self::named(format!("resolve {shown} ({named})"), repo, move |r| {
+            r.resolve_hunks(&path, &choices)
+        })
+        .announcing(format!("resolved {shown} ({named})"))
+    }
+
+    /// Puts a conflicted path back the way a region answer found it — the
+    /// bytes on disk and the unmerged stages in the index, both as they
+    /// were read before the choice this undoes.
+    pub fn restore(
+        repo: &Handle,
+        path: Vec<u8>,
+        bytes: Vec<u8>,
+        stages: Vec<gitten_git::UnmergedStage>,
+    ) -> Self {
+        let shown = String::from_utf8_lossy(&path).into_owned();
+        Self::named(format!("undo {shown}"), repo, move |r| {
+            r.restore_conflict(&path, bytes, &stages)
+        })
+        .announcing(format!("undo recorded for {shown}"))
     }
 
     /// Moves the current branch onto `target`, taking as much of the index
@@ -342,14 +745,136 @@ impl Write {
     }
 
     /// Deletes one tag — a name and not a home, so every commit it pointed
-    /// at survives. No tags pane exists yet for anything built-in to aim
-    /// this from; it sits here on the same rails as its siblings so the
-    /// tags pane (a future wave) and any extension reach it through the one
-    /// door, never a private path.
-    #[allow(dead_code)]
+    /// at survives.
     pub fn delete_tag(repo: &Handle, name: Vec<u8>) -> Self {
         let shown = String::from_utf8_lossy(&name).into_owned();
         Self::named(format!("untag {shown}"), repo, move |r| r.delete_tag(&name))
+    }
+
+    /// Pushes one tag to the named remote. The `tag` word rides inside the
+    /// verb (see [`Repo::push_tag`](gitten_git::Repo::push_tag)), so a
+    /// caller can never push a branch by spelling a name two things share.
+    pub fn push_tag(repo: &Handle, remote: Vec<u8>, name: Vec<u8>) -> Self {
+        let shown = String::from_utf8_lossy(&name).into_owned();
+        let at = String::from_utf8_lossy(&remote).into_owned();
+        Self::named(format!("push tag {shown} to {at}"), repo, move |r| {
+            r.push_tag(&remote, &name)
+        })
+    }
+
+    /// Deletes the branch from the named remote, keeping the local branch.
+    pub fn delete_remote_branch(repo: &Handle, remote: Vec<u8>, branch: Vec<u8>) -> Self {
+        let shown = String::from_utf8_lossy(&branch).into_owned();
+        let at = String::from_utf8_lossy(&remote).into_owned();
+        Self::named(format!("delete {shown} from {at}"), repo, move |r| {
+            r.delete_remote_branch(&remote, &branch)
+        })
+    }
+
+    /// Checks `base` out into a new worktree at `path`: `git worktree add`.
+    /// `branch` names a new branch to create there; empty `base` checks
+    /// out HEAD's branch, which git refuses when this tree holds it.
+    pub fn worktree_add(
+        repo: &Handle,
+        path: Vec<u8>,
+        base: Vec<u8>,
+        branch: Option<Vec<u8>>,
+    ) -> Self {
+        let shown = String::from_utf8_lossy(&path).into_owned();
+        Self::named(format!("worktree add {shown}"), repo, move |r| {
+            r.worktree_add(&path, &base, branch.as_deref())
+        })
+        .announcing(format!("worktree at {shown}"))
+    }
+
+    /// Forgets the worktree at `path`. A dirty tree refuses first — in our
+    /// own words, read from the tree itself — so the App can offer the
+    /// force spelling on the next press; anything else is git's sentence.
+    pub fn worktree_remove(repo: &Handle, path: Vec<u8>, force: bool) -> Self {
+        let shown = String::from_utf8_lossy(&path).into_owned();
+        let name = match force {
+            true => format!("worktree remove --force {shown}"),
+            false => format!("worktree remove {shown}"),
+        };
+        Self::named(name, repo, move |r| {
+            if !force {
+                use std::os::unix::ffi::OsStrExt;
+                let at = std::path::Path::new(std::ffi::OsStr::from_bytes(&path));
+                let dirty = gitten_git::open(at)
+                    .status()
+                    .map(|s| !s.is_empty())
+                    .unwrap_or(false);
+                if dirty {
+                    return Err(format!(
+                        "worktree at {shown} has uncommitted changes — press d again to force its removal"
+                    ));
+                }
+            }
+            r.worktree_remove(&path, force)
+        })
+    }
+
+    /// Starts a bisection with `bad` where the bug is and `goods` where it
+    /// is not. The goods ride one argv — one process, one question.
+    pub fn bisect_start(repo: &Handle, bad: Vec<u8>, goods: Vec<Vec<u8>>) -> Self {
+        Self::named("bisect start".into(), repo, move |r| {
+            r.bisect_start(&bad, &goods)
+        })
+        .announcing("bisecting — mark the checkout good, bad, or skipped")
+    }
+
+    /// Marks the bisect checkout good (`rev` empty) or the named commit.
+    pub fn bisect_good(repo: &Handle, rev: Vec<u8>) -> Self {
+        Self::named("bisect good".into(), repo, move |r| r.bisect_good(&rev))
+    }
+
+    /// Marks the bisect checkout bad (`rev` empty) or the named commit.
+    pub fn bisect_bad(repo: &Handle, rev: Vec<u8>) -> Self {
+        Self::named("bisect bad".into(), repo, move |r| r.bisect_bad(&rev))
+    }
+
+    /// Skips the bisect checkout as untestable.
+    pub fn bisect_skip(repo: &Handle, rev: Vec<u8>) -> Self {
+        Self::named("bisect skip".into(), repo, move |r| r.bisect_skip(&rev))
+    }
+
+    /// Ends the bisection, back where it started. Outside one this is the
+    /// quiet no-op, so it takes no confirmation anywhere.
+    pub fn bisect_reset(repo: &Handle) -> Self {
+        Self::named("bisect reset".into(), repo, move |r| r.bisect_reset())
+    }
+
+    /// Points HEAD's ref at `target` with `message` as the reflog sentence —
+    /// undo's and redo's verb. The label names the direction, so the queue
+    /// and the status line read as prose rather than as a git invocation.
+    ///
+    /// **Where HEAD was when this was built is part of the job.** `target`
+    /// is a positional selector — `HEAD@{1}` names whatever the reflog held
+    /// when it was read, not a sha — so a branch switch in a terminal
+    /// between dispatch and execution retargets the undo onto the other
+    /// branch's walk. HEAD is read here — at the confirmation, which is
+    /// where this is built — and read again in the job, and a difference
+    /// refuses before git runs. Same binding as
+    /// [`Write::rebase_plan`](Self::rebase_plan); undo and redo both
+    /// re-derive their selector from a fresh reflog read, so the recovery
+    /// is simply trying again.
+    pub fn move_head(repo: &Handle, label: String, message: &'static str, target: Vec<u8>) -> Self {
+        let confirmed_at = head_sha(repo.as_ref());
+        Self::named(label, repo, move |r| {
+            if let Some(was) = confirmed_at.as_deref() {
+                let now = head_sha(r);
+                if now.as_deref() != Some(was) {
+                    return Err(format!(
+                        "HEAD was {} when this undo was confirmed and is {} now — \
+                         something outside this queue moved it; \
+                         try again for a fresh reading",
+                        abbreviated(was),
+                        now.as_deref().map(abbreviated).unwrap_or("nowhere"),
+                    ));
+                }
+            }
+            r.move_head(&target, message)
+        })
     }
 
     /// Parks the tracked working tree on the stash stack — `git stash push`.
@@ -383,6 +908,79 @@ impl Write {
         Self::named(format!("stash drop stash@{index}"), repo, move |r| {
             r.stash_drop(index)
         })
+    }
+
+    /// Parks a chosen part of the working tree — [`StashScope`] says which,
+    /// and which part is left standing.
+    ///
+    /// The band names the scope rather than the flag: a reader watching a
+    /// job run wants to know *what went*, and `--keep-index` is a fact about
+    /// git's command line.
+    pub fn stash_push_scoped(repo: &Handle, message: Option<String>, scope: StashScope) -> Self {
+        let shown = scope.label();
+        Self::named(format!("stash {shown}"), repo, move |r| {
+            r.stash_push_scoped(message.as_deref(), &scope).map(|_| ())
+        })
+    }
+
+    /// Restores the entry `id` names, keeping it — [`Write::stash_apply`]
+    /// aimed by commit, so a stack that churned between the keypress and the
+    /// queue's turn cannot retarget it. The band says the number the reader
+    /// saw; the write resolves the commit again for itself.
+    pub fn stash_apply_entry(repo: &Handle, id: StashId) -> Self {
+        Self::named(
+            format!("stash apply stash@{{{}}}", id.index),
+            repo,
+            move |r| r.stash_apply_id(&id),
+        )
+    }
+
+    /// [`Write::stash_pop`] aimed by commit. A conflicted restore is git's
+    /// refusal with the entry kept — see [`Repo::stash_pop`].
+    pub fn stash_pop_entry(repo: &Handle, id: StashId) -> Self {
+        Self::named(
+            format!("stash pop stash@{{{}}}", id.index),
+            repo,
+            move |r| r.stash_pop_id(&id),
+        )
+    }
+
+    /// [`Write::stash_drop`] aimed by commit — the verb the identity matters
+    /// most for, because a drop aimed at a stale number destroys work nobody
+    /// chose. DESTRUCTIVE: the caller confirms before this is ever built.
+    pub fn stash_drop_entry(repo: &Handle, id: StashId) -> Self {
+        Self::named(
+            format!("stash drop stash@{{{}}}", id.index),
+            repo,
+            move |r| r.stash_drop_id(&id),
+        )
+    }
+
+    /// Gives a stash entry a new message, keeping its commit. Announces,
+    /// because a rename re-files the entry at the top of the stack — see
+    /// [`Repo::stash_rename`] for why git leaves no other shape — and a row
+    /// that moved without a word looks like a different entry.
+    pub fn stash_rename(repo: &Handle, id: StashId, message: String) -> Self {
+        let shown = message.clone();
+        Self::named(format!("rename stash@{{{}}}", id.index), repo, move |r| {
+            r.stash_rename(&id, &message)
+        })
+        .announcing(format!("renamed to {shown}, now at the top of the stack"))
+    }
+
+    /// Starts a branch from a stash entry: the stash's own base commit,
+    /// checked out under `name`, with the entry applied and its index
+    /// intact. Announces — the effect is a checkout the eye may be nowhere
+    /// near.
+    pub fn stash_branch(repo: &Handle, id: StashId, name: Vec<u8>) -> Self {
+        let shown = String::from_utf8_lossy(&name).into_owned();
+        let at = id.index;
+        Self::named(
+            format!("branch {shown} from stash@{{{at}}}"),
+            repo,
+            move |r| r.stash_branch(&id, &name),
+        )
+        .announcing(format!("{shown} starts where stash@{{{at}}} was made"))
     }
 
     // ------------------------------------------------------------ the sync
@@ -446,6 +1044,103 @@ impl Write {
         };
         Ok(Self::push(repo, remote, branch.as_bytes().to_vec()))
     }
+
+    /// Checks out the remote-tracking ref `remote/branch` as a local branch
+    /// that tracks it — [`Repo::checkout_tracking`]'s job. The local name is
+    /// git's choice (the branch's own), so it is not an argument here.
+    pub fn checkout_tracking(repo: &Handle, remote: Vec<u8>, branch: Vec<u8>) -> Self {
+        let shown = shown_pair(&remote, &branch);
+        Self::named(format!("checkout {shown} (tracking)"), repo, move |r| {
+            r.checkout_tracking(&remote, &branch)
+        })
+        // HEAD's branch changes and the branches pane may not be focused —
+        // the key lives over a remote row — so this one says what it did.
+        .announcing(format!("checked out {shown} as a tracking branch"))
+    }
+
+    /// Checks out the branch HEAD sat on before this one. Nothing here to
+    /// confirm: it only ever moves HEAD along the reflog, and the tree it
+    /// lands on is whatever that checkout makes of the changes — git's own
+    /// refusals (none recorded, diverged trees) surface verbatim.
+    pub fn checkout_previous(repo: &Handle) -> Self {
+        Self::named("checkout previous".into(), repo, |r| r.checkout_previous())
+            .announcing("checked out the previous branch")
+    }
+
+    /// Checks out `name` over any local changes. DESTRUCTIVE: the caller
+    /// confirms before this job is ever built.
+    pub fn checkout_force(repo: &Handle, name: Vec<u8>) -> Self {
+        let shown = String::from_utf8_lossy(&name).into_owned();
+        Self::named(format!("force-checkout {shown}"), repo, move |r| {
+            r.checkout_force(&name)
+        })
+        .announcing(format!("checked out {shown}, local changes discarded"))
+    }
+
+    /// Makes local branch `local` track `remote/branch` — the link only,
+    /// never a fetch or a merge, which is why no confirmation precedes it.
+    pub fn set_upstream(repo: &Handle, local: Vec<u8>, remote: Vec<u8>, branch: Vec<u8>) -> Self {
+        let shown = shown_pair(&remote, &branch);
+        let local_shown = String::from_utf8_lossy(&local).into_owned();
+        Self::named(format!("track {shown} on {local_shown}"), repo, move |r| {
+            r.set_upstream(&local, &remote, &branch)
+        })
+        .announcing(format!("{local_shown} now tracks {shown}"))
+    }
+
+    /// Severs local branch `local`'s tracking link. Recoverable by setting
+    /// one again, so no confirmation precedes it.
+    pub fn unset_upstream(repo: &Handle, local: Vec<u8>) -> Self {
+        let shown = String::from_utf8_lossy(&local).into_owned();
+        Self::named(format!("untrack {shown}"), repo, move |r| {
+            r.unset_upstream(&local)
+        })
+        .announcing(format!("{shown} no longer tracks an upstream"))
+    }
+
+    /// Fast-forwards local branch `local` onto `remote/branch` — never
+    /// sideways; which git verb the checked-out case needs is the trait's
+    /// decision, read fresh from HEAD. A divergence comes back refused in
+    /// git's words with the branch left standing.
+    pub fn fast_forward(repo: &Handle, local: Vec<u8>, remote: Vec<u8>, branch: Vec<u8>) -> Self {
+        let shown = shown_pair(&remote, &branch);
+        let local_shown = String::from_utf8_lossy(&local).into_owned();
+        Self::named(
+            format!("fast-forward {local_shown} to {shown}"),
+            repo,
+            move |r| r.fast_forward(&local, &remote, &branch),
+        )
+        .announcing(format!("fast-forwarded {local_shown} to {shown}"))
+    }
+
+    /// Introduces a remote by name and URL. A duplicate name is git's own
+    /// refusal, verbatim.
+    pub fn add_remote(repo: &Handle, name: Vec<u8>, url: Vec<u8>) -> Self {
+        let shown = String::from_utf8_lossy(&name).into_owned();
+        Self::named(format!("add remote {shown}"), repo, move |r| {
+            r.add_remote(&name, &url)
+        })
+        .announcing(format!("added remote {shown}"))
+    }
+
+    /// Points remote `name` at `url`.
+    pub fn set_remote_url(repo: &Handle, name: Vec<u8>, url: Vec<u8>) -> Self {
+        let shown = String::from_utf8_lossy(&name).into_owned();
+        Self::named(format!("set-url {shown}"), repo, move |r| {
+            r.set_remote_url(&name, &url)
+        })
+        .announcing(format!("{shown} now points at the new URL"))
+    }
+
+    /// Forgets remote `name`, its remote-tracking branches going with it.
+    /// DESTRUCTIVE: the caller confirms before this job is ever built.
+    pub fn remove_remote(repo: &Handle, name: Vec<u8>) -> Self {
+        let shown = String::from_utf8_lossy(&name).into_owned();
+        Self::named(format!("remove remote {shown}"), repo, move |r| {
+            r.remove_remote(&name)
+        })
+        .announcing(format!("removed remote {shown}"))
+    }
 }
 
 /// Two byte-names as a person reads them, once: the band's words and the
@@ -472,6 +1167,113 @@ fn default_remote(remotes: &[Remote]) -> Result<Vec<u8>, String> {
          push it from the branches panel to set one"
             .into(),
     )
+}
+
+/// The steps [`Write::graft_patch`] runs as one job. Each step names its
+/// own failure; the reader's position is restored before any error
+/// leaves, except the one state that is meant to stand: a replay stopped
+/// on a conflict, which the lifecycle owns from there and the refresh
+/// wave will draw.
+fn graft(
+    r: &dyn Repo,
+    sha: &[u8],
+    files: &[(Vec<u8>, Vec<u8>)],
+    reverse: bool,
+) -> Result<(), String> {
+    if !r.status()?.is_empty() {
+        return Err("stow or commit the working tree first — a graft needs a clean tree".into());
+    }
+    if r.operation().is_some() {
+        return Err("a standing operation waits — abort it or finish it first".into());
+    }
+    let home = r.head()?;
+    if matches!(&home, HeadState::Branch { commit: None, .. }) {
+        return Err("no commits to rewrite yet".into());
+    }
+    // A detached HEAD has no branch to carry the rewrite: the dance
+    // below would detach at the commit, amend a replacement, and then
+    // check out the old commit again — the replacement dangling
+    // unreferenced while the visible state reads byte-identical to
+    // before. Refuse up front, naming the door, before anything moves.
+    if let HeadState::Detached { commit } = &home {
+        return Err(format!(
+            "checkout a branch first — grafting onto a detached HEAD would leave the rewrite dangling at {}",
+            abbreviated(commit)
+        ));
+    }
+    // Detach at the commit being rewritten: its content is then the
+    // worktree, so every patch aims at exactly what it was built from.
+    r.checkout(sha)?;
+    let restore = |r: &dyn Repo| {
+        // Back to the detached commit's own content first: a bare
+        // checkout refuses to overwrite the graft's half-applied work,
+        // stranding the reader detached. Reset hard — the commit is
+        // untouched, only worktree and index move, and the graft required
+        // a clean tree so nothing but its own work can be in the way —
+        // then go home.
+        let _ = r.reset(ResetMode::Hard, sha);
+        let _ = match &home {
+            HeadState::Branch { name, .. } => r.checkout(name.as_bytes()),
+            HeadState::Detached { commit } => r.checkout(commit.as_bytes()),
+        };
+    };
+    let amended = (|| {
+        for (path, patch) in files {
+            if reverse {
+                r.discard_patch(patch)?;
+            } else {
+                r.apply_patch(patch)?;
+            }
+            r.stage(path)?;
+        }
+        // Lifting a commit's only change does not rewrite it — it
+        // deletes it, and git's own amend refuses an empty result for
+        // exactly that reason. The graft refuses first, naming the door
+        // that owns it, before the position or the history moves.
+        if r.graft_empties(sha)? {
+            let short = String::from_utf8_lossy(sha);
+            let short = short.chars().take(8).collect::<String>();
+            return Err(format!(
+                "removing this would empty {short} — drop the commit instead"
+            ));
+        }
+        r.amend_no_edit()
+    })();
+    let new = match amended {
+        Ok(new) => new,
+        Err(e) => {
+            restore(r);
+            return Err(e);
+        }
+    };
+    match &home {
+        HeadState::Detached { commit } => {
+            r.checkout(commit.as_bytes())?;
+            Ok(())
+        }
+        HeadState::Branch { name, commit } => {
+            r.checkout(name.as_bytes())?;
+            // The rewritten commit was the tip: no descendants to replay,
+            // so the branch steps onto the replacement — what the replay
+            // would have meant with an empty range.
+            if commit.as_deref() == Some(String::from_utf8_lossy(sha).as_ref()) {
+                r.reset(ResetMode::Hard, new.as_bytes())?;
+                return Ok(());
+            }
+            match r.rebase_onto_base(new.as_bytes(), sha) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    if r.operation().is_some() {
+                        Err(format!(
+                            "the replay stopped on a conflict — resolve it and continue, or abort: {e}"
+                        ))
+                    } else {
+                        Err(e)
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl Job for Write {
@@ -655,6 +1457,55 @@ mod tests {
                 .push(format!("stash drop stash@{index}"));
             Ok(())
         }
+        fn stash_push_scoped(
+            &self,
+            message: Option<&str>,
+            scope: &StashScope,
+        ) -> gitten_git::Result<usize> {
+            self.0.lock().unwrap().push(format!(
+                "stash push {:?} {:?} [{}]",
+                message,
+                scope.label(),
+                scope.flags().join(" ")
+            ));
+            Ok(0)
+        }
+        fn stash_apply_id(&self, id: &StashId) -> gitten_git::Result<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("stash apply {}", id.commit));
+            Ok(())
+        }
+        fn stash_pop_id(&self, id: &StashId) -> gitten_git::Result<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("stash pop {}", id.commit));
+            Ok(())
+        }
+        fn stash_drop_id(&self, id: &StashId) -> gitten_git::Result<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("stash drop {}", id.commit));
+            Ok(())
+        }
+        fn stash_rename(&self, id: &StashId, message: &str) -> gitten_git::Result<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("stash rename {} {message}", id.commit));
+            Ok(())
+        }
+        fn stash_branch(&self, id: &StashId, name: &[u8]) -> gitten_git::Result<()> {
+            self.0.lock().unwrap().push(format!(
+                "stash branch {} {}",
+                String::from_utf8_lossy(name),
+                id.commit
+            ));
+            Ok(())
+        }
     }
 
     fn recorded(calls: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
@@ -836,6 +1687,309 @@ mod tests {
                 "stash drop stash@3",
             ],
             "the band names are the verbs' own words"
+        );
+    }
+
+    /// A repository whose HEAD moves out from under the queue: the first
+    /// read answers `before` — the confirmation's read — and every later one
+    /// answers `after`, which is exactly the shape of a commit typed in a
+    /// terminal while a plan stood open.
+    struct Moving {
+        before: String,
+        after: String,
+        reads: Arc<Mutex<usize>>,
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Repo for Moving {
+        fn log(&self, _: usize) -> gitten_git::Result<Vec<Commit>> {
+            Ok(Vec::new())
+        }
+        fn pairs(&self, _: &str) -> gitten_git::Result<Vec<gitten_git::Pair>> {
+            Ok(Vec::new())
+        }
+        fn status(&self) -> gitten_git::Result<Status> {
+            Ok(Status::default())
+        }
+        fn describe(&self) -> String {
+            "moving".into()
+        }
+        fn head(&self) -> gitten_git::Result<HeadState> {
+            let mut reads = self.reads.lock().unwrap();
+            *reads += 1;
+            let commit = match *reads {
+                1 => self.before.clone(),
+                _ => self.after.clone(),
+            };
+            Ok(HeadState::Branch {
+                name: RefName::from("main"),
+                commit: Some(commit),
+            })
+        }
+        fn rebase_plan(&self, _plan: &Plan) -> gitten_git::Result<()> {
+            self.calls.lock().unwrap().push("rebase_plan".into());
+            Ok(())
+        }
+        fn move_head(&self, _target: &[u8], _message: &str) -> gitten_git::Result<()> {
+            self.calls.lock().unwrap().push("move_head".into());
+            Ok(())
+        }
+    }
+
+    /// Three commits, newest first, as a loaded window reads.
+    fn window() -> Vec<Commit> {
+        ["head", "mid", "under", "root"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| Commit {
+                sha: format!("{name}-sha"),
+                short: (*name).into(),
+                parents: match i {
+                    3 => Box::new([]) as Box<[String]>,
+                    _ => Box::new([format!("{}-sha", ["head", "mid", "under", "root"][i + 1])]),
+                },
+                author: "a".into(),
+                timestamp: 0,
+                subject: format!("{name} subject"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_confirmed_plan_refuses_a_head_that_moved_outside_the_queue() {
+        // The plan is built and confirmed against a window whose newest sha
+        // is what HEAD held then. Nothing of ours writes in between — no
+        // generation bumps, no queue activity at all — and HEAD moves
+        // anyway. The job must refuse rather than replay four shas the
+        // branch no longer has.
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let repo: Handle = Arc::new(Moving {
+            before: "head-sha".into(),
+            after: "somebody-elses-sha".into(),
+            reads: Arc::new(Mutex::new(0)),
+            calls: Arc::clone(&calls),
+        });
+        let plan = Plan::over(&window(), 2).expect("a window of three picks");
+        let runner = Runner::new();
+        assert!(runner
+            .submitter()
+            .submit(Box::new(Write::rebase_plan(&repo, plan)))
+            .is_ok());
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let refusal = loop {
+            assert!(Instant::now() < deadline, "the job never finished");
+            if let Some(Event::Finished { outcome, .. }) = runner.try_next() {
+                break outcome;
+            }
+            std::thread::yield_now();
+        };
+        let Err(said) = refusal else {
+            panic!("a plan confirmed at a sha HEAD no longer holds was replayed");
+        };
+        assert!(
+            said.contains("head-sha") && said.contains("somebody"),
+            "the refusal names both shas: {said}"
+        );
+        assert!(
+            recorded(&calls).is_empty(),
+            "git was reached anyway: {:?}",
+            recorded(&calls)
+        );
+    }
+
+    #[test]
+    fn a_confirmed_plan_runs_when_head_is_where_it_was_left() {
+        // The same job against a HEAD that did not move: the comparison must
+        // not become a refusal every plan trips over.
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let repo: Handle = Arc::new(Moving {
+            before: "head-sha".into(),
+            after: "head-sha".into(),
+            reads: Arc::new(Mutex::new(0)),
+            calls: Arc::clone(&calls),
+        });
+        let plan = Plan::over(&window(), 2).expect("a window of three picks");
+        let runner = Runner::new();
+        assert!(runner
+            .submitter()
+            .submit(Box::new(Write::rebase_plan(&repo, plan)))
+            .is_ok());
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while recorded(&calls).is_empty() {
+            assert!(Instant::now() < deadline, "the plan never ran");
+            std::thread::yield_now();
+        }
+        assert_eq!(recorded(&calls), vec!["rebase_plan"]);
+    }
+
+    #[test]
+    fn a_confirmed_undo_refuses_a_head_that_moved_outside_the_queue() {
+        // The undo job is built against a HEAD, then somebody switches
+        // branches in a terminal before the queue runs it: `HEAD@{1}`
+        // would now name the other branch's walk. The job must refuse
+        // rather than move a ref the reader never meant.
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let repo: Handle = Arc::new(Moving {
+            before: "head-sha".into(),
+            after: "somebody-elses-sha".into(),
+            reads: Arc::new(Mutex::new(0)),
+            calls: Arc::clone(&calls),
+        });
+        let runner = Runner::new();
+        assert!(runner
+            .submitter()
+            .submit(Box::new(Write::move_head(
+                &repo,
+                "undo (commit)".into(),
+                gitten_core::refs::UNDO_MESSAGE,
+                b"HEAD@{1}".to_vec()
+            )))
+            .is_ok());
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let refusal = loop {
+            assert!(Instant::now() < deadline, "the job never finished");
+            if let Some(Event::Finished { outcome, .. }) = runner.try_next() {
+                break outcome;
+            }
+            std::thread::yield_now();
+        };
+        let Err(said) = refusal else {
+            panic!("an undo confirmed at a sha HEAD no longer holds was replayed");
+        };
+        assert!(
+            said.contains("head-sha") && said.contains("somebody"),
+            "the refusal names both shas: {said}"
+        );
+        assert!(
+            recorded(&calls).is_empty(),
+            "git was reached anyway: {:?}",
+            recorded(&calls)
+        );
+    }
+
+    #[test]
+    fn a_confirmed_undo_runs_when_head_is_where_it_was_left() {
+        // The same job against a HEAD that did not move: the comparison
+        // must not become a refusal every undo trips over.
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let repo: Handle = Arc::new(Moving {
+            before: "head-sha".into(),
+            after: "head-sha".into(),
+            reads: Arc::new(Mutex::new(0)),
+            calls: Arc::clone(&calls),
+        });
+        let runner = Runner::new();
+        assert!(runner
+            .submitter()
+            .submit(Box::new(Write::move_head(
+                &repo,
+                "undo (commit)".into(),
+                gitten_core::refs::UNDO_MESSAGE,
+                b"HEAD@{1}".to_vec()
+            )))
+            .is_ok());
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while recorded(&calls).is_empty() {
+            assert!(Instant::now() < deadline, "the undo never ran");
+            std::thread::yield_now();
+        }
+        assert_eq!(recorded(&calls), vec!["move_head"]);
+    }
+
+    #[test]
+    fn the_scoped_and_identified_stash_verbs_reach_the_trait_by_commit() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let repo: Handle = Arc::new(Recording(Arc::clone(&calls)));
+        let runner = Runner::new();
+        let submit = runner.submitter();
+        let id = StashId {
+            index: 1,
+            commit: "cafebabe".into(),
+        };
+
+        let jobs: Vec<Box<dyn Job>> = vec![
+            Box::new(Write::stash_push_scoped(
+                &repo,
+                Some("index only".into()),
+                StashScope::Staged,
+            )),
+            Box::new(Write::stash_push_scoped(
+                &repo,
+                None,
+                StashScope::Path {
+                    path: "notes.md".into(),
+                    untracked: true,
+                },
+            )),
+            Box::new(Write::stash_apply_entry(&repo, id.clone())),
+            Box::new(Write::stash_pop_entry(&repo, id.clone())),
+            Box::new(Write::stash_drop_entry(&repo, id.clone())),
+            Box::new(Write::stash_rename(
+                &repo,
+                id.clone(),
+                "the parser one".into(),
+            )),
+            Box::new(Write::stash_branch(&repo, id.clone(), b"wip".to_vec())),
+        ];
+        for job in jobs {
+            assert!(submit.submit(job).is_ok());
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while recorded(&calls).len() < 7 {
+            assert!(
+                Instant::now() < deadline,
+                "jobs did not run: {:?}",
+                recorded(&calls)
+            );
+            std::thread::yield_now();
+        }
+        // The scope travels as the concept and spells its own flags where
+        // git is called; the entry travels as its **commit**, so nothing a
+        // renumbering does between the keypress and here can retarget it.
+        assert_eq!(
+            recorded(&calls),
+            vec![
+                "stash push Some(\"index only\") \"the staged side\" [--staged]",
+                "stash push None \"notes.md\" [-u]",
+                "stash apply cafebabe",
+                "stash pop cafebabe",
+                "stash drop cafebabe",
+                "stash rename cafebabe the parser one",
+                "stash branch wip cafebabe",
+            ]
+        );
+
+        let mut band = Vec::new();
+        while let Some(event) = runner.try_next() {
+            match event {
+                Event::Started { name } => band.push(name),
+                Event::Finished { done, .. } => {
+                    if let Some(done) = done {
+                        band.push(format!("done: {done}"));
+                    }
+                }
+            }
+        }
+        // The band names the scope rather than the flag, and the number the
+        // reader saw rather than the commit they did not.
+        assert_eq!(
+            band,
+            vec![
+                "stash the staged side",
+                "stash notes.md",
+                "stash apply stash@{1}",
+                "stash pop stash@{1}",
+                "stash drop stash@{1}",
+                "rename stash@{1}",
+                "done: renamed to the parser one, now at the top of the stack",
+                "branch wip from stash@{1}",
+                "done: wip starts where stash@{1} was made",
+            ]
         );
     }
 
@@ -1337,6 +2491,35 @@ mod tests {
                 Some("fetched or\u{FFFD}gin".into()),
             ]
         );
+    }
+
+    #[test]
+    fn reset_upstream_names_the_tracking_ref_in_full() {
+        // The aim is read, and named the way git resolves it: `up/main`,
+        // not `@{upstream}`, so the question a reader confirms and the
+        // revspec git is handed are the same string.
+        let fake = Arc::new(SyncFake::tracked(Some("up"), &["up"]));
+        let repo: Handle = fake.clone();
+        let job = Write::reset_upstream(&repo, ResetMode::Hard).expect("an aim");
+        assert_eq!(job.name(), "reset --hard up/main");
+        assert_eq!(fake.said(), Vec::<String>::new(), "nothing ran yet");
+
+        // No upstream configured: a sentence, not a job git would answer
+        // with a revspec error.
+        let fake = Arc::new(SyncFake::tracked(None, &["origin"]));
+        let repo: Handle = fake.clone();
+        let err = Write::reset_upstream(&repo, ResetMode::Mixed)
+            .err()
+            .expect("refused");
+        assert!(err.contains("no upstream"), "{err}");
+
+        // Detached HEAD is not a branch, so it tracks nothing.
+        let fake = Arc::new(SyncFake::detached());
+        let repo: Handle = fake.clone();
+        let err = Write::reset_upstream(&repo, ResetMode::Soft)
+            .err()
+            .expect("refused");
+        assert!(err.contains("detached"), "{err}");
     }
 
     #[test]

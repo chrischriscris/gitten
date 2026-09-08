@@ -55,6 +55,7 @@ rather than nine.
 | [0028](0028-settings-live-in-a-panel.md) | The settings live in a panel, not in the title strip |
 | [0029](0029-settings-live-in-a-window.md) | The settings live in a window, not in a panel |
 | [0030](0030-window-before-acquisition.md) | The desktop opens its window before it acquires |
+| [0031](0031-the-sidebar-is-tabbed-sections.md) | The terminal sidebar is tabbed sections, not eight slices |
 
 **0011 is deliberately absent.** It was a rendered-Markdown reader that was built,
 looked at, judged broken and parked in a `git stash` rather than deleted. The

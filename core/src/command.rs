@@ -37,6 +37,7 @@
 //! enough for a help screen, and enough for the config layer to say "no such
 //! command" instead of binding a key to nothing.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 /// Which physical key, ignoring modifiers.
@@ -334,6 +335,10 @@ impl Keymap {
         // of the keyboard for a panel at the edge of the app's life.
         bind(GLOBAL, "`", "message.show");
         bind(GLOBAL, "esc", "back");
+        // The patch clipboard's door, on lazygit's own ctrl+p: the menu
+        // names the targets and the builder, and every answer is a command
+        // of its own — nothing here writes, so it asks nothing twice.
+        bind(GLOBAL, "ctrl-p", "patch.menu");
 
         bind(GLOBAL, "j", "view.down");
         bind(GLOBAL, "down", "view.down");
@@ -390,6 +395,13 @@ impl Keymap {
         // reads, not a fetch. The queue's own finish does the same dance
         // after every write; this is the same wave, asked for by hand.
         bind(GLOBAL, "R", "repo.refresh");
+        // lazygit's undo pair, global because history is not a pane's: z
+        // walks the last HEAD move back, Z walks forward again behind our
+        // own undo. One shadow: [commits] answers Z with the cherry-pick
+        // abort, the older and more urgent door — redo stays a pane away,
+        // on every list but that one.
+        bind(GLOBAL, "z", "history.undo");
+        bind(GLOBAL, "Z", "history.redo");
         // The recent-repositories switcher, global because a repository is
         // what every pane reads from: lowercase opens the list, capital
         // types a path instead. Stepping between recents stays unbound —
@@ -423,10 +435,78 @@ impl Keymap {
         // lazygit's shift-stash: park what the working tree holds and start
         // again from HEAD.
         bind("files", "s", "files.stash");
+        // lazygit's capital beside it: the stash *choices*, behind a menu of
+        // their own for the reason the reset menu is — `m`, `u` and `f` all
+        // mean something somewhere else, and a question's mode borrows them
+        // only while it stands. `s` inside it is the staged side, which is
+        // the same letter the pane's own `s` uses for the whole tree: the
+        // menu is the qualifier.
+        bind("files", "S", "files.stash-menu");
+        bind("stash", "m", "files.stash-named");
+        bind("stash", "s", "files.stash-staged");
+        bind("stash", "u", "files.stash-unstaged");
+        bind("stash", "U", "files.stash-untracked");
+        bind("stash", "f", "files.stash-file");
+        // The patch menu's answers, in a mode of their own for the reason
+        // the stash menu is: `a` and `i` apply the clipboard forwards onto
+        // the worktree and the index, `r` and `u` reverse it off them, `b`
+        // opens the builder, `m` moves the patch onto a named branch, and
+        // `c` clears the clipboard.
+        bind("patch", "a", "patch.apply-worktree");
+        bind("patch", "i", "patch.apply-index");
+        bind("patch", "r", "patch.reverse-worktree");
+        bind("patch", "u", "patch.reverse-index");
+        bind("patch", "b", "patch.show");
+        bind("patch", "m", "patch.move-to-branch");
+        bind("patch", "c", "patch.clear");
+        // lazygit's files-panel reset menu, on its own `g`: the strengths
+        // aim at the *upstream* rather than at a row, and the nuke throws
+        // the working tree away. It shadows the global `view.top` inside
+        // this pane, the trade [stashes] already makes for its own `g`, and
+        // `home` still reaches the top. The answers live in a mode of their
+        // own — pushed only while the question stands — because `s`, `h`
+        // and `D` all mean something else in this pane the rest of the time,
+        // which is the menu doing its job rather than stealing three keys.
+        bind("files", "g", "files.reset-menu");
+        bind("upstream", "s", "files.reset-upstream-soft");
+        bind("upstream", "m", "files.reset-upstream-mixed");
+        bind("upstream", "h", "files.reset-upstream-hard");
+        // lazygit's own letter for the nuke, reachable here rather than on
+        // the pane itself: `D` on a row discards *that file*, and the two
+        // are a keypress and a catastrophe apart.
+        bind("upstream", "D", "files.nuke");
+        // A conflict row's four answers. Lazygit reaches them through a
+        // main-view merging UI; here they are file-level and live beside the
+        // rows that name the conflict — ours/theirs take the two stages,
+        // both concatenates them, keep records the file as it stands.
+        bind("files", "o", "files.resolve-ours");
+        bind("files", "t", "files.resolve-theirs");
+        bind("files", "b", "files.resolve-both");
+        bind("files", "k", "files.resolve-keep");
         // The commit list's live filter, over the working tree: `/` opens a
         // query and every edit narrows the list in place — the same verb
         // every list pane answers to, on the key lazygit keeps free here.
         bind("files", "/", "files.search");
+        // Enter previews the row's own side — the door the commits list's
+        // enter already opens, one pane over — and tab flips the previewed
+        // side for the same file, the only file-side key left free here.
+        bind("files", "enter", "files.open-diff");
+        bind("files", "tab", "files.toggle-side");
+
+        // The merging view's region answers, on lazygit's merging keys:
+        // space takes whichever half the keyboard is on, o/t/b take a side
+        // by name, z undoes this session's last answer (the snapshot it
+        // restores dies with the view and any refresh), left/right walk the
+        // conflicts, and M hands whole-file choices back to the conflict
+        // row's own o/t/b/k. Esc is `back`, already global.
+        bind("merge", "space", "merge.take-side");
+        bind("merge", "o", "merge.take-ours");
+        bind("merge", "t", "merge.take-theirs");
+        bind("merge", "b", "merge.take-both");
+        bind("merge", "z", "merge.undo");
+        bind("merge", "M", "merge.options");
+        bind("merge", "left", "merge.prev-conflict");
+        bind("merge", "right", "merge.next-conflict");
 
         // The stash stack, on lazygit's own three: space applies and keeps,
         // g pops — apply, then drop only when the apply was clean — and d
@@ -440,6 +520,73 @@ impl Keymap {
         // The live filter again, over the stash stack — the messages are
         // what a query matches, the addresses what the rows are for.
         bind("stashes", "/", "stashes.search");
+        // Enter previews the entry's diff — the parked work, seen before
+        // anything is applied to the working tree.
+        bind("stashes", "enter", "stashes.open-diff");
+        // lazygit's other two on this pane: r renames the entry, n starts a
+        // branch where it was made. Both open a field, so neither writes on
+        // the press that opens it.
+        bind("stashes", "r", "stashes.rename");
+        bind("stashes", "n", "stashes.new-branch");
+        // lazygit's `w`: a new checkout starting where the entry was
+        // made — the stash commit itself, which git checks out detached.
+        bind("stashes", "w", "stashes.new-worktree");
+
+        // The remotes panel's verbs, on lazygit's keys: f fetches the
+        // selected remote's tracking branches, n introduces one (two
+        // prompts — name, then URL), e repoints it, d forgets it (twice-
+        // pressed — the tracking branches go with it). The pane has no
+        // number by the same trade the status slot makes: it is one more
+        // list in the cycle, on the ctrl-j/ctrl-k keys every sidebar list
+        // shares.
+        bind("remotes", "f", "remotes.fetch");
+        bind("remotes", "n", "remotes.new");
+        bind("remotes", "e", "remotes.edit");
+        bind("remotes", "d", "remotes.remove");
+        bind("remotes", "/", "remotes.search");
+
+        // The tags panel's verbs, on lazygit's keys: space checks the tag
+        // out detached, n names a new one (annotated when the message
+        // field comes back nonempty, lightweight when it comes back
+        // empty), d forgets it (twice-pressed — the commits survive), P
+        // pushes it (the remote rides the prompt; tags track nothing, so
+        // there is no upstream to default to). No number, like remotes:
+        // one more list in the ctrl-j/ctrl-k cycle.
+        bind("tags", "space", "tags.checkout");
+        bind("tags", "n", "tags.new");
+        bind("tags", "d", "tags.delete");
+        bind("tags", "P", "tags.push");
+        bind("tags", "/", "tags.search");
+        // lazygit's `w`: a new checkout at the commit the tag names.
+        bind("tags", "w", "tags.new-worktree");
+
+        // The reflog panel's verbs: space puts the current branch back
+        // onto the entry (reset --soft — index and worktree untouched) or
+        // checks the entry out when HEAD is detached. One key because
+        // recovery is one question; the preview names the move.
+        bind("reflog", "space", "reflog.recover");
+        bind("reflog", "/", "reflog.search");
+
+        // The worktrees panel's verbs, on lazygit's keys: n checks a
+        // starting point out into a new checkout (two prompts — from,
+        // then path), d forgets the row (twice-pressed, upgrading past a
+        // dirty refusal on the third), space opens the checkout as a
+        // repository. No number, like remotes: one more list in the
+        // ctrl-j/ctrl-k cycle.
+        bind("worktrees", "n", "worktrees.new");
+        bind("worktrees", "d", "worktrees.remove");
+        bind("worktrees", "space", "worktrees.switch");
+        bind("worktrees", "/", "worktrees.search");
+
+        // The bisect question's answers, on the reset question's terms:
+        // single letters reused contextually, above the pane's own
+        // bindings and only while the question stands. `b` opens the
+        // question (or the start field when the tree is clean); here `b`
+        // judges bad, `g` good, `s` skips, `r` resets.
+        bind("bisect", "g", "commits.bisect-good");
+        bind("bisect", "b", "commits.bisect-bad");
+        bind("bisect", "s", "commits.bisect-skip");
+        bind("bisect", "r", "commits.bisect-reset");
 
         // The branches panel, on lazygit's own letters: space checks out the
         // branch under the keyboard, n names a new one, r rebases the
@@ -453,9 +600,34 @@ impl Keymap {
         bind("branches", "R", "branches.rename");
         bind("branches", "d", "branches.delete");
         bind("branches", "T", "branches.new-tag");
+        // lazygit's `c`: check out by typing a name, when the row is not the
+        // one to walk to.
+        bind("branches", "c", "branches.checkout-name");
+        // lazygit's `-`: back to the branch HEAD sat on before this one.
+        bind("branches", "-", "branches.checkout-previous");
+        // Force is checkout's destructive spelling, and takes the capital
+        // beside its quiet sibling — the twice-press is the confirmation.
+        bind("branches", "F", "branches.force-checkout");
+        // Upstream movements. `f` shadows repo.fetch inside this pane —
+        // lazygit makes the same trade, and the fetch stays one pane away —
+        // and `u`/`U` are lazygit's own set/unset letters.
+        bind("branches", "f", "branches.fast-forward");
+        bind("branches", "u", "branches.set-upstream");
+        bind("branches", "U", "branches.unset-upstream");
+        // lazygit's m on a branch row: bring the selected branch into the
+        // one HEAD is on. The menu it opens becomes two keys — lowercase
+        // regular, capital squash — because a squash's finish (staged,
+        // uncommitted) is a different sentence a reader acts on differently.
+        bind("branches", "m", "branches.merge");
+        bind("branches", "M", "branches.merge-squash");
         // The live filter over the ref list — the pane where sixteen
         // machine-named worktree branches are exactly why a query exists.
         bind("branches", "/", "branches.search");
+        // Enter drills down: the branch's own history, in the main pane.
+        bind("branches", "enter", "branches.open-log");
+        // lazygit's `w`: a new checkout starting at this row — the branch
+        // itself, or the remote-tracking ref for a remote row.
+        bind("branches", "w", "branches.new-worktree");
 
         bind("diff", "s", "diff.cycle-layout");
         bind("diff", "w", "diff.cycle-wrap");
@@ -463,6 +635,17 @@ impl Keymap {
         bind("diff", "[", "diff.prev-file");
         bind("diff", "tab", "diff.next-file");
         bind("diff", "backtab", "diff.prev-file");
+        // The live query over the diff, on the same key every list answers
+        // to: it walks the keyboard to each match — a filtered diff is not a
+        // diff — and `n`/`N` walk on from there, wrapping.
+        bind("diff", "/", "diff.search");
+        // lazygit's next/previous hunk. Upstream reaches them with the
+        // arrows and h/l in the staging panel; here the arrows and h/l are
+        // the pane walk and the sideways scroll, so the hunks take the
+        // modified arrows — a deliberate difference, said here and in the
+        // ledger.
+        bind("diff", "alt-down", "diff.next-hunk");
+        bind("diff", "alt-up", "diff.prev-hunk");
         // The keyboard acts on the hunk it sits on, on lazygit's staging key:
         // space sends the hunk to the index, `u` brings it back (one less
         // finger than a shifted key, and nothing else claims it here — the
@@ -473,6 +656,28 @@ impl Keymap {
         bind("diff", "space", "diff.stage-hunk");
         bind("diff", "u", "diff.unstage-hunk");
         bind("diff", "D", "diff.discard-hunk");
+        // lazygit's selection unit and range: `a` says which unit the verbs
+        // above act on — the whole hunk, or the marked lines — and `v`
+        // marks the range, the same key every list pane already answers.
+        bind("diff", "a", "diff.toggle-line-selection");
+        bind("diff", "v", "select.mark");
+        // The patch clipboard's pick, on the free `p`: the hunk — or the
+        // marked lines — under the keyboard joins the clipboard, from any
+        // diff that names a read. Commits and stashes keep as drawn (their
+        // reads are immutable); working-tree sides are re-read and matched
+        // before anything is kept.
+        bind("diff", "p", "patch.pick");
+        // History surgery from a commit's diff, where the staging verbs
+        // have nothing to aim at: `d` lifts the hunk out of the commit it
+        // belongs to, `X` the whole file under the keyboard, `c` checks
+        // the file out of the commit, and `A` amends the commit with the
+        // clipboard. `D` stays the working-tree discard everywhere — one
+        // key names one command per mode, so the file scope takes the free
+        // capital beside it. Every one rewrites history and asks twice.
+        bind("diff", "d", "patch.remove-from-commit");
+        bind("diff", "X", "patch.discard-file");
+        bind("diff", "c", "patch.checkout-file");
+        bind("diff", "A", "patch.amend-commit");
         bind("commits", "enter", "commits.open-diff");
         bind("commits", "/", "commits.search");
         // Resetting to the commit under the keyboard, exactly lazygit's
@@ -498,6 +703,33 @@ impl Keymap {
         bind("commits", "s", "commits.squash-up");
         bind("commits", "f", "commits.fixup-up");
         bind("commits", "d", "commits.drop-commit");
+        // The rest of lazygit's history editing, on lazygit's own letters:
+        // `i` opens the plan for the window from HEAD down to this row, `e`
+        // stops a rebase *at* this commit so it can be amended, `r` gives it
+        // a new message, and `B` marks it as the base a `--onto` rebase
+        // counts from. All four are particular to this pane, so none is a
+        // global; `r` and `e` are free here, and `B` is nobody's.
+        bind("commits", "i", "commits.interactive-rebase");
+        bind("commits", "e", "commits.edit-commit");
+        bind("commits", "r", "commits.reword");
+        bind("commits", "B", "commits.mark-base");
+        // Moving a commit through its neighbours. lazygit spells this
+        // ctrl+j/ctrl+k *and* alt+↓/alt+↑; the chords are the pane cycle
+        // here and would have to be taken from every list to free them, so
+        // the alias is the binding and the difference is deliberate. Up is
+        // towards HEAD, which is what the list draws above the row.
+        bind("commits", "alt-up", "commits.move-up");
+        bind("commits", "alt-down", "commits.move-down");
+        // The fixup family, on lazygit's creation letter and a finder: `F`
+        // commits the index as a fixup for this row, `ctrl-f` moves the
+        // keyboard to the commit the staged changes build on. The fold and
+        // the kind take aliases, and both differences are deliberate: `S`
+        // is the standing operation's skip in every pane and stays it, so
+        // the fold is `U`; `c` is copy here, so the kind cycles on `K`.
+        bind("commits", "F", "commits.create-fixup");
+        bind("commits", "ctrl-f", "commits.find-fixup-base");
+        bind("commits", "U", "commits.apply-fixups");
+        bind("commits", "K", "commits.fixup-message");
         // The way out of a stranded rebase — one that stopped mid-flight on
         // a conflict or a refusal and left its state standing. lazygit
         // offers these through a menu that appears during a rebase; here
@@ -512,6 +744,19 @@ impl Keymap {
         // takes no confirmation dance either: dropping the copy undoes the
         // pick.
         bind("commits", "Y", "commits.cherry-pick");
+        // The cherry-pick clipboard, lazygit's C/V/ctrl+r family on keys
+        // this pane can spare. `C` itself is taken — it continues a rebase —
+        // so the copy is its lowercase twin; `v` marks the range, so the
+        // paste is the capital beside it, and the clear is the chord
+        // lazygit uses. `c` copies the marked range when one stands, else
+        // the row alone; `V` replays the clipboard front to back.
+        bind("commits", "c", "commits.copy");
+        bind("commits", "V", "commits.paste");
+        bind("commits", "ctrl-r", "commits.clear-copies");
+        // lazygit's own `a`: the author of HEAD back to the current user.
+        // HEAD only — a deeper commit's author is a rebase, and that UI is
+        // a later slice — so anything older refuses by name.
+        bind("commits", "a", "commits.reset-author");
         // Tagging the commit under the keyboard, on lazygit's own T. It
         // shadows theme.cycle inside this pane — a tag belongs here and the
         // theme is reachable everywhere else — which is the same
@@ -535,12 +780,52 @@ impl Keymap {
         // row there being no free letter left that begins either word.
         bind("commits", "Z", "commits.cherry-pick-abort");
         bind("commits", "X", "commits.cherry-pick-continue");
+        // One lifecycle door for all four writes git leaves standing —
+        // merge, rebase, cherry-pick, revert — because only one of them can
+        // stand at a time and the reader should not learn four keys for one
+        // question. m backs out, M carries on, S steps over (a rebase's
+        // alone); the availability layer says which of them the standing
+        // operation answers, and the per-kind capitals above keep working.
+        bind("commits", "m", "operation.abort");
+        bind("commits", "M", "operation.continue");
+        bind("commits", "S", "operation.skip");
 
-        // Text itself belongs to the platform input service. These are the two
-        // transitions around it, kept as named commands so a config file can
-        // move them without teaching a client another keymap.
+        // Text itself belongs to the platform input service. These are the
+        // two transitions around it, kept as named commands so a config file
+        // can move them without teaching a client another keymap.
         bind("input", "enter", "input.accept");
         bind("input", "esc", "input.cancel");
+        // The one key that carries text into a field instead of resolving to
+        // a command: Enter is accept, so a message that grew past one line is
+        // typed through this — lazygit's commit description has no key at all
+        // for it, which is the gap this fills.
+        bind("input", "alt-enter", "input.newline");
+
+        // A standing search's own mode — pushed only while a query stands in
+        // the focused pane, above the pane's bindings, so `n` and `N` mean
+        // next and previous match exactly for as long as there is a match to
+        // walk. That is also the honest answer to the collision with
+        // branches.new and commits.new-branch: with no query standing those
+        // keys are the pane's, as lazygit's panel bindings are; with one
+        // standing, the matches are what the keyboard is for. `esc` clears
+        // the query rather than leaving — a search that eats the way out is
+        // a search that was never cancelled.
+        bind("search", "n", "search.next");
+        bind("search", "N", "search.prev");
+        bind("search", "esc", "search.clear");
+
+        // Marking a range of rows for the next action — lazygit's `v`, which
+        // toggles drag-select. The text-copy selection is a different thing
+        // and keeps its own keys: this marks *rows* for *actions*, and the
+        // first consumer is the commit list.
+        bind("commits", "v", "select.mark");
+        // lazygit's `w`: a new checkout starting at the selected commit —
+        // detached, because a commit is a place and not a branch.
+        bind("commits", "w", "commits.new-worktree");
+        // lazygit's `b`: the bisect door. With a clean tree it opens the
+        // start field, aimed at the selected commit; with a bisection
+        // standing it opens the judgement question instead.
+        bind("commits", "b", "commits.bisect-menu");
 
         // The help overlay owns the keyboard for as long as it stands: a client
         // resolves against this mode *alone* while it is up, so a chord that is
@@ -560,6 +845,83 @@ impl Keymap {
         bind("help", "home", "view.top");
         bind("help", "G", "view.bottom");
         bind("help", "end", "view.bottom");
+
+        // The recent-repositories picker owns the keyboard for as long as it
+        // stands, on the same terms help does: the moves it names and the
+        // two ways to answer, and nothing underneath.
+        bind("picker", "enter", "input.accept");
+        bind("picker", "esc", "back");
+        bind("picker", "j", "view.down");
+        bind("picker", "down", "view.down");
+        bind("picker", "k", "view.up");
+        bind("picker", "up", "view.up");
+        bind("picker", "g", "view.top");
+        bind("picker", "home", "view.top");
+        bind("picker", "G", "view.bottom");
+        bind("picker", "end", "view.bottom");
+
+        // The rebase plan owns the keyboard for as long as it is open, on
+        // the same terms the picker does: a press it does not name runs
+        // nothing underneath, because the keys underneath rewrite history.
+        // The action letters are git's own todo words — p, r, e, s, f, d —
+        // which are also lazygit's, and `S` is the autosquash beside them.
+        // The chords are free inside a modal, so the reorder takes both of
+        // lazygit's spellings here even though the pane outside can only
+        // afford the alias.
+        bind("todo", "p", "todo.pick");
+        bind("todo", "r", "todo.reword");
+        bind("todo", "e", "todo.edit");
+        bind("todo", "s", "todo.squash");
+        bind("todo", "f", "todo.fixup");
+        bind("todo", "d", "todo.drop");
+        // The fold's third message answer, on the capital beside its own
+        // letter: `f` keeps the older message, `F` keeps this commit's.
+        bind("todo", "F", "todo.fixup-keep");
+        bind("todo", "S", "todo.autosquash");
+        bind("todo", "alt-up", "todo.move-up");
+        bind("todo", "alt-down", "todo.move-down");
+        bind("todo", "ctrl-k", "todo.move-up");
+        bind("todo", "ctrl-j", "todo.move-down");
+        bind("todo", "enter", "todo.run");
+        bind("todo", "esc", "back");
+        // The panel over the plan: `?` is the one key every mode here keeps,
+        // and a screen of unfamiliar letters is exactly where it is wanted.
+        bind("todo", "?", "help");
+        bind("todo", "j", "view.down");
+        bind("todo", "down", "view.down");
+        bind("todo", "k", "view.up");
+        bind("todo", "up", "view.up");
+        bind("todo", "g", "view.top");
+        bind("todo", "home", "view.top");
+        bind("todo", "G", "view.bottom");
+        bind("todo", "end", "view.bottom");
+        // The patch builder owns the keyboard for as long as it stands,
+        // on exactly the todo screen's terms: a press it does not name
+        // must run nothing underneath, because the clipboard it edits is
+        // one keypress from landing somewhere. Its own mode, because the
+        // menu's letters mean other things — `a` applies there and toggles
+        // here. Space toggles the hunk, `a` the file, `D` drops the file
+        // whole; enter and `i` apply onto the worktree and the index, `r`
+        // and `u` reverse off them, `m` moves onto a named branch.
+        bind("builder", "?", "help");
+        bind("builder", "esc", "back");
+        bind("builder", "j", "view.down");
+        bind("builder", "down", "view.down");
+        bind("builder", "k", "view.up");
+        bind("builder", "up", "view.up");
+        bind("builder", "g", "view.top");
+        bind("builder", "home", "view.top");
+        bind("builder", "G", "view.bottom");
+        bind("builder", "end", "view.bottom");
+        bind("builder", "space", "patch.toggle-hunk");
+        bind("builder", "a", "patch.toggle-file");
+        bind("builder", "D", "patch.drop-file");
+        bind("builder", "enter", "patch.apply-worktree");
+        bind("builder", "i", "patch.apply-index");
+        bind("builder", "r", "patch.reverse-worktree");
+        bind("builder", "u", "patch.reverse-index");
+        bind("builder", "m", "patch.move-to-branch");
+        bind("builder", "c", "patch.clear");
 
         // The settings panel owns the keyboard for as long as it stands, for
         // the same reason the help overlay does: a press it does not name must
@@ -585,6 +947,23 @@ impl Keymap {
 
         bind("panes", "ctrl-j", "pane.next");
         bind("panes", "ctrl-k", "pane.prev");
+
+        // lazygit's tab pair. A mode of its own rather than `panes`', because
+        // the two are different facts: `panes` is "there is more than one
+        // list to cycle", which every client with a sidebar has, and this is
+        // "the list with the keyboard shares its slot with another one",
+        // which only a client whose sidebar groups its lists into sections
+        // has. A client pushes it when that is true of the pane it focused,
+        // so the help panel lists these two exactly where they move —
+        // `stashes` shares its slot with nothing, and a `[` advertised there
+        // would be the one lie a mode-scoped help exists to prevent.
+        //
+        // Below the focused pane's own mode either way, so `[diff]`'s file
+        // jumps keep the keys where the main region has the keyboard: the
+        // sideways pair a diff needs is older and more urgent than a tab
+        // there is no section for.
+        bind("tabs", "[", "tab.prev");
+        bind("tabs", "]", "tab.next");
         k
     }
 
@@ -790,6 +1169,34 @@ impl Keymap {
         out
     }
 
+    /// [`help_supported`](Self::help_supported) with no client word taken:
+    /// every advertised name is treated as runnable. What a client that has
+    /// not built an [`Availability`] projects — and what the window's panel
+    /// reads today.
+    pub fn help(&self, commands: &Commands, modes: &Modes) -> Vec<HelpRow> {
+        self.help_rows(commands, modes, None)
+    }
+
+    /// What the help screen shows with `modes` active, filtered through what
+    /// one client can actually run.
+    ///
+    /// The same projection [`help`](Self::help) makes, with one more input:
+    /// the client's [`Availability`]. A name it marks
+    /// [`Usable::Unsupported`] takes its row and its keys out entirely — a
+    /// panel of keys that do nothing is the lie this screen exists to stop —
+    /// and a name it marks [`Usable::Disabled`] stays, but says *why* where
+    /// the description was, because "here is a key" without "and here is
+    /// why it will not run" is the same lie with a footnote. Mode order,
+    /// shadowing and grouping are the unchanged walk both callers share.
+    pub fn help_supported(
+        &self,
+        commands: &Commands,
+        modes: &Modes,
+        availability: &Availability,
+    ) -> Vec<HelpRow> {
+        self.help_rows(commands, modes, Some(availability))
+    }
+
     /// What the help screen shows with `modes` active: which key runs what,
     /// **now**.
     ///
@@ -801,7 +1208,12 @@ impl Keymap {
     /// screen: which bindings are live is decided by [`Keymap::resolve`]'s same
     /// innermost-first walk, so a key listed here is a key that would actually
     /// fire.
-    pub fn help(&self, commands: &Commands, modes: &Modes) -> Vec<HelpRow> {
+    fn help_rows(
+        &self,
+        commands: &Commands,
+        modes: &Modes,
+        availability: Option<&Availability>,
+    ) -> Vec<HelpRow> {
         let active = modes.as_slice();
         let mut out = Vec::new();
         for (at, mode) in active.iter().enumerate() {
@@ -832,10 +1244,17 @@ impl Keymap {
                 if all.is_empty() {
                     continue;
                 }
-                let doc = commands
-                    .get(&b.command)
-                    .map(|c| c.doc.clone())
-                    .unwrap_or_default();
+                // One consult per command, where its description would have
+                // been read: unsupported takes the row away, disabled keeps
+                // it and swaps the description for the reason.
+                let doc = match availability.map(|a| a.state(&b.command)) {
+                    Some(Usable::Unsupported) => continue,
+                    Some(Usable::Disabled(reason)) => reason.clone(),
+                    _ => commands
+                        .get(&b.command)
+                        .map(|c| c.doc.clone())
+                        .unwrap_or_default(),
+                };
                 rows.push(HelpRow::Command {
                     name: b.command.clone(),
                     keys: all,
@@ -872,6 +1291,115 @@ pub enum HelpRow {
     },
     /// Air between two modes.
     Blank,
+}
+
+/// Whether a client can run a command its keymap resolved, and what it says
+/// when it cannot.
+///
+/// [`Commands`] knows a name exists; only the client asked to run it knows
+/// whether anything answers behind the name. A help screen that lists what
+/// cannot run is a lie in the one place that exists to stop you guessing,
+/// and a dispatch that runs nothing while claiming a handler is its twin —
+/// so both read the client's one word per name, [`Availability`], and
+/// cannot disagree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Usable {
+    /// The client runs it. What a name with no entry in a lenient
+    /// [`Availability`] means, and the only answer either the help
+    /// projection or the dispatch acts on.
+    Available,
+    /// The client has a handler, but the way this instance was opened turns
+    /// it away — a fixture view with no repository behind it, say. The
+    /// reason is what the help row says where the description was, and what
+    /// the status line says when the key is pressed.
+    Disabled(String),
+    /// The client has no handler for the name at all: no help row, and a
+    /// refusal on dispatch. The honest spelling of a key that does nothing.
+    Unsupported,
+}
+
+static AVAILABLE: Usable = Usable::Available;
+static UNSUPPORTED: Usable = Usable::Unsupported;
+
+/// The client-supplied half of the command registry: which of the names a
+/// keymap can resolve, this client actually runs.
+///
+/// `Commands` is shared — one registry, every client, one help projection —
+/// but what a name *does* is per client: a browser tab has no `quit`, and a
+/// terminal that has not grown a rebase yet must not advertise one. So the
+/// registry stays shared and each client says, beside it, what it can do
+/// with the names. [`Keymap::help_supported`] and the client's dispatch
+/// both read this, which is the whole point: one word per name, read twice.
+/// The mode stack and the shadowing rules live on the keymap and are
+/// untouched — this says *which* names run, never *when*.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Availability {
+    states: BTreeMap<String, Usable>,
+    /// What a name with no entry of its own means. `true` for a client that
+    /// has described only its exceptions and promises the rest — the honest
+    /// default while the map is empty; `false` for one that has enumerated
+    /// what it runs and refuses the rest on their behalf.
+    unlisted_runnable: bool,
+}
+
+impl Availability {
+    /// Every name not named here is runnable — the client that has described
+    /// only its exceptions.
+    pub fn lenient() -> Self {
+        Self {
+            unlisted_runnable: true,
+            ..Self::default()
+        }
+    }
+
+    /// Every name not named here is unsupported — the client that has
+    /// enumerated what it runs.
+    pub fn strict() -> Self {
+        Self {
+            unlisted_runnable: false,
+            ..Self::default()
+        }
+    }
+
+    /// Marks names runnable.
+    pub fn available(&mut self, names: impl IntoIterator<Item = impl Into<String>>) -> &mut Self {
+        for name in names {
+            self.states.insert(name.into(), Usable::Available);
+        }
+        self
+    }
+
+    /// Marks names unsupported — the handler-less names a strict client
+    /// refuses on behalf of every key bound to them.
+    pub fn unsupported(&mut self, names: impl IntoIterator<Item = impl Into<String>>) -> &mut Self {
+        for name in names {
+            self.states.insert(name.into(), Usable::Unsupported);
+        }
+        self
+    }
+
+    /// Marks one name runnable-but-turned-away, with the reason the help row
+    /// and the refusal both say.
+    pub fn disabled(&mut self, name: impl Into<String>, reason: impl Into<String>) -> &mut Self {
+        self.states
+            .insert(name.into(), Usable::Disabled(reason.into()));
+        self
+    }
+
+    /// The client's word on one name.
+    pub fn state(&self, name: &str) -> &Usable {
+        self.states
+            .get(name)
+            .unwrap_or(match self.unlisted_runnable {
+                true => &AVAILABLE,
+                false => &UNSUPPORTED,
+            })
+    }
+
+    /// Whether the client runs it — what a dispatch reads before routing.
+    pub fn runnable(&self, name: &str) -> bool {
+        matches!(self.state(name), Usable::Available)
+    }
 }
 
 /// One command a client can be asked to run.
@@ -933,6 +1461,15 @@ impl Commands {
             ("view.bottom", "the last row", None),
             ("view.left", "scroll the text left", None),
             ("view.right", "scroll the text right", None),
+            ("search.next", "the next match", None),
+            ("search.prev", "the previous match", None),
+            ("search.clear", "clear the standing search", None),
+            (
+                "select.mark",
+                "mark or release a range of rows for the next action",
+                Some("mark"),
+            ),
+            ("input.newline", "a line break", None),
             (
                 "diff.next-file",
                 "the next file's header",
@@ -942,6 +1479,16 @@ impl Commands {
                 "diff.prev-file",
                 "the previous file's header",
                 Some("prev file"),
+            ),
+            (
+                "diff.next-hunk",
+                "the next hunk's first row",
+                Some("next hunk"),
+            ),
+            (
+                "diff.prev-hunk",
+                "the previous hunk's first row",
+                Some("prev hunk"),
             ),
             ("diff.cycle-layout", "the next presentation", None),
             ("diff.cycle-wrap", "the next wrap", None),
@@ -960,6 +1507,75 @@ impl Commands {
                 "discard the hunk under the keyboard from the working tree, asked twice",
                 Some("discard hunk"),
             ),
+            (
+                "diff.toggle-line-selection",
+                "act on marked lines instead of the whole hunk",
+                Some("line selection"),
+            ),
+            ("patch.menu", "the patch clipboard's targets and builder", Some("patch")),
+            (
+                "patch.pick",
+                "pick the hunk under the keyboard onto the patch clipboard",
+                Some("pick"),
+            ),
+            (
+                "patch.remove-from-commit",
+                "lift the hunk under the keyboard out of its own commit, asked twice",
+                Some("remove"),
+            ),
+            (
+                "patch.discard-file",
+                "lift the whole file under the keyboard out of its own commit, asked twice",
+                Some("discard file"),
+            ),
+            (
+                "patch.checkout-file",
+                "check the file under the keyboard out of its commit, asked twice",
+                Some("checkout file"),
+            ),
+            (
+                "patch.amend-commit",
+                "amend this commit with the patch clipboard, asked twice",
+                Some("amend"),
+            ),
+            (
+                "patch.apply-worktree",
+                "apply the patch clipboard onto the working tree",
+                Some("apply"),
+            ),
+            (
+                "patch.apply-index",
+                "apply the patch clipboard onto the index",
+                Some("apply indexed"),
+            ),
+            (
+                "patch.reverse-worktree",
+                "reverse the patch clipboard off the working tree, asked twice",
+                Some("reverse"),
+            ),
+            (
+                "patch.reverse-index",
+                "reverse the patch clipboard off the index",
+                Some("reverse indexed"),
+            ),
+            ("patch.show", "open the patch builder", Some("builder")),
+            (
+                "patch.toggle-hunk",
+                "include or exclude the hunk under the keyboard",
+                Some("toggle hunk"),
+            ),
+            (
+                "patch.toggle-file",
+                "include or exclude the whole file under the keyboard",
+                Some("toggle file"),
+            ),
+            ("patch.drop-file", "drop the file under the keyboard off the patch", Some("drop")),
+            (
+                "patch.move-to-branch",
+                "carry the patch clipboard onto a named branch, uncommitted",
+                Some("move"),
+            ),
+            ("patch.clear", "empty the patch clipboard", Some("clear patch")),
             ("theme.cycle", "the next theme", None),
             (
                 "commits.open-diff",
@@ -967,6 +1583,7 @@ impl Commands {
                 Some("diff"),
             ),
             ("commits.search", "search the commits", Some("search")),
+            ("diff.search", "search the diff", Some("search")),
             (
                 "commits.reset-soft",
                 "move this branch here, keeping every change staged",
@@ -1003,6 +1620,120 @@ impl Commands {
                 Some("drop"),
             ),
             (
+                "commits.create-fixup",
+                "commit the staged changes as a fixup for this commit",
+                Some("fixup"),
+            ),
+            (
+                "commits.find-fixup-base",
+                "move to the commit the staged changes build on",
+                Some("find base"),
+            ),
+            (
+                "commits.apply-fixups",
+                "fold every fixup into the commit it names (`U`), asked twice",
+                Some("fold fixups"),
+            ),
+            (
+                "commits.fixup-message",
+                "choose what a fixup creation writes: fixup, amend, reword",
+                Some("fixup kind"),
+            ),
+            (
+                "commits.interactive-rebase",
+                "open this branch's rebase plan, from this commit up",
+                Some("rebase"),
+            ),
+            (
+                "commits.edit-commit",
+                "replay up to this commit and stop, so it can be amended",
+                Some("edit"),
+            ),
+            (
+                "commits.reword",
+                "give this commit a new message",
+                Some("reword"),
+            ),
+            (
+                "commits.mark-base",
+                "mark this commit as the base a rebase counts from",
+                Some("base"),
+            ),
+            (
+                "commits.move-up",
+                "move this commit one closer to HEAD",
+                Some("move up"),
+            ),
+            (
+                "commits.move-down",
+                "move this commit one further from HEAD",
+                Some("move down"),
+            ),
+            ("todo.pick", "replay this commit unchanged", Some("pick")),
+            (
+                "todo.reword",
+                "replay it under a message you type now",
+                Some("reword"),
+            ),
+            (
+                "todo.edit",
+                "replay it, then stop so it can be amended",
+                Some("edit"),
+            ),
+            (
+                "todo.squash",
+                "fold it into the commit below, keeping both messages",
+                Some("squash"),
+            ),
+            (
+                "todo.fixup",
+                "fold it into the commit below, dropping its message",
+                Some("fixup"),
+            ),
+            (
+                "todo.fixup-keep",
+                "fold it into the commit below, keeping this message instead",
+                Some("fixup -C"),
+            ),
+            (
+                "todo.drop",
+                "leave this commit out of the branch",
+                Some("drop"),
+            ),
+            ("todo.move-up", "move this row one closer to HEAD", None),
+            ("todo.move-down", "move this row one further from HEAD", None),
+            (
+                "todo.autosquash",
+                "land every fixup! and squash! on the commit it names",
+                Some("autosquash"),
+            ),
+            ("todo.run", "rewrite history the way this plan says", Some("run")),
+            (
+                "files.reset-menu",
+                "choose a strength to reset toward the upstream",
+                Some("reset"),
+            ),
+            (
+                "files.reset-upstream-soft",
+                "move this branch onto its upstream, keeping every change staged",
+                Some("reset soft"),
+            ),
+            (
+                "files.reset-upstream-mixed",
+                "move this branch onto its upstream, unstaging what it holds",
+                Some("reset mixed"),
+            ),
+            (
+                "files.reset-upstream-hard",
+                "move this branch onto its upstream and discard the changes, asked twice",
+                Some("reset hard"),
+            ),
+            (
+                "files.nuke",
+                "throw every uncommitted change away, asked twice",
+                Some("nuke"),
+            ),
+            (
                 "commits.rebase-onto",
                 "move the current branch onto the selected branch, asked twice",
                 Some("rebase onto"),
@@ -1018,9 +1749,44 @@ impl Commands {
                 None,
             ),
             (
+                "operation.abort",
+                "give up whichever operation is standing — merge, rebase, cherry-pick or revert — and put everything back where it started",
+                Some("abort"),
+            ),
+            (
+                "operation.continue",
+                "carry on whichever operation is standing once its conflicts are resolved",
+                Some("continue"),
+            ),
+            (
+                "operation.skip",
+                "step over the commit the rebase stopped on — its changes leave the branch",
+                Some("skip"),
+            ),
+            (
                 "commits.cherry-pick",
                 "apply this commit onto the current branch as a new commit",
                 Some("cherry-pick"),
+            ),
+            (
+                "commits.copy",
+                "copy this commit — or the marked range — onto the cherry-pick clipboard",
+                Some("copy"),
+            ),
+            (
+                "commits.paste",
+                "cherry-pick every copied commit, in the order copied",
+                Some("paste"),
+            ),
+            (
+                "commits.clear-copies",
+                "empty the cherry-pick clipboard",
+                Some("clear copies"),
+            ),
+            (
+                "commits.reset-author",
+                "reset HEAD's author to the current user, asked twice",
+                Some("reset author"),
             ),
             (
                 "commits.new-tag",
@@ -1080,6 +1846,16 @@ impl Commands {
                 Some("ignore"),
             ),
             ("files.search", "search the working tree", Some("search")),
+            (
+                "files.open-diff",
+                "show the diff pane, loaded with this file's side",
+                Some("diff"),
+            ),
+            (
+                "files.toggle-side",
+                "switch the previewed file between its staged and unstaged side",
+                Some("toggle side"),
+            ),
             ("branches.focus", "focus the branches pane", None),
             (
                 "branches.checkout",
@@ -1102,13 +1878,272 @@ impl Commands {
                 "name the selected branch's commit with a new tag",
                 Some("tag"),
             ),
+            (
+                "branches.merge",
+                "merge the selected branch into the branch you are on",
+                Some("merge"),
+            ),
+            (
+                "branches.merge-squash",
+                "squash the selected branch into the branch you are on, staged and uncommitted",
+                Some("squash merge"),
+            ),
+            (
+                "files.resolve-ours",
+                "record the selected conflict as resolved, taking this side's version",
+                Some("ours"),
+            ),
+            (
+                "files.resolve-theirs",
+                "record the selected conflict as resolved, taking the other side's version",
+                Some("theirs"),
+            ),
+            (
+                "files.resolve-both",
+                "record the selected conflict as resolved with both versions, this side first",
+                Some("both"),
+            ),
+            (
+                "files.resolve-keep",
+                "record the selected conflict as resolved with the file as it stands",
+                Some("keep"),
+            ),
+            (
+                "merge.take-side",
+                "keep whichever half of the conflict the keyboard is on",
+                Some("pick"),
+            ),
+            (
+                "merge.take-ours",
+                "keep this side's half of the conflict the keyboard is on",
+                Some("ours"),
+            ),
+            (
+                "merge.take-theirs",
+                "keep the other side's half of the conflict the keyboard is on",
+                Some("theirs"),
+            ),
+            (
+                "merge.take-both",
+                "keep both halves of the conflict the keyboard is on, this side first",
+                Some("both"),
+            ),
+            (
+                "merge.undo",
+                "put the file back the way the last answer found it — this session only",
+                Some("undo"),
+            ),
+            (
+                "merge.options",
+                "whole-file answers: hand the keyboard back to the conflict row",
+                Some("whole file"),
+            ),
+            (
+                "merge.next-conflict",
+                "the next conflict in the file",
+                Some("next conflict"),
+            ),
+            (
+                "merge.prev-conflict",
+                "the previous conflict in the file",
+                Some("prev conflict"),
+            ),
             ("branches.search", "search the branches", Some("search")),
+            (
+                "branches.checkout-name",
+                "check out a branch by typing its name",
+                Some("checkout"),
+            ),
+            (
+                "branches.checkout-previous",
+                "check out the branch HEAD was on before this one",
+                Some("previous"),
+            ),
+            (
+                "branches.force-checkout",
+                "check out the selected branch, discarding local changes, asked twice",
+                Some("force checkout"),
+            ),
+            (
+                "branches.fast-forward",
+                "fast-forward the selected branch onto its upstream",
+                Some("fast-forward"),
+            ),
+            (
+                "branches.set-upstream",
+                "make the selected branch track the remote branch of the same name",
+                Some("track"),
+            ),
+            (
+                "branches.unset-upstream",
+                "stop the selected branch tracking its upstream",
+                Some("untrack"),
+            ),
+            ("remotes.focus", "focus the remotes pane", None),
+            (
+                "remotes.fetch",
+                "update the selected remote's tracking branches",
+                Some("fetch"),
+            ),
+            ("remotes.new", "add a remote, by name and URL", Some("add")),
+            (
+                "remotes.edit",
+                "point the selected remote at a new URL",
+                Some("edit"),
+            ),
+            (
+                "remotes.remove",
+                "forget the selected remote, asked twice",
+                Some("remove"),
+            ),
+            ("remotes.search", "search the remotes", Some("search")),
+            ("tags.focus", "focus the tags pane", None),
+            (
+                "tags.checkout",
+                "check out the selected tag, detaching HEAD",
+                Some("checkout"),
+            ),
+            (
+                "tags.new",
+                "name a commit with a new tag — annotated when the message field comes back nonempty",
+                Some("tag"),
+            ),
+            (
+                "tags.delete",
+                "forget the selected tag, asked twice — the commits survive",
+                Some("remove"),
+            ),
+            (
+                "tags.push",
+                "push the selected tag to the named remote",
+                Some("push"),
+            ),
+            ("tags.search", "search the tags", Some("search")),
+            ("worktrees.focus", "focus the worktrees pane", None),
+            (
+                "worktrees.new",
+                "check a starting point out into a new worktree",
+                Some("new"),
+            ),
+            (
+                "worktrees.remove",
+                "forget the selected checkout, asked twice — force on the third past dirt",
+                Some("remove"),
+            ),
+            (
+                "worktrees.switch",
+                "open the selected checkout as a repository",
+                Some("switch"),
+            ),
+            ("worktrees.search", "search the worktrees", Some("search")),
+            (
+                "commits.new-worktree",
+                "check the selected commit out into a new worktree",
+                Some("worktree"),
+            ),
+            (
+                "branches.new-worktree",
+                "check the selected branch out into a new worktree",
+                Some("worktree"),
+            ),
+            (
+                "stashes.new-worktree",
+                "check the selected entry's commit out into a new worktree",
+                Some("worktree"),
+            ),
+            (
+                "tags.new-worktree",
+                "check the selected tag's commit out into a new worktree",
+                Some("worktree"),
+            ),
+            (
+                "commits.bisect-menu",
+                "judge the bisect, or start one at the selected commit",
+                Some("bisect"),
+            ),
+            (
+                "commits.bisect-good",
+                "mark the bisect checkout good",
+                Some("good"),
+            ),
+            (
+                "commits.bisect-bad",
+                "mark the bisect checkout bad",
+                Some("bad"),
+            ),
+            (
+                "commits.bisect-skip",
+                "skip the bisect checkout as untestable",
+                Some("skip"),
+            ),
+            (
+                "commits.bisect-reset",
+                "end the bisect, back where it started",
+                Some("reset"),
+            ),
+            ("reflog.focus", "focus the reflog pane", None),
+            (
+                "reflog.recover",
+                "put the current branch back onto the selected entry, asked twice",
+                Some("recover"),
+            ),
+            ("reflog.search", "search the reflog", Some("search")),
+            (
+                "history.undo",
+                "walk the last HEAD move back, keeping index and worktree",
+                Some("undo"),
+            ),
+            (
+                "history.redo",
+                "walk forward again, behind our own undo only",
+                Some("redo"),
+            ),
+            (
+                "branches.delete-remote",
+                "delete the remote-tracking row's branch on its remote, asked twice",
+                Some("remove"),
+            ),
+            (
+                "branches.open-log",
+                "show this branch's history in the main pane",
+                Some("log"),
+            ),
             ("stashes.focus", "focus the stash list", None),
             ("commits.focus", "focus the commit list", None),
             (
                 "files.stash",
                 "park the working tree's changes on the stash stack",
                 Some("stash"),
+            ),
+            (
+                "files.stash-menu",
+                "choose which part of the working tree to park",
+                Some("stash…"),
+            ),
+            (
+                "files.stash-named",
+                "park the working tree's changes under a message you type",
+                Some("stash named"),
+            ),
+            (
+                "files.stash-staged",
+                "park what the index holds, leaving the unstaged work standing",
+                Some("stash staged"),
+            ),
+            (
+                "files.stash-unstaged",
+                "park the unstaged work, leaving the index as it is",
+                Some("stash unstaged"),
+            ),
+            (
+                "files.stash-untracked",
+                "park the working tree's changes and its new files too",
+                Some("stash untracked"),
+            ),
+            (
+                "files.stash-file",
+                "park the selected file alone, leaving every other path",
+                Some("stash file"),
             ),
             (
                 "stashes.apply",
@@ -1122,6 +2157,21 @@ impl Commands {
             ),
             ("stashes.drop", "drop this stash, asked twice", Some("drop")),
             ("stashes.search", "search the stash stack", Some("search")),
+            (
+                "stashes.open-diff",
+                "show the diff pane, loaded with this stash's changes",
+                Some("diff"),
+            ),
+            (
+                "stashes.rename",
+                "give this stash a new message — it moves to the top of the stack",
+                Some("rename"),
+            ),
+            (
+                "stashes.new-branch",
+                "start a branch where this stash was made and apply it there",
+                Some("branch"),
+            ),
             (
                 "repo.push",
                 "send the current branch to its remote, setting the upstream if needed",
@@ -1164,8 +2214,10 @@ impl Commands {
             ("input.cancel", "discard the text", None),
             ("pane.next", "the next list in the column", None),
             ("pane.prev", "the previous list in the column", None),
-            ("pane.left", "the pane on the left", None),
-            ("pane.right", "the pane on the right", None),
+            ("tab.next", "the next tab in this section", None),
+            ("tab.prev", "the previous tab in this section", None),
+            ("pane.left", "the previous pane, wrapping", None),
+            ("pane.right", "the next pane, wrapping", None),
             ("select.all", "select the whole view", None),
             ("select.none", "drop the selection", None),
             (
@@ -1302,7 +2354,11 @@ mod tests {
             Resolve::Run("view.page-down")
         );
         assert_eq!(k.resolve(&modes, &keys("G")), Resolve::Run("view.bottom"));
-        assert_eq!(k.resolve(&modes, &keys("z")), Resolve::None);
+        assert_eq!(
+            k.resolve(&modes, &keys("z")),
+            Resolve::Run("history.undo"),
+            "undo is global: history is not a pane's"
+        );
     }
 
     #[test]
@@ -1690,7 +2746,9 @@ mod tests {
         // d drop, T tag, n new-branch, space checkout — and g opens the
         // reset question rather than any strength firing directly. `f`
         // shadows repo.fetch inside the pane, lazygit's own trade; `h` is
-        // nobody's here, so the pane move keeps it.
+        // nobody's here, so the pane move keeps it. The clipboard answers
+        // on the keys lazygit's C/V chord can spare here — `C` itself
+        // continues a rebase, `v` marks — and the author on lazygit's `a`.
         let mut commits = Modes::new();
         commits.push("commits");
         for (chord, name) in [
@@ -1705,6 +2763,10 @@ mod tests {
             ("space", "commits.checkout"),
             ("Z", "commits.cherry-pick-abort"),
             ("X", "commits.cherry-pick-continue"),
+            ("c", "commits.copy"),
+            ("V", "commits.paste"),
+            ("ctrl-r", "commits.clear-copies"),
+            ("a", "commits.reset-author"),
         ] {
             assert_eq!(
                 k.resolve(&commits, &keys(chord)),
@@ -1740,10 +2802,20 @@ mod tests {
                 Resolve::Run(name),
                 "{chord} did not reach {name} globally"
             );
-            // Inherited inside a pane too, never re-bound there.
+            // Inherited inside a pane too — except `f`, which the branches
+            // panel's own fast-forward takes over, the same pane-overrides-
+            // global trade the commits panel makes with squash and fixup.
+            // The fetch stays one pane away, on any other list.
             let mut modes = Modes::new();
             modes.push("branches");
-            assert_eq!(k.resolve(&modes, &keys(chord)), Resolve::Run(name));
+            for (chord, name) in [("P", "repo.push"), ("p", "repo.pull")] {
+                assert_eq!(k.resolve(&modes, &keys(chord)), Resolve::Run(name));
+            }
+            assert_eq!(
+                k.resolve(&modes, &keys("f")),
+                Resolve::Run("branches.fast-forward"),
+                "the branches panel's fast-forward owns its own f"
+            );
         }
         // A capital is not its lowercase twin's binding: sending and asking
         // stay two commands on lazygit's pair.
@@ -1836,10 +2908,103 @@ mod tests {
         let k = Keymap::builtin();
         let mut found = k.keys_for("view.down");
         found.sort();
-        // `view.down` is also how the settings panel moves its selection —
-        // the same verb, intercepted while the panel stands.
-        assert_eq!(found, vec!["down", "down", "j", "j"]);
+        // `view.down` is also how the settings panel, the remotes picker,
+        // the rebase plan and the patch builder move their selection — the
+        // same verb, intercepted while each of them stands.
+        assert_eq!(
+            found,
+            vec!["down", "down", "down", "down", "down", "j", "j", "j", "j", "j"]
+        );
         assert!(k.keys_for("nothing.at.all").is_empty());
+    }
+
+    #[test]
+    fn the_patch_menu_and_builder_answer_in_their_modes() {
+        let k = Keymap::builtin();
+        let resolve = |modes: &[&str], chord: &str| {
+            let mut m = Modes::new();
+            for mode in modes {
+                m.push(*mode);
+            }
+            k.resolve(&m, &keys(chord))
+        };
+        // The menu's letters, in the question's mode and nowhere else.
+        for (chord, name) in [
+            ("a", "patch.apply-worktree"),
+            ("i", "patch.apply-index"),
+            ("r", "patch.reverse-worktree"),
+            ("u", "patch.reverse-index"),
+            ("b", "patch.show"),
+            ("m", "patch.move-to-branch"),
+            ("c", "patch.clear"),
+        ] {
+            assert_eq!(
+                resolve(&["patch"], chord),
+                Resolve::Run(name),
+                "{chord} did not reach {name} in [patch]"
+            );
+        }
+        // Most answers mean the same with the builder open — the letters
+        // coincide on purpose — except `a`, which applies in the menu and
+        // toggles in the builder, and `b`, which opens the builder and so
+        // has nothing to open inside it.
+        for (chord, name) in [
+            ("i", "patch.apply-index"),
+            ("r", "patch.reverse-worktree"),
+            ("u", "patch.reverse-index"),
+            ("m", "patch.move-to-branch"),
+            ("c", "patch.clear"),
+        ] {
+            assert_eq!(
+                resolve(&["builder"], chord),
+                Resolve::Run(name),
+                "{chord} did not reach {name} in [builder]"
+            );
+        }
+        assert_eq!(
+            resolve(&["builder"], "a"),
+            Resolve::Run("patch.toggle-file"),
+            "a toggles in [builder], it does not apply"
+        );
+        assert_ne!(
+            resolve(&["builder"], "b"),
+            Resolve::Run("patch.show"),
+            "patch.show leaked into [builder]"
+        );
+        // The builder's own letters, where the menu's mean other things.
+        for (chord, name) in [
+            ("space", "patch.toggle-hunk"),
+            ("a", "patch.toggle-file"),
+            ("D", "patch.drop-file"),
+            ("enter", "patch.apply-worktree"),
+            ("m", "patch.move-to-branch"),
+            ("c", "patch.clear"),
+        ] {
+            assert_eq!(
+                resolve(&["builder"], chord),
+                Resolve::Run(name),
+                "{chord} did not reach {name} in [builder]"
+            );
+        }
+        // The diff's surgery keys, answered by origin at dispatch.
+        for (chord, name) in [
+            ("p", "patch.pick"),
+            ("d", "patch.remove-from-commit"),
+            ("X", "patch.discard-file"),
+            ("c", "patch.checkout-file"),
+            ("A", "patch.amend-commit"),
+        ] {
+            assert_eq!(
+                resolve(&["diff"], chord),
+                Resolve::Run(name),
+                "{chord} did not reach {name} in [diff]"
+            );
+        }
+        assert_eq!(
+            resolve(&[], "ctrl-p"),
+            Resolve::Run("patch.menu"),
+            "ctrl-p did not reach the patch menu globally"
+        );
     }
 
     #[test]

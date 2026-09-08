@@ -88,13 +88,13 @@ jobs:
       - uses: actions/checkout@v5
       - run: cargo fmt --check
       - uses: Swatinem/rust-cache@v2
-        id: cache
       # The set Zed's own install script hands a Linux builder: gpui needs the
-      # headers even to compile, and blade wants vulkan present. Cached
-      # dependencies are already compiled; provision these only when Cargo has
-      # work that can consult them.
-      - if: steps.cache.outputs.cache-hit != 'true'
-        name: Install Linux build dependencies
+      # headers even to compile, and blade wants vulkan present. Not gated on a
+      # cache hit, unlike the original shape of this step: rust-cache keys on
+      # the Cargo tree and knows nothing about apt, so a full cache hit is
+      # exactly the run whose runner image may not ship fontconfig.pc — and a
+      # skipped install died building yeslogic-fontconfig-sys (PR #73).
+      - name: Install Linux build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \

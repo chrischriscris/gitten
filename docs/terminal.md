@@ -134,6 +134,45 @@ row, it shears every row below it, because the cursor ends up somewhere the grid
 does not agree with. A lead cell plus a continuation cell, and `flush` extends a
 changed run backwards to the lead cell before positioning the cursor.
 
+## The sidebar is tabbed sections
+
+The column beside the diff is **not** eight lists with a slice each. Eight
+slices of a 24-row terminal's 22 rows is 2.75 rows apiece — a header and one
+commit — so the lists are grouped into `panes::SECTIONS` and take turns:
+
+```text
+  1|  2  files - worktrees                  │  0  diff  ab12cd  the subject
+  2|  3  branches - remotes - tags          │ f.txt  +2 -2
+  3|  4  commits - reflog                   │ @@ -2,7 +2,7 @@
+  4|ab12cd  CH ●  the subject               │  2  2   line one
+   |                  ⋮  19 rows            │
+ 22|  5  stashes                            │
+```
+
+One header row of tabs per section; the section with the keyboard takes every
+row the column has left. Only the tab a section is *showing* has a rectangle at
+all — the rest are hidden the way the narrow layout hides an unfocused pane, and
+are resized when next shown. `[`/`]` walk the tabs of the focused section, in a
+`tabs` mode pushed only when there is a second registered tab to reach — so the
+help panel lists them exactly where they move, and the window, which has no
+sections, never pushes it. The numbers are unchanged, because `2` naming
+`files` reaches the files section through its first tab and every
+`<name>.focus` still means exactly one pane. A
+tab whose pane never registered is not drawn and not reachable, and a section
+with no registered tab collapses out of the column: a fixture launch draws one
+header, not five.
+
+Which tab a section shows, and which section is open while the *diff* has the
+keyboard, are one fact at two scopes — the one the keyboard sat on last — so
+`Panes` keeps a recency list of names and `Panes::spots` resolves both from it
+once per layout, into `Spot::shown` and `Spot::open`. A `Layout` stays a pure
+function of the spots and the body; nothing about tabs is re-derived per row,
+and the header's tab spans are worked out there too, so the paint and the hit
+test read one table rather than two copies of the same arithmetic.
+
+See [decisions/0031](decisions/0031-the-sidebar-is-tabbed-sections.md), which
+also records why a section header carries no label.
+
 ## The graph, in box drawing
 
 Topology is `assign_lanes` and colour is `graph::Hues`, both untouched. What this
@@ -256,6 +295,7 @@ because only a presentation knows where its own text starts:
 | which visual row a cell is over | `Diff::locate`, from the viewport |
 | which text and which byte | `Rows::hit`, per presentation, in columns |
 | which rows lie between two carets, and what they copy | `core::select` |
+| which section a header row belongs to, and which tab a word on it is | `panes::Geometry::hit`/`hit_tab`, from the spans the layout worked out |
 | how many times you clicked | `main.rs`, against a 400 ms clock |
 | whether finishing one copies it | `[mouse] copy_on_select`, read per gesture |
 

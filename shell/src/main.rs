@@ -409,13 +409,6 @@ fn expand_project_path(text: &str, current: &std::path::Path) -> std::path::Path
         expanded
     }
 }
-/// Every cursor move and click loads its commit's diff at once — no
-/// settle delay. A fast run through the list schedules one load per row
-/// but only the newest request ever survives its guard to land — see
-/// [`DevShell::schedule_main_diff`]. Like the terminal, which re-acquires
-/// synchronously on each move.
-const DIFF_DEBOUNCE: Duration = Duration::ZERO;
-
 /// What only this client has. The two views, the arguments and `gitten.toml` are
 /// documented once, in `gitten_app::cli::usage`, because they are the same in
 /// every client — see that function for why that is a promise and not a
@@ -3031,6 +3024,16 @@ impl DevShell {
             self.set_notice("branches.delete is not supported here");
             return;
         }
+        // The desktop deliberately does not delete remote branches: a
+        // tracking ref is its remote's shadow, pruned by fetch. The TUI
+        // owns that verb (LG-075); this door keeps refusing it.
+        if matches!(
+            self.branches_target(cx),
+            Some(views::branches::Target::Remote { .. })
+        ) {
+            self.set_notice("a remote-tracking row is its remote's shadow, pruned by fetch");
+            return;
+        }
         let mut client = WindowActs { shell: self, cx };
         gitten_app::act::delete_branch(&mut client);
     }
@@ -4536,13 +4539,12 @@ impl DevShell {
     /// Aims the main view at `commit`.
     ///
     /// **Load at once, by request guard.** Every schedule bumps
-    /// [`DevShell::request`] and spawns one timer ([`DIFF_DEBOUNCE`], zero —
-    /// loads start on the next executor pump); a waking timer proceeds only
-    /// if its request is still the newest, so a fast cursor run leaves one
-    /// live load — the latest row's — and the dead ones cost a wake and a
-    /// compare each. The acquisition then runs on the background executor
-    /// behind a second copy of the same guard, so an older load can never
-    /// land over a newer one.
+    /// [`DevShell::request`] and starts loading immediately; a starting
+    /// load proceeds only if its request is still the newest, so a fast
+    /// cursor run leaves one live load — the latest row's — and the dead
+    /// ones cost a compare each. The acquisition then runs on the
+    /// background executor behind a second copy of the same guard, so an
+    /// older load can never land over a newer one.
     ///
     /// The header is written *now*, not on arrival: the strip naming the
     /// commit whose diff is coming is what makes the load visible in frame
@@ -4584,12 +4586,7 @@ impl DevShell {
                 commit.subject
             ));
         }
-        let delay = match immediate {
-            true => Duration::ZERO,
-            false => DIFF_DEBOUNCE,
-        };
         cx.spawn(async move |shell, cx| {
-            cx.background_executor().timer(delay).await;
             // Load half, on the executor: one acquisition plus one prepare.
             // Built inside the guard so a superseded request never spawns it.
             let mut job = None;
@@ -5181,8 +5178,8 @@ impl DevShell {
                         // The row's own click handler (deeper, so earlier in
                         // bubble) already moved the keyboard via `select_row`;
                         // the preview follows it here, like every key move
-                        // does through `run_command`'s tail — no debounce,
-                        // like the terminal.
+                        // does through `run_command`'s tail, like the
+                        // terminal.
                         this.sync_main_diff(cx);
                     }),
                 )
@@ -6465,6 +6462,14 @@ fn open_main_window(launch: Launch, cx: &mut App) {
                         v.note.clone(),
                         v.load.clone(),
                     )
+                }
+                // A launch never opens on a conflict: the files pane does
+                // not exist at startup, so no eye could be on one. The arm
+                // names itself rather than hiding in a wildcard, so a
+                // future launch that can open on a conflict must say what
+                // screen it means.
+                Some(Data::Conflict(..)) => {
+                    unreachable!("no launch opens on a conflict")
                 }
                 // The skeleton: the same screens at their loading shapes,
                 // one generation below the wave that fills them. The saved
@@ -8878,8 +8883,7 @@ diff --git a/one.txt b/one.txt
             "a load ran before the cursor settled"
         );
 
-        // Settled: one timer fires, one acquisition runs, for the final row.
-        cx.executor().advance_clock(super::DIFF_DEBOUNCE);
+        // Settled: one acquisition runs, for the final row.
         cx.run_until_parked();
         shell.read_with(cx, |shell, _| assert!(!shell.loading.get()));
         assert_eq!(repo.diffs_wrote(), vec![search_commit(5).sha]);
@@ -8899,7 +8903,6 @@ diff --git a/one.txt b/one.txt
             );
             assert!(shell.loading.get());
         });
-        cx.executor().advance_clock(super::DIFF_DEBOUNCE);
         cx.run_until_parked();
         shell.read_with(cx, |shell, _| {
             assert!(!shell.loading.get(), "the startup load never came home");
@@ -8966,7 +8969,7 @@ diff --git a/one.txt b/one.txt
         /// over. Empty until a test serves it.
         log_answer: std::sync::Mutex<Vec<Commit>>,
         /// Which revspecs `pairs` was asked to diff, in order — the record a
-        /// main-view debounce test reads. Separate from [`Self::calls`] so
+        /// main-view load test reads. Separate from [`Self::calls`] so
         /// write assertions never see a read.
         diffs: std::sync::Mutex<Vec<String>>,
     }

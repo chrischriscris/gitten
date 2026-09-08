@@ -22,6 +22,7 @@
 use crate::screen::{width, Ink, Pen, Screen};
 use crate::scrollbar::{self, Bar};
 use gitten_core::host::Host;
+use gitten_core::search::TextIndex;
 use gitten_core::status::{Change, ConflictKind, PathBytes, Status};
 use gitten_core::view::Viewport;
 use std::collections::HashSet;
@@ -306,6 +307,19 @@ pub fn unavailable_label(describe: &str) -> String {
 /// what the second press confirms is a row of this list.
 pub struct Files {
     rows: Vec<Entry>,
+    /// Every row's search text, folded once at load — headings fold to the
+    /// empty text, so a non-empty query can never name one. See
+    /// [`gitten_core::search::TextIndex`].
+    search: TextIndex,
+    /// The standing query, `None` when the list is whole — always the
+    /// *trimmed* text, the same normalization the commit list applies.
+    query: Option<String>,
+    /// Which source rows the viewport can see, ascending — the one
+    /// visible-to-source table every row reader goes through. Unfiltered it
+    /// is `0..len`; filtered it is what [`TextIndex::indices`] answered,
+    /// which is file rows only: a heading never matches, and a filtered file
+    /// list is a flat list, not a list of orphan headings.
+    visible: Vec<usize>,
     /// The cursor, the top row and the height — [`Viewport`], the same model
     /// every other list holds.
     view: Viewport,
@@ -354,8 +368,11 @@ impl Files {
             view.go_to(1);
         }
         let total = rows.iter().filter(|r| matches!(r, Entry::File(_))).count();
-        Self {
+        let mut this = Self {
             rows,
+            search: TextIndex::new(Vec::<String>::new()),
+            query: None,
+            visible: Vec::new(),
             view,
             cols: 0,
             bar: Bar::default(),
@@ -363,7 +380,9 @@ impl Files {
             armed: None,
             total,
             opened: false,
-        }
+        };
+        this.reindex();
+        this
     }
 
     /// The pane a failed initial read registers: retryable, registered, and
@@ -372,6 +391,9 @@ impl Files {
     pub fn unavailable() -> Self {
         Self {
             rows: Vec::new(),
+            search: TextIndex::new(Vec::<String>::new()),
+            query: None,
+            visible: Vec::new(),
             view: Viewport::new(),
             cols: 0,
             bar: Bar::default(),
@@ -440,8 +462,107 @@ impl Files {
     /// cursor move and every refresh, so the cursor never rests on a
     /// heading.
     fn settle(&mut self, from: usize) {
-        self.view
-            .settle(from, |i| matches!(self.rows.get(i), Some(Entry::File(_))));
+        self.view.settle(from, |i| {
+            self.visible
+                .get(i)
+                .is_some_and(|&r| matches!(self.rows.get(r), Some(Entry::File(_))))
+        });
+    }
+
+    /// The row the viewport names, through the visible table — the cursor is
+    /// a row of the *filtered* list, and only the final lookup names a row of
+    /// the source.
+    fn row_at(&self, visual: usize) -> Option<&Entry> {
+        self.rows.get(*self.visible.get(visual)?)
+    }
+
+    /// Rebuilds the folded search texts against the rows as they stand.
+    fn reindex(&mut self) {
+        self.search = TextIndex::new(self.rows.iter().map(|e| match e {
+            Entry::File(f) => f.text.clone(),
+            // A heading folds to the empty text: it can never contain a
+            // non-empty needle, so a filtered list is file rows only.
+            Entry::Heading { .. } => String::new(),
+        }));
+        self.refilter();
+    }
+
+    /// Rebuilds the visible table against the standing query and re-clamps
+    /// the viewport. `apply_query` and `reindex` land here.
+    fn refilter(&mut self) {
+        self.visible = match &self.query {
+            Some(q) => self.search.indices(q),
+            None => Vec::from_iter(0..self.rows.len()),
+        };
+        self.view.set_len(self.visible.len());
+    }
+
+    // ----------------------------------------------------------------- search
+
+    /// The live query, for pre-filling a second `/`. `None` when unfiltered.
+    pub fn query(&self) -> Option<&str> {
+        self.query.as_deref()
+    }
+
+    /// The filter while one stands, for a status line: `15/30` — hits over
+    /// changed files. `None` unfiltered.
+    pub fn filter_note(&self) -> Option<String> {
+        self.query
+            .is_some()
+            .then(|| format!("{}/{}", self.visible.len(), self.total))
+    }
+
+    /// Sets the filter — once per keystroke, and never anywhere else. The
+    /// keyboard stays on the file it was on: anchored by section and path
+    /// into the next result set wherever it survives the narrower query, and
+    /// clamped when it does not. An empty (or whitespace-only) query is no
+    /// query, so clearing restores the whole list; the same trimmed query
+    /// twice rebuilds nothing.
+    ///
+    /// An armed discard dies with a result set that changed, like any other
+    /// refresh: the question was about a row of yesterday's list.
+    pub fn apply_query(&mut self, query: &str) {
+        let next = Some(query.trim()).filter(|q| !q.is_empty());
+        if self.query.as_deref() == next {
+            return;
+        }
+        let anchored = self.row_at(self.view.cursor()).and_then(|e| match e {
+            Entry::File(f) => Some((f.section, f.path.clone())),
+            Entry::Heading { .. } => None,
+        });
+        self.query = next.map(str::to_string);
+        self.refilter();
+        self.armed = None;
+        let cursor = anchored
+            .and_then(|(section, path)| {
+                self.visible.iter().position(|&r| {
+                    matches!(
+                        self.rows.get(r),
+                        Some(Entry::File(f)) if f.section == section && f.path == path
+                    )
+                })
+            })
+            .unwrap_or_else(|| self.view.cursor());
+        self.view.go_to(cursor);
+    }
+
+    /// The next — or previous — row of the visible list, wrapping. With a
+    /// filter standing the visible list *is* the matches, so this is what
+    /// iterating them is; with none standing it says so by doing nothing.
+    pub fn next_match(&mut self, by: isize) {
+        if self.query.is_none() || self.visible.is_empty() {
+            return;
+        }
+        let len = self.visible.len() as isize;
+        let at = (self.view.cursor() as isize + by).rem_euclid(len) as usize;
+        self.armed = None;
+        self.view.go_to(at);
+    }
+
+    /// Takes the filter off. The one door `search.clear` opens, so a search
+    /// that is cancelled restores the list it filtered.
+    pub fn clear_search(&mut self) {
+        self.apply_query("");
     }
 
     /// Swaps in refreshed rows, keeping the cursor anchored to its file.
@@ -470,17 +591,22 @@ impl Files {
             .count();
         // A read came back: whatever the pane said before, it says no longer.
         self.available = true;
-        let mut view = old;
-        view.set_len(self.rows.len());
+        // The folded search texts and the visible table were built against
+        // the rows the pane held; a refresh may have added files under a
+        // standing filter, and both are rebuilt with the list — the table is
+        // built here and read everywhere else.
+        self.reindex();
         let cursor = anchored
             .and_then(|(section, path)| {
-                self.rows.iter().position(
-                    |e| matches!(e, Entry::File(f) if f.section == section && f.path == path),
-                )
+                self.visible.iter().position(|&r| {
+                    matches!(
+                        self.rows.get(r),
+                        Some(Entry::File(f)) if f.section == section && f.path == path
+                    )
+                })
             })
-            .unwrap_or_else(|| view.cursor());
-        view.go_to(cursor);
-        self.view = view;
+            .unwrap_or_else(|| old.cursor());
+        self.view.go_to(cursor);
         // A vanished anchor can leave the cursor on whatever heading took its
         // row; the direction is "where it was", so it walks on to the next
         // file rather than back to the previous section's last.
@@ -489,12 +615,25 @@ impl Files {
 
     // ------------------------------------------------------------------ verbs
 
+    /// Whether a section holds a path — what a side toggle consults before
+    /// it switches: a file that exists only on one side of the index has no
+    /// other side to switch to, and the row list is the one place that
+    /// answer lives.
+    pub fn has_row(&self, section: Section, path: &PathBytes) -> bool {
+        self.rows.iter().any(|row| match row {
+            Entry::File(file) => file.section == section && &file.path == path,
+            _ => false,
+        })
+    }
+
     /// What the keyboard is on: the whole file row — section and path
     /// together, which is what a stage verb needs to know where its work
     /// goes. `None` only on an empty or unavailable tree, since the cursor
-    /// never rests on a heading.
+    /// never rests on a heading. Through the visible table: under a filter,
+    /// the cursor is a row of the filtered list and names a different
+    /// position in the source.
     pub fn current_file(&self) -> Option<&FileRow> {
-        match self.rows.get(self.view.cursor()) {
+        match self.row_at(self.view.cursor()) {
             Some(Entry::File(f)) => Some(f),
             _ => None,
         }
@@ -503,7 +642,7 @@ impl Files {
     /// Which section the keyboard sits *in* — the side of the index under the
     /// keyboard decides where a whole-section verb goes.
     pub fn cursor_section(&self) -> Option<Section> {
-        match self.rows.get(self.view.cursor()) {
+        match self.row_at(self.view.cursor()) {
             Some(Entry::Heading { section, .. }) => Some(*section),
             Some(Entry::File(f)) => Some(f.section),
             None => None,
@@ -600,7 +739,7 @@ impl Files {
 
     pub fn to_bottom(&mut self) {
         self.view.to_bottom();
-        self.settle(self.rows.len().saturating_sub(1));
+        self.settle(self.visible.len().saturating_sub(1));
         self.armed = None;
     }
 
@@ -656,7 +795,7 @@ impl Files {
         if self.total == 0 {
             return "clean".into();
         }
-        let at = match self.rows.get(self.view.cursor()) {
+        let at = match self.row_at(self.view.cursor()) {
             Some(Entry::File(f)) => f.n,
             _ => 0,
         };
@@ -702,7 +841,12 @@ impl Files {
         let armed = self.armed_index();
         for i in 0..self.view.height() {
             let row = y + i;
-            let Some(index) = self.view.row_at(i) else {
+            let Some(index) = self
+                .view
+                .row_at(i)
+                .and_then(|v| self.visible.get(v))
+                .copied()
+            else {
                 screen.span(row, x, self.cols).wash(plain);
                 continue;
             };

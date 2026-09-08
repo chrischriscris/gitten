@@ -44,8 +44,10 @@
 //! never changes, so a diff keyed on the pair of them is cacheable forever.
 
 use gitten_core::differ::{Differs, Overrides};
+use gitten_core::operation::{Operation, Side};
 use gitten_core::refs::{
-    Branch, HeadState, ReflogEntry, Remote, RemoteBranch, ResetMode, Stash, Tag, Upstream,
+    Branch, HeadState, ReflogEntry, Remote, RemoteBranch, ResetMode, Stash, StashId, StashScope,
+    Tag, Upstream,
 };
 use gitten_core::status::{
     Change, ConflictEntry, ConflictKind, Kind, PathBytes, StagedEntry, Status, Submodule,
@@ -53,10 +55,12 @@ use gitten_core::status::{
 };
 use gitten_core::{parse_log, Commit, FileDiff};
 
-/// The interactive-rebase plan, re-exported because it appears on the
+/// The interactive-rebase plans, re-exported because they appear on the
 /// [`Repo`] trait: an implementor should not need to know which crate
-/// spelled it.
-pub use gitten_core::rebase::TodoScript;
+/// spelled them. [`TodoScript`] is git's file as bytes; [`Plan`] is the
+/// editable model a todo UI holds, and the one that can carry a reworded
+/// message down to the layer with a filesystem to put it in.
+pub use gitten_core::rebase::{FixupKind, Plan, TodoScript};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
@@ -67,6 +71,11 @@ pub type Result<T> = std::result::Result<T, String>;
 
 /// Must match `gitten_core::parse_log`.
 const LOG_FORMAT: &str = "%H%x1f%h%x1f%P%x1f%an%x1f%at%x1f%s%x1e";
+
+/// [`RAW`](Self::pairs)'s argument list, spelled in bytes for the side reads
+/// whose pathspec is a raw name. Keep the two lists the same: one spell of
+/// `--raw -z -M --abbrev=64 --no-ext-diff`, whatever calls it.
+const RAW_B: [&[u8]; 5] = [b"--raw", b"-z", b"-M", b"--abbrev=64", b"--no-ext-diff"];
 
 /// An OID of all zeros is git's "not in the object database", which on the new
 /// side of a `git diff` means "look in the working tree".
@@ -192,10 +201,10 @@ fn run_env(repo: &Path, args: &[&[u8]], env: &[(&str, &str)]) -> Result<Vec<u8>>
     Ok(out.stdout)
 }
 
-/// Writes a plan to one freshly created temp file and names it.
+/// Writes bytes to one freshly created temp file and names it.
 ///
-/// Three properties, because this file carries commit subjects and lives in
-/// a directory other users may be able to write:
+/// Three properties, because these files carry commit subjects and messages
+/// and live in a directory other users may be able to write:
 ///
 /// **`create_new`** — the create fails if anything already sits at the
 /// path, so a pre-planted file or symlink cannot be clobbered with a plan
@@ -210,8 +219,9 @@ fn run_env(repo: &Path, args: &[&[u8]], env: &[(&str, &str)]) -> Result<Vec<u8>>
 ///
 /// The file exists only for the length of the rebase process; uniqueness
 /// is per call rather than per process, because two rebases queued behind
-/// each other on the job thread must not share a plan.
-fn write_todo_tmpfile(script: Vec<u8>) -> Result<PathBuf> {
+/// each other on the job thread must not share a plan — and one rebase's
+/// own reworded messages are one file each, for the same reason.
+fn write_private_tmpfile(kind: &str, contents: Vec<u8>) -> Result<PathBuf> {
     use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -223,7 +233,7 @@ fn write_todo_tmpfile(script: Vec<u8>) -> Result<PathBuf> {
     for attempt in 0..4 {
         let mut at = std::env::temp_dir();
         at.push(format!(
-            "gitten-todo-{}-{:x}-{:x}-{:x}",
+            "gitten-{kind}-{}-{:x}-{:x}-{:x}",
             std::process::id(),
             nanos,
             attempt,
@@ -239,7 +249,7 @@ fn write_todo_tmpfile(script: Vec<u8>) -> Result<PathBuf> {
                 file.set_permissions(std::fs::Permissions::from_mode(0o600))
                     .map_err(|e| format!("could not lock down {}: {e}", at.display()))?;
                 (&file)
-                    .write_all(&script)
+                    .write_all(&contents)
                     .map_err(|e| format!("could not write {}: {e}", at.display()))?;
                 return Ok(at);
             }
@@ -249,7 +259,9 @@ fn write_todo_tmpfile(script: Vec<u8>) -> Result<PathBuf> {
             Err(e) => return Err(format!("could not create {}: {e}", at.display())),
         }
     }
-    Err("could not create a private todo tempfile after four attempts".into())
+    Err(format!(
+        "could not create a private {kind} tempfile after four attempts"
+    ))
 }
 
 /// A path as one shell word. Temp directories do not usually need the
@@ -363,6 +375,49 @@ pub trait Repo: Send + Sync {
     /// has untracked files in it.
     fn pairs(&self, revspec: &str) -> Result<Vec<Pair>>;
 
+    /// `HEAD`'s tree → the index: the staged side, for one path or the
+    /// whole side.
+    ///
+    /// The path is raw bytes, matched byte for byte — a lossy decode here
+    /// would rename somebody's file on the way to the answer. A rename
+    /// record names either of its two paths. A repository with no commits
+    /// yet is not a failure: the index reads against the empty tree, which
+    /// is what every staged file on an unborn branch actually is.
+    fn pairs_staged(&self, _path: Option<&[u8]>) -> Result<Vec<Pair>> {
+        Err(unserved("the staged side"))
+    }
+
+    /// The index → the working tree: the unstaged side, for one path or the
+    /// whole side. Untracked files are not here — they are in no tree and
+    /// no index, and [`Self::pair_untracked`] is their door.
+    fn pairs_unstaged(&self, _path: Option<&[u8]>) -> Result<Vec<Pair>> {
+        Err(unserved("the unstaged side"))
+    }
+
+    /// One untracked file's contents, as a pair with nothing opposite it.
+    ///
+    /// `None` is an honest answer, not an error: an unreadable file — a
+    /// broken symlink, a file deleted between the status read and this
+    /// one — has no contents to show.
+    fn pair_untracked(&self, _path: &[u8]) -> Result<Option<Pair>> {
+        Err(unserved("the untracked file"))
+    }
+
+    /// The untracked files one stash parked, as pairs with nothing opposite
+    /// them. `git stash push -u` keeps them in a third parent commit; a
+    /// stash without one answers empty, which is the ordinary case.
+    fn pairs_stash_untracked(&self, _commit: &str) -> Result<Vec<Pair>> {
+        Err(unserved("a stash's untracked files"))
+    }
+
+    /// Commit history from a ref other than HEAD, newest first — a branch
+    /// drilldown's read. Same [`Self::log`] rules: `--topo-order`, newest
+    /// first, and the revspec is raw bytes, because branch names carry no
+    /// encoding guarantee.
+    fn log_at(&self, _revspec: &[u8], _limit: usize) -> Result<Vec<Commit>> {
+        Err(unserved("a ref's log"))
+    }
+
     /// The working tree against HEAD and the index: staged, unstaged,
     /// untracked and conflicted, each list its own answer. See
     /// [`gitten_core::status`] for the model and why the four are separate.
@@ -388,6 +443,35 @@ pub trait Repo: Send + Sync {
     /// `(gone)` — the rows stay true, one word of honesty is lost.
     fn worktree_branches(&self) -> Vec<String> {
         Vec::new()
+    }
+
+    /// Every checkout of this repository, this one included, as porcelain reports it.
+    ///
+    /// The main worktree is always first — git's own ordering — so a caller
+    /// that wants "the others" skips one row rather than comparing paths.
+    fn worktrees(&self) -> Result<Vec<gitten_core::worktrees::Worktree>> {
+        Err(unserved("worktrees"))
+    }
+
+    /// Checks out `base` into a new worktree at `path`: `git worktree add`.
+    ///
+    /// `base` names what the new checkout holds — a branch, a commit, any
+    /// revspec — and `branch` names a *new* branch to create there instead
+    /// of checking the base out detached. An empty base checks out HEAD's
+    /// branch in the new tree, which git refuses when this tree already
+    /// holds it — the refusal arrives in git's own words. Paths and revs
+    /// ride argv as bytes; a path beginning with `-` is refused first.
+    fn worktree_add(&self, _path: &[u8], _base: &[u8], _branch: Option<&[u8]>) -> Result<()> {
+        Err(unserved("adding a worktree"))
+    }
+
+    /// Forgets the worktree at `path`: `git worktree remove`.
+    ///
+    /// A dirty tree or a lock refuses without `force` — git's own words —
+    /// and a prunable entry removes the metadata. `force` is the second
+    /// press's spelling, never the first's.
+    fn worktree_remove(&self, _path: &[u8], _force: bool) -> Result<()> {
+        Err(unserved("removing a worktree"))
     }
 
     /// Where `HEAD` points — a branch, or a commit it detached onto, or
@@ -451,6 +535,20 @@ pub trait Repo: Send + Sync {
     /// [`status`](Self::status) named the path.
     fn discard(&self, _path: &[u8]) -> Result<()> {
         Err(unserved("discarding"))
+    }
+
+    /// Restores one path to the version a commit holds —
+    /// `git checkout <sha> -- <path>`, worktree and index together.
+    ///
+    /// [`discard`](Self::discard)'s older sibling: same mechanics, an
+    /// older source. The sha rides argv as bytes behind [`refuse_dashes`],
+    /// the path behind the `--` that stops a leading dash reading as a
+    /// flag — the two guards face opposite directions and both stand.
+    /// Worktree and index both move, which is git's semantic and is said
+    /// as such wherever this is offered: staged work on this path is
+    /// replaced, not kept.
+    fn checkout_file_from(&self, _sha: &[u8], _path: &[u8]) -> Result<()> {
+        Err(unserved("checking out a file from a commit"))
     }
 
     /// Deletes one untracked file from the working tree.
@@ -557,6 +655,57 @@ pub trait Repo: Send + Sync {
         Err(unserved("patch discarding"))
     }
 
+    /// Writes exactly what `patch` describes into the working tree:
+    /// `git apply` without `--cached` and without `--reverse`.
+    ///
+    /// The fourth corner the other three patch verbs leave open: stage and
+    /// unstage aim at the index, discard runs the worktree backwards, and
+    /// this one runs it forwards — what a patch picked from anywhere lands
+    /// through. The index is not touched, so staged work stands still while
+    /// the worktree takes the patch; context that drifted since the patch
+    /// was built fails with git's own sentence, verbatim, because "patch
+    /// does not apply" is advice only the person holding both sides can
+    /// act on. The same stdin transport as its siblings, for the same
+    /// reason: a patch is arbitrary text and never argv.
+    fn apply_patch(&self, _patch: &[u8]) -> Result<()> {
+        Err(unserved("patch applying"))
+    }
+
+    /// The files one commit touched, in the order git names them: each
+    /// entry is the status letter git's own `diff-tree` reports (`A`, `M`,
+    /// `D`, `R` with the similarity score, `T` for a type change) beside
+    /// the path as the reader will see it. Renames report the new path —
+    /// the name the worktree holds now — with the old one folded into the
+    /// status letter's score, because a verb aims at what exists.
+    ///
+    /// `git diff-tree --no-commit-id --name-status -r -z`, so raw-byte
+    /// paths survive whole and empty commits answer empty rather than
+    /// erroring: a commit that changed nothing has no files, which is a
+    /// fact and not a failure. `-M` so a rename reports once, under its
+    /// new name, rather than as a delete plus an add that no verb could
+    /// aim at together. The sha rides argv as bytes and passes
+    /// [`refuse_dashes`] first, like every other rev that travels there.
+    fn commit_files(&self, _sha: &[u8]) -> Result<Vec<(char, Vec<u8>)>> {
+        Err(unserved("a commit's files"))
+    }
+
+    /// The blob OID the index holds for one path — the stage-0 entry — or
+    /// `None` when the index has no entry under that name. The write-time
+    /// half of partial staging's staleness contract: a patch is built
+    /// against a read, and this is how the write checks the read still
+    /// holds before `git apply` aims it anywhere.
+    fn index_blob_oid(&self, _path: &[u8]) -> Result<Option<String>> {
+        Err(unserved("the index's blob"))
+    }
+
+    /// The blob OID `HEAD`'s tree holds for one path, under the same
+    /// contract as [`Self::index_blob_oid`]. An unborn HEAD, and a path
+    /// HEAD never carried, answer `None` — which is exactly the identity a
+    /// patch built against "nothing" revalidates against.
+    fn head_blob_oid(&self, _path: &[u8]) -> Result<Option<String>> {
+        Err(unserved("HEAD's blob"))
+    }
+
     /// Commits what the index holds with `message`, returning the new
     /// commit's OID.
     ///
@@ -566,6 +715,17 @@ pub trait Repo: Send + Sync {
     /// names the wrong failure.
     fn commit(&self, _message: &str) -> Result<String> {
         Err(unserved("committing"))
+    }
+
+    /// Commits what the index holds as a fixup for `sha`, returning the new
+    /// commit's OID — `git commit --fixup[=amend:|=reword:]<sha>`, so the
+    /// message is git's marker, never a prompt. `--fixup` never opens an
+    /// editor, which is why this rides [`run_bytes`] instead of the
+    /// message-piping road [`commit`](Self::commit) takes. The sha rides
+    /// argv as bytes behind [`refuse_dashes`], like every other rev that
+    /// travels there.
+    fn commit_fixup(&self, _sha: &[u8], _kind: FixupKind) -> Result<String> {
+        Err(unserved("a fixup commit"))
     }
 
     /// Moves HEAD onto the named local branch: `git checkout -q`.
@@ -662,6 +822,76 @@ pub trait Repo: Send + Sync {
         Err(unserved("dropping a stash"))
     }
 
+    /// Parks a *chosen part* of the working tree — [`StashScope`] says which,
+    /// and just as bindingly which part must be left exactly where it is.
+    ///
+    /// [`Self::stash_push`] is this with [`StashScope::Tracked`], kept as its
+    /// own verb because it is the one a bare "stash" means and every client
+    /// already asks for it by that name.
+    ///
+    /// The same "did the stack move" test as the plain push, and one more
+    /// thing said when it moved *and* git failed: `--staged` writes its entry
+    /// before it tries to take the change back out of the index, and a path
+    /// with changes on both sides is a reversal git cannot perform. The entry
+    /// stands, nothing was taken away, and both halves of that reach the
+    /// reader — the alternative is dropping a stash git just made, which is
+    /// the one thing this family may never do behind somebody's back.
+    fn stash_push_scoped(&self, _message: Option<&str>, _scope: &StashScope) -> Result<usize> {
+        Err(unserved("stashing"))
+    }
+
+    /// [`Self::stash_apply`], aimed by the entry's own commit instead of by a
+    /// position that renumbers.
+    ///
+    /// The resolution happens here, against a stack read immediately before
+    /// the write, which is the whole difference: a push or a drop between the
+    /// keypress and the queue's turn moves the entry, and the number captured
+    /// at the keypress then names somebody else's work. See
+    /// [`StashId`](gitten_core::refs::StashId) for the rule, and
+    /// [`StashAt`](gitten_core::refs::StashAt) for the two answers that are
+    /// refusals rather than positions.
+    fn stash_apply_id(&self, _id: &StashId) -> Result<()> {
+        Err(unserved("applying a stash"))
+    }
+
+    /// [`Self::stash_pop`], aimed by commit — see [`Self::stash_apply_id`].
+    /// A conflicted restore is git's own refusal with the entry kept, which
+    /// is why nothing here drops as a separate step.
+    fn stash_pop_id(&self, _id: &StashId) -> Result<()> {
+        Err(unserved("popping a stash"))
+    }
+
+    /// [`Self::stash_drop`], aimed by commit — see [`Self::stash_apply_id`].
+    /// The verb this identity matters most for: a drop aimed at a stale
+    /// number destroys work nobody chose.
+    fn stash_drop_id(&self, _id: &StashId) -> Result<()> {
+        Err(unserved("dropping a stash"))
+    }
+
+    /// Gives a stash entry a new message, keeping its commit.
+    ///
+    /// **A rename re-files the entry at the top of the stack**, and that is
+    /// git's shape rather than a choice: the stash is a reflog, `git stash
+    /// store` appends, and no verb rewrites an entry's message in place. So
+    /// the commit is stored again under the new message and the old entry is
+    /// dropped — in that order, so the commit is named twice in the middle
+    /// and never zero times.
+    fn stash_rename(&self, _id: &StashId, _message: &str) -> Result<()> {
+        Err(unserved("renaming a stash"))
+    }
+
+    /// Starts a branch from a stash entry: `git stash branch`.
+    ///
+    /// Three things in one verb, which is why it is git's and not a checkout
+    /// plus an apply assembled here — the branch starts at the commit the
+    /// stash was *made on*, the entry is applied with its index intact so
+    /// what was staged is staged again, and the entry is dropped only if
+    /// that apply was clean. A dirty tree that the checkout would overwrite
+    /// is git's refusal, surfaced verbatim, with the stash untouched.
+    fn stash_branch(&self, _id: &StashId, _name: &[u8]) -> Result<()> {
+        Err(unserved("a branch from a stash"))
+    }
+
     /// Moves the branch HEAD names onto `target` — `git reset -q --<mode>`.
     ///
     /// The mode says how much follows the pointer: [`ResetMode::Soft`] moves
@@ -713,6 +943,61 @@ pub trait Repo: Send + Sync {
         Err(unserved("amending"))
     }
 
+    /// Rewrites HEAD keeping tree, message, author and date exactly as
+    /// they are — `git commit --amend --no-edit -q` — returning the
+    /// replacement commit's OID.
+    ///
+    /// The verb a graft ends with: the worktree was already aimed at the
+    /// commit being rewritten (detached), the patch applied and staged, so
+    /// what remains is to fold it in without touching a word of the
+    /// message. `--no-edit` is load-bearing — without it git opens an
+    /// editor, or with one configured silently rewords — and there is no
+    /// `--only` here because the staged patch is exactly what must land.
+    /// An unborn branch is refused before any process runs, like
+    /// [`amend`](Self::amend)'s own guard.
+    fn amend_no_edit(&self) -> Result<String> {
+        Err(unserved("amending without rewording"))
+    }
+
+    /// Whether folding the current index into `sha` would leave it empty —
+    /// the staged tree byte-identical to the commit's first-parent tree.
+    /// The graft's guard against amending a commit into nothing: lifting a
+    /// commit's only change does not rewrite it, it deletes it, and the
+    /// drop door owns that. Compared as trees, not as patches, so a commit
+    /// that changed two files and loses one still stands.
+    fn graft_empties(&self, _sha: &[u8]) -> Result<bool> {
+        Err(unserved("an emptiness check"))
+    }
+
+    /// Resets HEAD's author to the current user —
+    /// `git commit --amend --no-edit --reset-author`. The tree and the
+    /// message stand exactly still; only the authorship moves, which is
+    /// what makes this the narrow sibling of [`amend`](Self::amend) rather
+    /// than a second spelling of it. The standing tree is left alone —
+    /// staged work stays staged and unstaged work stays unstaged, which
+    /// takes git's `--only` and is the whole reason this is not spelled
+    /// `amend` with an empty message: a bare `--amend` folds the index into
+    /// the commit it rewrites, so a keypress meant to fix a name would
+    /// quietly commit whatever happened to be staged. An unborn branch is
+    /// refused before any process runs — there is no commit to re-author.
+    /// HEAD only: a deeper commit's author is a rebase, and the todo UI for
+    /// one is a later slice, so the caller aims this at HEAD and says so.
+    fn reset_author(&self) -> Result<()> {
+        Err(unserved("resetting the author"))
+    }
+
+    /// Replaces HEAD's message and nothing else —
+    /// `git commit --amend --only --file=-`.
+    ///
+    /// The narrow sibling of [`amend`](Self::amend), and narrow on purpose:
+    /// `--only` with no pathspec keeps the index exactly where it is, so a
+    /// keypress that said *reword* cannot commit somebody's staged work in
+    /// progress. Deeper than HEAD the same move is a rebase, and
+    /// [`rebase_plan`](Self::rebase_plan) carries it.
+    fn reword_head(&self, _message: &str) -> Result<()> {
+        Err(unserved("rewording"))
+    }
+
     /// Rewrites history by handing git a plan: `git rebase -i <upstream>`
     /// with the sequencer editor replaced by a command that installs
     /// [`script`](gitten_core::rebase::TodoScript).
@@ -748,6 +1033,31 @@ pub trait Repo: Send + Sync {
         Err(unserved("interactive rebase"))
     }
 
+    /// Rewrites history from an editable [`Plan`] — the same
+    /// `git rebase -i` machinery as [`rebase_todo`](Self::rebase_todo), with
+    /// the two things a plan carries that a bare script cannot.
+    ///
+    /// A **reworded** message is bytes somebody typed, and git's own
+    /// `reword` would ask for them again through an editor nothing here can
+    /// answer. So the plan's reword reaches git as a `pick` followed by an
+    /// `exec` of `git commit --amend -F <file>`, the file being one private
+    /// temp file per message, removed once the rebase is over. That is the
+    /// whole reason this verb exists beside its sibling: the message needs a
+    /// filesystem, and [`gitten_core::rebase`] has none.
+    ///
+    /// An **amendment** is the same trick without the file —
+    /// `--reset-author` is the one today — which is what lets a commit
+    /// deeper than HEAD be re-authored at all.
+    ///
+    /// Everything else is [`rebase_todo`](Self::rebase_todo)'s story
+    /// verbatim, refusals included: an invalid plan refuses before any
+    /// process runs, a dirty tree is git's own sentence, and a conflict or
+    /// an `edit` stop leaves rebase state standing for the lifecycle to
+    /// carry on from.
+    fn rebase_plan(&self, _plan: &Plan) -> Result<()> {
+        Err(unserved("interactive rebase"))
+    }
+
     /// Moves the current branch onto `upstream`, replaying its own commits:
     /// plain `git rebase -q <upstream>`, no plan involved.
     ///
@@ -758,6 +1068,38 @@ pub trait Repo: Send + Sync {
     /// upstream has them, which is git deciding rather than us.
     fn rebase_onto(&self, _upstream: &[u8]) -> Result<()> {
         Err(unserved("rebasing"))
+    }
+
+    /// Replays everything after `base` onto `onto` —
+    /// `git rebase --onto <onto> <base>`, git's own three-argument form
+    /// with HEAD as the implicit third.
+    ///
+    /// `base` is **exclusive**: the commit marked stays where it is and its
+    /// children are what move. That is what makes marking a base worth a
+    /// key — it is the only way to say "not from where the branches
+    /// diverged, from *here*" — and it is also the sharp edge, because a
+    /// base that is not an ancestor of HEAD replays a range nobody meant.
+    /// Both names are bytes and both pass [`refuse_dashes`] first.
+    fn rebase_onto_base(&self, _onto: &[u8], _base: &[u8]) -> Result<()> {
+        Err(unserved("rebasing onto a base"))
+    }
+
+    /// Throws the whole working tree away: `git reset --hard HEAD` and then
+    /// `git clean -fd`.
+    ///
+    /// DESTRUCTIVE, and the most destructive verb in this trait — every
+    /// uncommitted byte goes, tracked and untracked alike, with no stash and
+    /// no reflog to walk back through. The caller confirms; nothing here
+    /// does.
+    ///
+    /// Two deliberate limits. Ignored files **stay**: `clean` runs without
+    /// `-x`, because a build directory is not somebody's work and deleting
+    /// half an hour of compilation is not what the key said. And an unborn
+    /// branch skips the reset — there is no HEAD to reset to — and cleans
+    /// alone, rather than failing at the first process and leaving the
+    /// second undone.
+    fn nuke_worktree(&self) -> Result<()> {
+        Err(unserved("nuking the working tree"))
     }
 
     /// Abandons an in-progress rebase and puts everything back:
@@ -805,6 +1147,18 @@ pub trait Repo: Send + Sync {
         Err(unserved("cherry-picking"))
     }
 
+    /// Replays several commits onto the current branch in order — one
+    /// `git cherry-pick` over the clipboard's shas, oldest first as the
+    /// caller arranged them. One invocation rather than one per commit, so
+    /// a conflict stops the sequence exactly where git stopped it and the
+    /// lifecycle finds the whole remainder standing, not half a paste
+    /// scattered across jobs. An empty list is refused here: git would read
+    /// a bare `cherry-pick` as "continue the standing one", which is a
+    /// different verb wearing this one's argv.
+    fn cherry_pick_range(&self, _shas: &[Vec<u8>]) -> Result<()> {
+        Err(unserved("cherry-picking a range"))
+    }
+
     /// Abandons an in-progress cherry-pick and puts everything back:
     /// `git cherry-pick --abort`. The branch, index and working tree return
     /// to where they were when the pick started — git's own guarantee, not
@@ -832,6 +1186,197 @@ pub trait Repo: Send + Sync {
     /// here asks before it starts rather than trusting a stale answer.
     fn cherry_pick_in_progress(&self) -> bool {
         false
+    }
+
+    /// Merges `target` into the current branch: `git merge --no-edit <target>`
+    /// for a regular merge (fast-forward when git can take it), `git merge
+    /// --squash --no-edit <target>` for the squash shape — the collision
+    /// staged and nothing committed, which is why a squash has no
+    /// [`merge_continue`](Self::merge_continue) to reach.
+    ///
+    /// No strategy choices, no message invention: git's own merge machinery
+    /// and, when it stops, its own conflict question standing in the tree —
+    /// which [`operation`](Self::operation) reports and only a human answers.
+    /// An operation already standing refuses before any process runs.
+    fn merge(&self, _target: &[u8], _squash: bool) -> Result<()> {
+        Err(unserved("merging"))
+    }
+
+    /// Abandons an in-progress merge: `git merge --abort`. The tree and index
+    /// return to where the merge found them — git's own guarantee.
+    fn merge_abort(&self) -> Result<()> {
+        Err(unserved("aborting a merge"))
+    }
+
+    /// Finishes an in-progress regular merge after the conflicts are
+    /// resolved: `git merge --continue`, the message editor answered `true`.
+    /// A squash merge leaves no merge state to continue, so nothing offers
+    /// this for one; the commit a squash still needs is
+    /// [`commit`](Self::commit)'s ordinary work.
+    fn merge_continue(&self) -> Result<()> {
+        Err(unserved("continuing a merge"))
+    }
+
+    /// Whether a merge is mid-flight right now — `MERGE_HEAD` on disk,
+    /// resolved through `--git-path` so linked worktrees answer for
+    /// themselves. The same posture as
+    /// [`rebase_in_progress`](Self::rebase_in_progress).
+    fn merge_in_progress(&self) -> bool {
+        false
+    }
+
+    /// Steps over the commit a rebase stopped on: `git rebase --skip`. That
+    /// commit's changes leave the branch — the one lifecycle answer that
+    /// destroys work rather than restoring it, which is why only a rebase
+    /// ever offers it.
+    fn rebase_skip(&self) -> Result<()> {
+        Err(unserved("skipping a rebase commit"))
+    }
+
+    /// Abandons an in-progress revert: `git revert --abort`.
+    fn revert_abort(&self) -> Result<()> {
+        Err(unserved("aborting a revert"))
+    }
+
+    /// Finishes an in-progress revert after conflicts are resolved:
+    /// `git revert --continue`, the message editor answered `true`.
+    fn revert_continue(&self) -> Result<()> {
+        Err(unserved("continuing a revert"))
+    }
+
+    /// Whether a revert is mid-flight right now — `REVERT_HEAD` on disk,
+    /// resolved through `--git-path`.
+    fn revert_in_progress(&self) -> bool {
+        false
+    }
+
+    /// The unmerged stages git still holds for one path, as `git ls-files
+    /// -u` spells them: mode, object id and stage number. What a merging
+    /// view reads to say *which kind* of conflict stands (a missing stage 2
+    /// is a delete-by-us, and its hunk view is whole-file answers only), and
+    /// what an undo restores the index from — the entries go back through
+    /// `update-index --index-info` exactly as they were read.
+    fn unmerged(&self, _path: &[u8]) -> Result<Vec<UnmergedStage>> {
+        Err(unserved("reading a path's unmerged stages"))
+    }
+
+    /// The conflicted file itself: the working-tree bytes on disk, parsed
+    /// into regions by [`gitten_core::conflict`]. A file that has left the
+    /// working tree is an error naming that, not an empty parse — the
+    /// caller's message can then say what actually happened.
+    fn conflict_file(&self, _path: &[u8]) -> Result<gitten_core::conflict::ConflictFile> {
+        Err(unserved("reading a conflicted file"))
+    }
+
+    /// Applies region answers to the conflicted file as it stands **now** —
+    /// re-read, re-parsed and re-validated against `choices` before a byte
+    /// is written — then stages it. Unchosen regions keep their markers, so
+    /// a half-answered file stays unmerged in git's own eyes.
+    fn resolve_hunks(
+        &self,
+        _path: &[u8],
+        _choices: &[(usize, gitten_core::conflict::Answer)],
+    ) -> Result<()> {
+        Err(unserved("applying region answers"))
+    }
+
+    /// Puts a conflicted path back the way a snapshot found it — the undo
+    /// of this session's region answers. `git checkout -m` recreates the
+    /// conflict from the same inputs the merge read, with the conflict
+    /// flags every reader agrees on; the snapshot's bytes go over it, so
+    /// the worktree is byte-for-byte what the session answered from. Where
+    /// no merge can be re-run, the captured stages go back by id through
+    /// `update-index --index-info` — read from [`Repo::unmerged`] *before*
+    /// the choice they undo, their object ids unchanged by any resolution.
+    fn restore_conflict(
+        &self,
+        _path: &[u8],
+        _bytes: Vec<u8>,
+        _stages: &[UnmergedStage],
+    ) -> Result<()> {
+        Err(unserved("undoing region answers"))
+    }
+
+    /// Records one conflicted path as resolved, taking `side`'s answer.
+    ///
+    /// [`Side::Ours`]/[`Side::Theirs`]: `git checkout --ours|--theirs --` the
+    /// path, then `git add` — and when that side's stage does not exist
+    /// (ours of an added-by-them conflict, theirs of a deleted-by-them one),
+    /// the side's answer *is* the deletion, so `git rm -f` records it.
+    /// [`Side::Both`]: stage 2's bytes followed by stage 3's, one newline
+    /// boundary between them, written and staged — a text-only answer git's
+    /// stage read refuses on a binary path, which is the honest fallback.
+    /// [`Side::Keep`]: `git add` alone, recording the working tree as it
+    /// stands — including a deletion, which is what resolves a
+    /// both-deleted conflict. Undo of a *recorded* resolution is not offered:
+    /// `git add` collapsed the stages, and claiming an undo that cannot
+    /// reconstruct them would be a lie.
+    fn resolve(&self, _path: &[u8], _side: Side) -> Result<()> {
+        Err(unserved("resolving a conflict"))
+    }
+
+    /// The operation standing right now, if any — the four state reads plus
+    /// the unmerged count from [`Repo::status`]. The priority order matters
+    /// only while a sequencer drives a rebase: rebase first, then the three
+    /// single-write kinds. `None` is a clean repository.
+    fn operation(&self) -> Option<Operation> {
+        use gitten_core::operation::Kind;
+        let kind = if self.rebase_in_progress() {
+            Kind::Rebase
+        } else if self.merge_in_progress() {
+            Kind::Merge
+        } else if self.cherry_pick_in_progress() {
+            Kind::CherryPick
+        } else if self.revert_in_progress() {
+            Kind::Revert
+        } else {
+            return None;
+        };
+        let conflicts = self.status().map(|s| s.conflicts.len()).unwrap_or(0);
+        Some(Operation { kind, conflicts })
+    }
+
+    /// A bisection standing right now, if any — read from git's own state
+    /// files (`BISECT_LOG` standing means standing), resolved through
+    /// `--git-path` so linked worktrees answer for themselves. `None` is
+    /// no bisection, the same posture as [`operation`](Self::operation).
+    fn bisect_state(&self) -> Option<gitten_core::bisect::BisectState> {
+        None
+    }
+
+    /// Starts a bisection: `git bisect start <bad> <goods...>`. The bad
+    /// revision is where the bug is; the goods are where it is not. git
+    /// refuses a nonsense pair in its own words, and a standing bisection
+    /// refuses before any process runs — one question at a time.
+    fn bisect_start(&self, _bad: &[u8], _goods: &[Vec<u8>]) -> Result<()> {
+        Err(unserved("starting a bisect"))
+    }
+
+    /// Marks the checked-out commit good and checks out the next one to
+    /// judge: `git bisect good`. `rev` names a commit other than HEAD when
+    /// given; empty judges the checkout. Refuses outside a bisection in
+    /// git's own words.
+    fn bisect_good(&self, _rev: &[u8]) -> Result<()> {
+        Err(unserved("marking a bisect good"))
+    }
+
+    /// Marks the checked-out commit bad and checks out the next one:
+    /// `git bisect bad`. Same shape as [`bisect_good`](Self::bisect_good).
+    fn bisect_bad(&self, _rev: &[u8]) -> Result<()> {
+        Err(unserved("marking a bisect bad"))
+    }
+
+    /// Skips the checked-out commit — untestable, not good, not bad:
+    /// `git bisect skip`. Same shape as [`bisect_good`](Self::bisect_good).
+    fn bisect_skip(&self, _rev: &[u8]) -> Result<()> {
+        Err(unserved("skipping a bisect commit"))
+    }
+
+    /// Ends the bisection and returns to where it started:
+    /// `git bisect reset`. Outside a bisection git answers a quiet no-op,
+    /// and so does this.
+    fn bisect_reset(&self) -> Result<()> {
+        Err(unserved("resetting a bisect"))
     }
 
     /// Names `target` with a tag: annotated (`-a`) carrying `message` when
@@ -898,12 +1443,94 @@ pub trait Repo: Send + Sync {
         Err(unserved("pulling"))
     }
 
+    /// Pushes one tag to the named remote — `git push <remote> tag <name>`.
+    fn push_tag(&self, _remote: &[u8], _name: &[u8]) -> Result<()> {
+        Err(unserved("pushing a tag"))
+    }
+
+    /// Deletes the branch from the named remote — `git push <remote>
+    /// --delete <branch>`. The local branch of the same name survives.
+    fn delete_remote_branch(&self, _remote: &[u8], _branch: &[u8]) -> Result<()> {
+        Err(unserved("deleting a remote branch"))
+    }
+
+    /// Points HEAD's ref at `target` — a sha or a reflog selector — with
+    /// `message` as the reflog sentence. The index and the working tree do
+    /// not move; see the implementation for why this is undo's verb.
+    fn move_head(&self, _target: &[u8], _message: &str) -> Result<()> {
+        Err(unserved("moving HEAD"))
+    }
+
     /// Updates remote-tracking refs — the one remote named, or every remote
     /// this repository knows when `None`. Nothing else moves: a fetch never
     /// touches local branches, HEAD or the working tree, which is what makes
     /// it safe behind a single unconfirmed key.
     fn fetch(&self, _remote: Option<&[u8]>) -> Result<()> {
         Err(unserved("fetching"))
+    }
+
+    /// Checks out the remote-tracking ref `remote/branch` as a local branch
+    /// that tracks it — `git checkout --track`. The local branch takes the
+    /// branch's own name; one already existing comes back refused in git's
+    /// own words, never overwritten here.
+    fn checkout_tracking(&self, _remote: &[u8], _branch: &[u8]) -> Result<()> {
+        Err(unserved("tracking checkouts"))
+    }
+
+    /// Checks out HEAD's previous branch — git's own `-`, resolved from the
+    /// reflog, so no name travels argv at all.
+    fn checkout_previous(&self) -> Result<()> {
+        Err(unserved("previous-branch checkouts"))
+    }
+
+    /// Checks out `name` over any local changes — `git checkout -f`. This
+    /// destroys unstaged work, which is why the caller confirms before this
+    /// job is ever built.
+    fn checkout_force(&self, _name: &[u8]) -> Result<()> {
+        Err(unserved("forced checkouts"))
+    }
+
+    /// Makes local branch `local` track `remote/branch` —
+    /// `git branch --set-upstream-to`. Nothing is fetched or merged by it;
+    /// only the tracking link moves.
+    fn set_upstream(&self, _local: &[u8], _remote: &[u8], _branch: &[u8]) -> Result<()> {
+        Err(unserved("upstream setting"))
+    }
+
+    /// Severs local branch `local`'s tracking link —
+    /// `git branch --unset-upstream`. Nothing else moves.
+    fn unset_upstream(&self, _local: &[u8]) -> Result<()> {
+        Err(unserved("upstream unsetting"))
+    }
+
+    /// Fast-forwards local branch `local` onto `remote/branch`, never
+    /// sideways: the checked-out branch merges `--ff-only` from the
+    /// remote-tracking ref, and every other branch is updated by
+    /// `git fetch <remote> <branch>:<local>`, which refuses a non-fast-forward
+    /// on its own. Which shape runs is decided here, fresh from HEAD — the
+    /// same read the branches pane draws HEAD's mark from — so a caller
+    /// cannot aim the wrong verb at a moving HEAD.
+    fn fast_forward(&self, _local: &[u8], _remote: &[u8], _branch: &[u8]) -> Result<()> {
+        Err(unserved("fast-forwards"))
+    }
+
+    /// Introduces a remote by name and URL — `git remote add`.
+    fn add_remote(&self, _name: &[u8], _url: &[u8]) -> Result<()> {
+        Err(unserved("remote creation"))
+    }
+
+    /// Points remote `name` at a new URL — `git remote set-url`. The old
+    /// URL is git's own config, and this verb never reads it back; the
+    /// pane does, on the next refresh.
+    fn set_remote_url(&self, _name: &[u8], _url: &[u8]) -> Result<()> {
+        Err(unserved("remote editing"))
+    }
+
+    /// Forgets remote `name` — `git remote remove`. The remote-tracking
+    /// branches under it go with it, which is why the caller confirms
+    /// before this job is ever built.
+    fn remove_remote(&self, _name: &[u8]) -> Result<()> {
+        Err(unserved("remote removal"))
     }
 
     /// A short label for the window title.
@@ -1014,184 +1641,173 @@ impl Repo for Binary {
     }
 
     fn pairs(&self, revspec: &str) -> Result<Vec<Pair>> {
-        // `-z` for NUL-separated paths, because a path may contain anything a
-        // filesystem allows and git otherwise quotes and escapes it. `-M` so a
-        // rename arrives as one file with two names instead of a delete and an
-        // add of an identical blob.
-        //
-        // `--abbrev=64` is load-bearing and looks like a no-op: `--raw` abbreviates
-        // OIDs by default, and `cat-file --batch` echoes back the *full* OID in its
-        // response header, so an abbreviated request cannot be matched to its
-        // answer. 64 is clamped to whatever the repository's hash length actually
-        // is, which makes this right for SHA-256 repositories too.
-        const RAW: [&str; 5] = ["--raw", "-z", "-M", "--abbrev=64", "--no-ext-diff"];
-        let raw = if revspec.is_empty() {
-            run(&self.root, &[&["diff"], &RAW[..], &["HEAD"]].concat())?
-        } else if revspec.contains("..") {
-            run(
-                &self.root,
-                &[&["diff"], &RAW[..], &["--end-of-options", revspec]].concat(),
-            )?
-        } else {
-            // A bare revision means "what did this commit change".
-            //
-            // Merges included. Modern git emits no diff at all for a merge unless
-            // asked — `git show --raw` prints zero records for one — so a merge
-            // commit selected in the log would render as an empty diff, silently.
-            // First-parent asks for the ordinary single-old/single-new records
-            // this parser already handles. Nothing else reaches this parser: the
-            // refusal of two-colon combined records in `parse_raw` below is
-            // belt-and-braces against future or unknown shapes, not a
-            // currently-reachable input. The flag needs git >= 2.31 (March 2021);
-            // older gits reject it and every bare-revision open fails wholesale
-            // rather than silently.
-            run(
-                &self.root,
-                &[
-                    &["show"],
-                    &RAW[..],
-                    &[
-                        "--format=",
-                        "--diff-merges=first-parent",
-                        "--end-of-options",
-                        revspec,
-                    ],
-                ]
-                .concat(),
-            )?
-        };
-
-        let changes = parse_raw(&raw);
-
-        // `--raw` and `--porcelain` paths are relative to the repository's top
-        // level, while `root` may be any subdirectory of it (the CLI default is
-        // the cwd) — so every working-tree read below joins onto the top level,
-        // never onto `root` itself. Object reads do not care: `-C` finds the
-        // objects from anywhere inside.
-        let top = self.top.get_or_init(|| top_level(&self.root));
-
-        // Every blob the whole diff needs, fetched by one `cat-file --batch` —
-        // but held one file at a time. The batch answers strictly in request
-        // order (it reads one OID and writes one answer before reading the
-        // next), and requests go out in pair order, old side then new, so the
-        // answers can be pulled back per file as each [`Pair`] is built instead
-        // of parking every old+new blob of the diff in a map until the last one.
-        // On a thousand-file diff that map was tens of MB of pure peak overlap.
-        // A duplicate OID costs a second read rather than a second copy, which is
-        // the trade the map made implicitly.
-        let mut wanted: Vec<&str> = Vec::with_capacity(changes.len() * 2);
-        for c in &changes {
-            for (mode, oid) in [(&c.old_mode, &c.old_oid), (&c.new_mode, &c.new_oid)] {
-                if fetchable(mode, oid) {
-                    wanted.push(oid);
-                }
-            }
+        let raw = self.raw_for(revspec)?;
+        if !revspec.is_empty() {
+            let top = self.top.get_or_init(|| top_level(&self.root));
+            return self.assemble(parse_raw(&raw), top, false);
         }
-
-        // The working-tree pair wants blobs *and* a status, and the two are
-        // independent — status reads the index and the working tree, the batch
-        // fetches OIDs the diff has already named — so they run side by side and
-        // an open of uncommitted work pays one spawn floor instead of two. Nothing
-        // is shared between them but this handle's root, and neither touches what
-        // the other reads. The stream's errors surface first, as `cat-file`'s did
-        // when both ran in sequence: a failure to start comes back before any
-        // answer is read, and the first failed answer below comes back before
-        // status is asked for. A panic in either is resumed rather than swallowed
-        // because both calls used to be inline.
-        let (blobs, loose) = if revspec.is_empty() {
-            std::thread::scope(|s| {
-                let loose = s.spawn(|| self.status());
-                let blobs = BlobStream::start(&self.root, &wanted);
-                (
-                    blobs,
-                    loose
-                        .join()
-                        .unwrap_or_else(|p| std::panic::resume_unwind(p)),
-                )
-            })
-        } else {
-            (
-                BlobStream::start(&self.root, &wanted),
-                Ok(Status::default()),
-            )
-        };
-        let mut blobs = blobs?;
-
-        let mut out = Vec::with_capacity(changes.len());
-        // Untracked files first, so they read as new before the modifications —
-        // `git status` lists them last and that is the wrong way round for a diff,
+        // The aggregate read is the one that wants untracked files in it, and
+        // untracked files come from the status pass — so the status read runs
+        // beside the whole blob-and-assembly road, not behind it: an open of
+        // uncommitted work pays one spawn floor, not two. The untracked pairs
+        // go first, so they read as new before the modifications — `git
+        // status` lists them last and that is the wrong way round for a diff,
         // where the thing you just created is the thing you are looking for.
-        // Fetching them early changed when they arrive, not where they land.
-        out.extend(loose?.untracked.iter().filter_map(|e| loose_pair(e, top)));
-        for c in changes {
-            // Both sides pull in request order — old, then new — which is what
-            // keeps this loop aligned with the stream.
-            //
-            // The two sides also read a null OID differently, and conflating them
-            // is a silent, plausible-looking bug: an added file whose old side
-            // falls back to the working tree diffs against itself and shows no
-            // change at all. The old side has no fallback: a null OID there means
-            // the file did not exist, and reading the tree for it would diff an
-            // added file against itself. On the new side a null OID is the
-            // ordinary case of a working-tree diff — what the file says now is on
-            // disk and nowhere else.
-            let fetched_old = if fetchable(&c.old_mode, &c.old_oid) {
-                blobs.answer()?
-            } else {
-                None
+        let top = self.top.get_or_init(|| top_level(&self.root));
+        let changes = parse_raw(&raw);
+        std::thread::scope(|s| {
+            let loose = s.spawn(|| self.status());
+            let built = self.assemble(changes, top, true);
+            let loose = loose
+                .join()
+                .unwrap_or_else(|p| std::panic::resume_unwind(p))?;
+            let built = built?;
+            let mut out = Vec::with_capacity(built.len() + loose.untracked.len());
+            out.extend(loose.untracked.iter().filter_map(|e| loose_pair(e, top)));
+            out.extend(built);
+            Ok(out)
+        })
+    }
+
+    fn pairs_staged(&self, path: Option<&[u8]>) -> Result<Vec<Pair>> {
+        // `HEAD`'s tree against the index. On an unborn branch there is no
+        // tree to name, and the honest answer is the empty tree: everything
+        // in the index is an addition, which is what `git init` + `add` +
+        // nothing else actually means. The empty tree's own oid — computed
+        // here, once per call, because the hash length is this repository's
+        // and not sha-1's — keeps the same `--raw` shape every other read
+        // below parses.
+        let raw = match self.head_commit()? {
+            Some(_) => {
+                let mut args: Vec<&[u8]> = vec![b"diff", b"--cached"];
+                args.extend(RAW_B);
+                self.side_raw(args, path)?
+            }
+            None => {
+                let empty = run(&self.root, &["hash-object", "-t", "tree", "/dev/null"])?;
+                let empty = String::from_utf8_lossy(&empty).trim_end().to_string();
+                let mut args: Vec<&[u8]> = vec![b"diff", b"--cached"];
+                args.extend(RAW_B);
+                args.push(b"--end-of-options");
+                args.push(empty.as_bytes());
+                self.side_raw(args, path)?
+            }
+        };
+        self.side_pairs(raw, path, false)
+    }
+
+    fn pairs_unstaged(&self, path: Option<&[u8]>) -> Result<Vec<Pair>> {
+        // Index against the working tree, with no tree named: the index is
+        // always there, so an unborn branch costs this read nothing.
+        let mut args: Vec<&[u8]> = vec![b"diff"];
+        args.extend(RAW_B);
+        let raw = self.side_raw(args, path)?;
+        self.side_pairs(raw, path, true)
+    }
+
+    fn pair_untracked(&self, path: &[u8]) -> Result<Option<Pair>> {
+        // The same door the aggregate read sources its untracked pairs
+        // through: the file read off the top level, bytes in, `None` for an
+        // unreadable one. The entry is built, not read — the caller names
+        // the file, so no status pass pays for it.
+        let top = self.top.get_or_init(|| top_level(&self.root));
+        let entry = UntrackedEntry {
+            path: PathBytes::from_bytes(path),
+        };
+        Ok(loose_pair(&entry, top))
+    }
+
+    fn pairs_stash_untracked(&self, commit: &str) -> Result<Vec<Pair>> {
+        // `git stash push -u` parks untracked files in a third parent. A
+        // stash without one — the ordinary case — answers empty here: the
+        // `--verify --quiet` read refuses and that is the whole story, not
+        // an error to surface. The expression is our own oid; a corrupt
+        // object answers the same empty and is found on the next read.
+        let third = match run(
+            &self.root,
+            &["rev-parse", "--verify", "--quiet", &format!("{commit}^3")],
+        ) {
+            Ok(bytes) if !bytes.iter().all(|b| b.is_ascii_whitespace()) => {
+                String::from_utf8_lossy(&bytes).trim().to_string()
+            }
+            _ => return Ok(Vec::new()),
+        };
+        // `ls-tree -rz` answers `<mode> <type> <oid>\t<path>\0` per entry,
+        // NUL-framed like every other read here. Only blobs are content:
+        // a gitlink parked by `-u` is a borrowed commit with nothing to
+        // read, and it is skipped rather than shown as empty text.
+        let listed = run(&self.root, &["ls-tree", "-rz", &third])?;
+        let mut wanted: Vec<&str> = Vec::new();
+        let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+        for record in listed.split(|b| *b == 0) {
+            if record.is_empty() {
+                continue;
+            }
+            // `<mode> <type> <oid>\t<path>` — the tab is the one separator
+            // the path itself cannot contain, because `ls-tree -z` NUL-frames
+            // the records. (`slice::split_once` is still unstable; the find is
+            // the same answer.)
+            let Some(at) = record.iter().position(|b| *b == b'\t') else {
+                continue;
             };
-            let fetched_new = if fetchable(&c.new_mode, &c.new_oid) {
-                blobs.answer()?
-            } else {
-                None
+            let (meta, path) = (&record[..at], &record[at + 1..]);
+            let mut fields = meta.split(|b| *b == b' ').filter(|f| !f.is_empty());
+            let (Some(mode), Some(kind), Some(oid)) = (fields.next(), fields.next(), fields.next())
+            else {
+                continue;
             };
-            let old = RawChange::synthetic(&c.old_mode, &c.old_oid).or(fetched_old);
-            let new = RawChange::synthetic(&c.new_mode, &c.new_oid)
-                .or(fetched_new)
-                .or_else(|| {
-                    // Only a working-tree diff can have content outside the
-                    // object database. A historical deletion has the same null
-                    // new OID, but reading a later recreation from disk would
-                    // put bytes into a revision where the file did not exist.
-                    revspec
-                        .is_empty()
-                        .then(|| new_side(&c.new_oid, top, c.path.as_bytes()))
-                        .flatten()
-                });
-            let binary = old.as_ref().is_some_and(|b| is_binary(b))
-                || new.as_ref().is_some_and(|b| is_binary(b));
-            // The lossy decode happens here and only here: everything above —
-            // the record, the batch alignment, the working-tree read — went
-            // through the raw bytes, so what reaches a frontend is the display
-            // form of the path git actually named.
-            //
-            // The OIDs ride along under exactly [`fetchable`]'s rule, which is
-            // also how they were chosen for the request list: a side with no
-            // blob behind it has no identity worth keying anything on.
+            if kind != b"blob" || mode == GITLINK.as_bytes() {
+                continue;
+            }
+            wanted.push(std::str::from_utf8(oid).unwrap_or_default());
+            entries.push((String::from_utf8_lossy(oid).into_owned(), path.to_vec()));
+        }
+        let mut blobs = BlobStream::start(&self.root, &wanted)?;
+        let mut out = Vec::with_capacity(entries.len());
+        for (oid, path) in entries {
+            // The parked blob is the whole of the new side; there is no old
+            // side to fall back to and none to invent — an untracked file
+            // existed nowhere before the stash took it.
+            let content = blobs.answer()?;
+            let binary = content.as_ref().is_some_and(|b| is_binary(b));
             out.push(Pair {
-                path: c.path.to_string_lossy().into_owned(),
-                old_path: c
-                    .old_path
-                    .as_ref()
-                    .map(|p| p.to_string_lossy().into_owned()),
-                status: c.status,
-                old: if binary {
-                    Vec::new()
-                } else {
-                    lines(old.as_deref().unwrap_or_default())
+                path: String::from_utf8_lossy(&path).into_owned(),
+                old_path: None,
+                status: 'A',
+                old: Vec::new(),
+                new: match (&content, binary) {
+                    (Some(bytes), false) => lines(bytes),
+                    _ => Vec::new(),
                 },
-                new: if binary {
-                    Vec::new()
-                } else {
-                    lines(new.as_deref().unwrap_or_default())
-                },
-                old_oid: fetchable(&c.old_mode, &c.old_oid).then(|| c.old_oid.clone()),
-                new_oid: fetchable(&c.new_mode, &c.new_oid).then(|| c.new_oid.clone()),
+                old_oid: None,
+                new_oid: Some(oid),
+                old_final_newline: true,
+                new_final_newline: content.as_ref().is_some_and(|b| b.ends_with(b"\n")),
                 binary,
             });
         }
         blobs.finish()?;
         Ok(out)
+    }
+
+    fn log_at(&self, revspec: &[u8], limit: usize) -> Result<Vec<Commit>> {
+        // The same read [`Self::log`] makes, aimed at a named ref: the same
+        // `--topo-order` lane assignment assumes, the same format, the rev
+        // as raw bytes behind `--end-of-options`.
+        let n = limit.to_string();
+        let bytes = run_bytes(
+            &self.root,
+            &[
+                b"log",
+                b"--topo-order",
+                b"-n",
+                n.as_bytes(),
+                LOG_FORMAT.as_bytes(),
+                b"--end-of-options",
+                revspec,
+            ],
+        )?;
+        Ok(parse_log(&String::from_utf8_lossy(&bytes)))
     }
 
     fn status(&self) -> Result<Status> {
@@ -1320,6 +1936,115 @@ impl Repo for Binary {
         )
     }
 
+    fn worktrees(&self) -> Result<Vec<gitten_core::worktrees::Worktree>> {
+        // One process, `--porcelain`: the stable machine spelling, and the
+        // same single-list read every other pane does. The parse lives in
+        // core beside the model, so a second client never re-derives it.
+        let raw = run(&self.root, &["worktree", "list", "--porcelain"])?;
+        Ok(gitten_core::worktrees::parse_worktrees(&raw))
+    }
+
+    fn worktree_add(&self, path: &[u8], base: &[u8], branch: Option<&[u8]>) -> Result<()> {
+        refuse_dashes(path)?;
+        // `add <path>`: no rev means HEAD's branch in the new tree — which
+        // git refuses when this tree holds it — so an empty base stays
+        // empty and git's own sentence does the explaining.
+        let mut argv: Vec<&[u8]> = vec![b"worktree", b"add"];
+        let mut held: Vec<Vec<u8>> = Vec::new();
+        if let Some(name) = branch {
+            refuse_dashes(name)?;
+            argv.push(b"-b");
+            held.push(name.to_vec());
+            argv.push(&held[0]);
+        }
+        argv.push(path);
+        if !base.is_empty() {
+            refuse_dashes(base)?;
+            argv.push(base);
+        }
+        run_bytes(&self.root, &argv).map(|_| ())
+    }
+
+    fn worktree_remove(&self, path: &[u8], force: bool) -> Result<()> {
+        refuse_dashes(path)?;
+        // `remove` refuses a dirty tree, untracked files, and locks; the
+        // force spelling is the second press's, and only ever that.
+        if force {
+            run_bytes(&self.root, &[b"worktree", b"remove", b"--force", path]).map(|_| ())
+        } else {
+            run_bytes(&self.root, &[b"worktree", b"remove", path]).map(|_| ())
+        }
+    }
+
+    fn bisect_state(&self) -> Option<gitten_core::bisect::BisectState> {
+        // The log's existence is the bisection: git writes BISECT_LOG on
+        // `start` and deletes it on `reset`. The revs degrade to empty
+        // words when a file is missing rather than failing the read.
+        let log = self.git_state_path("BISECT_LOG")?;
+        let present = log.exists();
+        let read = |name: &str| {
+            self.git_state_path(name)
+                .and_then(|at| std::fs::read(at).ok())
+        };
+        let expected = read("BISECT_EXPECTED_REV");
+        let start = read("BISECT_START");
+        let goods = read("BISECT_ANCESTORS_OK");
+        gitten_core::bisect::parse_bisect_state(
+            present,
+            expected.as_deref(),
+            start.as_deref(),
+            goods.as_deref(),
+        )
+    }
+
+    fn bisect_start(&self, bad: &[u8], goods: &[Vec<u8>]) -> Result<()> {
+        if self.bisect_state().is_some() {
+            return Err("a bisect is already in progress — reset it first".into());
+        }
+        refuse_dashes(bad)?;
+        let mut argv: Vec<&[u8]> = vec![b"bisect", b"start", bad];
+        for good in goods {
+            refuse_dashes(good)?;
+            argv.push(good);
+        }
+        run_bytes(&self.root, &argv).map(|_| ())
+    }
+
+    fn bisect_good(&self, rev: &[u8]) -> Result<()> {
+        // Empty judges the checkout — git's own default — so a caller
+        // passes what the keyboard named or nothing at all.
+        if rev.is_empty() {
+            run_bytes(&self.root, &[b"bisect", b"good"]).map(|_| ())
+        } else {
+            refuse_dashes(rev)?;
+            run_bytes(&self.root, &[b"bisect", b"good", rev]).map(|_| ())
+        }
+    }
+
+    fn bisect_bad(&self, rev: &[u8]) -> Result<()> {
+        if rev.is_empty() {
+            run_bytes(&self.root, &[b"bisect", b"bad"]).map(|_| ())
+        } else {
+            refuse_dashes(rev)?;
+            run_bytes(&self.root, &[b"bisect", b"bad", rev]).map(|_| ())
+        }
+    }
+
+    fn bisect_skip(&self, rev: &[u8]) -> Result<()> {
+        if rev.is_empty() {
+            run_bytes(&self.root, &[b"bisect", b"skip"]).map(|_| ())
+        } else {
+            refuse_dashes(rev)?;
+            run_bytes(&self.root, &[b"bisect", b"skip", rev]).map(|_| ())
+        }
+    }
+
+    fn bisect_reset(&self) -> Result<()> {
+        // Outside a bisection this is git's quiet no-op, and ours too —
+        // ending nothing is not an error.
+        run_bytes(&self.root, &[b"bisect", b"reset"]).map(|_| ())
+    }
+
     fn remote_branches(&self) -> Result<Vec<RemoteBranch>> {
         // The other half of the same ref listing — see
         // [`Binary::ref_tables`] for the process and what shares it. Same
@@ -1384,7 +2109,7 @@ impl Repo for Binary {
             &self.root,
             &[
                 "for-each-ref",
-                "--format=%(refname)%00%(*objectname)%00%(objectname)",
+                "--format=%(refname)%00%(*objectname)%00%(objectname)%00%(objecttype)%00%(contents:subject)",
                 "refs/tags",
             ],
         )?;
@@ -1438,6 +2163,11 @@ impl Repo for Binary {
         // The index is the source, so a staged version survives; see the
         // trait method for where that line sits.
         run_bytes(&self.root, &[b"checkout", b"--", path]).map(|_| ())
+    }
+
+    fn checkout_file_from(&self, sha: &[u8], path: &[u8]) -> Result<()> {
+        refuse_dashes(sha)?;
+        run_bytes(&self.root, &[b"checkout", sha, b"--", path]).map(|_| ())
     }
 
     fn remove_untracked(&self, path: &[u8]) -> Result<()> {
@@ -1559,6 +2289,59 @@ impl Repo for Binary {
         )
     }
 
+    fn apply_patch(&self, patch: &[u8]) -> Result<()> {
+        if patch.is_empty() {
+            return Err("an empty patch applies nothing".into());
+        }
+        run_stdin(&self.root, &[b"apply", b"--whitespace=nowarn", b"-"], patch)
+    }
+
+    fn commit_files(&self, sha: &[u8]) -> Result<Vec<(char, Vec<u8>)>> {
+        refuse_dashes(sha)?;
+        let out = run_bytes(
+            &self.root,
+            &[
+                b"diff-tree",
+                b"--no-commit-id",
+                b"--name-status",
+                b"-r",
+                b"-M",
+                b"-z",
+                sha,
+            ],
+        )?;
+        // `-z` NUL-separates every field: a status letter, then its paths
+        // — one path, or two when the letter is a rename (`R100`, old,
+        // new). Bytes throughout, because a path is not text until drawn.
+        let mut fields = out.split(|b| *b == 0);
+        let mut files = Vec::new();
+        while let Some(status) = fields.next() {
+            if status.is_empty() {
+                continue;
+            }
+            let letter = status[0] as char;
+            let first = fields.next().unwrap_or_default();
+            let path = if letter == 'R' {
+                fields.next().unwrap_or_default()
+            } else {
+                first
+            };
+            if path.is_empty() {
+                continue;
+            }
+            files.push((letter, path.to_vec()));
+        }
+        Ok(files)
+    }
+
+    fn index_blob_oid(&self, path: &[u8]) -> Result<Option<String>> {
+        tree_blob_oid(&self.root, b":0", path)
+    }
+
+    fn head_blob_oid(&self, path: &[u8]) -> Result<Option<String>> {
+        tree_blob_oid(&self.root, b"HEAD", path)
+    }
+
     fn checkout(&self, name: &[u8]) -> Result<()> {
         // `-q` keeps git's "Switched to branch" off our error band's road;
         // the name rides bare — see the trait method for why no `--` sits in
@@ -1606,7 +2389,19 @@ impl Repo for Binary {
         self.commit_via(&[b"commit", b"--file=-"], message)
     }
 
+    fn commit_fixup(&self, sha: &[u8], kind: FixupKind) -> Result<String> {
+        refuse_dashes(sha)?;
+        let flag = [kind.flag().as_bytes(), sha].concat();
+        run_bytes(&self.root, &[b"commit", &flag])?;
+        let out = run(&self.root, &["rev-parse", "HEAD"])?;
+        Ok(lossy(trimmed(&out)))
+    }
+
     fn stash_push(&self, message: Option<&str>) -> Result<usize> {
+        self.stash_push_scoped(message, &StashScope::Tracked)
+    }
+
+    fn stash_push_scoped(&self, message: Option<&str>, scope: &StashScope) -> Result<usize> {
         // What `stash@{0}` resolves to before the push. Git answers "nothing
         // to stash" with exit 0 and one localized sentence on stdout — no
         // flag makes it machine-readable — so the only honest test of whether
@@ -1614,14 +2409,37 @@ impl Repo for Binary {
         // cheap rev-parses around a rare write, and no prose parsing to go
         // wrong in another locale.
         let before = self.stash_head();
-        match message {
-            Some(m) => run(&self.root, &["stash", "push", "-m", m])?,
-            None => run(&self.root, &["stash", "push"])?,
-        };
-        if self.stash_head() == before {
-            return Err("nothing to stash: the working tree has no tracked changes".into());
+        let mut args: Vec<&[u8]> = vec![b"stash", b"push"];
+        args.extend(scope.flags().iter().map(|flag| flag.as_bytes()));
+        if let Some(m) = message {
+            args.push(b"-m");
+            args.push(m.as_bytes());
         }
-        Ok(0)
+        // The pathspec goes last, behind `--`, which is also what makes a
+        // path beginning with `-` safe here without a refusal of its own:
+        // everything after the separator is a path to git, whatever it looks
+        // like.
+        if let Some(path) = scope.path() {
+            args.push(b"--");
+            args.push(path.as_bytes());
+        }
+        let ran = run_bytes(&self.root, &args);
+        let moved = self.stash_head() != before;
+        match (ran, moved) {
+            (Ok(_), true) => Ok(0),
+            (Ok(_), false) => Err(format!(
+                "nothing to stash: {} has no changes",
+                scope.label()
+            )),
+            // Git failed *after* writing the entry — `--staged` against a
+            // path with changes on both sides is the way in. Nothing was
+            // taken out of the index or the working tree, and the entry it
+            // wrote is on the stack: both facts, behind git's own words.
+            (Err(e), true) => Err(format!(
+                "{e} — the entry was recorded, and the index and working tree are untouched"
+            )),
+            (Err(e), false) => Err(e),
+        }
     }
 
     fn stash_apply(&self, index: usize) -> Result<()> {
@@ -1640,6 +2458,49 @@ impl Repo for Binary {
         run_bytes(
             &self.root,
             &[b"stash", b"drop", stash_ref(index).as_slice()],
+        )
+        .map(|_| ())
+    }
+
+    fn stash_apply_id(&self, id: &StashId) -> Result<()> {
+        self.stash_apply(self.stash_position(id)?)
+    }
+
+    fn stash_pop_id(&self, id: &StashId) -> Result<()> {
+        self.stash_pop(self.stash_position(id)?)
+    }
+
+    fn stash_drop_id(&self, id: &StashId) -> Result<()> {
+        self.stash_drop(self.stash_position(id)?)
+    }
+
+    fn stash_rename(&self, id: &StashId, message: &str) -> Result<()> {
+        if message.trim().is_empty() {
+            return Err("a stash needs a message".into());
+        }
+        let at = self.stash_position(id)?;
+        // Store first, drop second, and never the other way round: between
+        // the two the commit is named by two reflog entries, so a failure in
+        // the middle leaves the stash listed twice rather than not at all.
+        // The store lands on top, which shifts every entry under it — this
+        // one included — up by one, so the drop aims at `at + 1`.
+        run(&self.root, &["stash", "store", "-m", message, &id.commit])?;
+        self.stash_drop(at + 1)
+    }
+
+    fn stash_branch(&self, id: &StashId, name: &[u8]) -> Result<()> {
+        if !nameable(name) {
+            return Err("a branch needs a name".into());
+        }
+        refuse_dashes(name)?;
+        // Addressed by `stash@{n}` rather than by the commit for the third
+        // of the three things this verb does: handed a raw object id git
+        // makes the branch and applies the entry, then leaves it standing,
+        // because there is no reflog entry it could delete.
+        let at = self.stash_position(id)?;
+        run_bytes(
+            &self.root,
+            &[b"stash", b"branch", name, stash_ref(at).as_slice()],
         )
         .map(|_| ())
     }
@@ -1685,42 +2546,141 @@ impl Repo for Binary {
         self.commit_via(&[b"commit", b"--amend", b"-q", b"--file=-"], message)
     }
 
+    fn amend_no_edit(&self) -> Result<String> {
+        if let HeadState::Branch { commit: None, .. } = self.head()? {
+            return Err("nothing to amend: this branch has no commits yet".into());
+        }
+        run_bytes(&self.root, &[b"commit", b"--amend", b"--no-edit", b"-q"])
+            .map_err(|e| format!("git commit --amend --no-edit: {e}"))?;
+        let sha = run(&self.root, &["rev-parse", "HEAD"])?;
+        Ok(lossy(trimmed(&sha)))
+    }
+
+    fn graft_empties(&self, sha: &[u8]) -> Result<bool> {
+        refuse_dashes(sha)?;
+        // `write-tree` reads the index as staged — no commit, no hook,
+        // no movement — and the parent's tree is what the amend would
+        // collapse onto. Equal trees mean the commit's every change just
+        // left through the graft. A root commit has no parent: its
+        // emptiness is the empty tree's hash, asked of git itself rather
+        // than canned here.
+        let staged = run(&self.root, &["write-tree"])?;
+        let parent_rev = [sha.to_vec(), b"^^{tree}".to_vec()].concat();
+        let parent = match run_bytes(&self.root, &[b"rev-parse", &parent_rev]) {
+            Ok(tree) => tree,
+            Err(_) => run(&self.root, &["hash-object", "-t", "tree", "/dev/null"])?,
+        };
+        Ok(trimmed(&staged) == trimmed(&parent))
+    }
+
+    fn reset_author(&self) -> Result<()> {
+        // The amend's own guard, minus the message: an unborn branch has no
+        // commit to re-author, and git's answer there names nothing a person
+        // can act on. `--no-edit` keeps the message byte-identical.
+        //
+        // `--only` is load-bearing and was measured, not reasoned: a bare
+        // `--amend` takes the index with it, so re-authoring with a file
+        // staged folded that file into HEAD — a keypress that fixes a name
+        // silently committing somebody's work in progress. With `--only`
+        // and no pathspec the staged path stays staged and HEAD keeps
+        // exactly the tree it had.
+        if let HeadState::Branch { commit: None, .. } = self.head()? {
+            return Err("nothing to re-author: this branch has no commits yet".into());
+        }
+        run_bytes(
+            &self.root,
+            &[
+                b"commit",
+                b"--amend",
+                b"-q",
+                b"--no-edit",
+                b"--reset-author",
+                b"--only",
+            ],
+        )
+        .map(|_| ())
+    }
+
+    fn reword_head(&self, message: &str) -> Result<()> {
+        if message.trim().is_empty() {
+            return Err("a commit needs a message".into());
+        }
+        if let HeadState::Branch { commit: None, .. } = self.head()? {
+            return Err("nothing to reword: this branch has no commits yet".into());
+        }
+        self.commit_via(
+            &[b"commit", b"--amend", b"-q", b"--only", b"--file=-"],
+            message,
+        )
+        .map(|_| ())
+    }
+
     fn rebase_todo(&self, upstream: &[u8], script: &TodoScript) -> Result<()> {
         // The plan is checked before anything runs: a refusal that names the
         // action beats a background job hung on an editor nobody can see.
         script.validate()?;
-        if self.rebase_in_progress() {
+        self.run_todo(upstream, script)
+    }
+
+    fn rebase_plan(&self, plan: &Plan) -> Result<()> {
+        plan.validate()?;
+        // `fixup -C` is the one spelling in this vocabulary a git older than
+        // 2.32 does not know, and its answer to one is to leave the rebase
+        // standing on an unparseable todo — a state the reader then has to
+        // clean up after a keypress that only meant "keep this message".
+        // One `git --version` before anything starts turns that into a
+        // sentence, and it runs only for a plan that actually asks.
+        if plan.keeps_a_message() && !self.git_at_least(2, 32) {
             return Err(
-                "a rebase is already in progress; finish or abort it before \
-                 starting another"
+                "keeping the folded commit's message needs git 2.32 or newer                  (it is git's `fixup -C`); squash keeps both messages here"
                     .into(),
             );
         }
-        refuse_dashes(upstream)?;
-        let todo = write_todo_tmpfile(script.emit())?;
-        // git runs the sequencer editor as `$EDITOR <todo>`, through the
-        // shell. `cp <ours>` takes the todo path as its second argument,
-        // overwrites it with our plan and exits 0 — an editor that always
-        // agrees with us. The temp path rides as bytes: a `$TMPDIR` with an
-        // odd byte in it is unusual, not impossible.
-        //
-        // `GIT_EDITOR=true` answers the *second* editor: a `squash` opens it
-        // on a message template git already filled in, and `true` accepts
-        // that text untouched — which is precisely what keeps git's own
-        // message-concatenation rule while nothing blocks on a prompt.
-        let editor = {
-            use std::os::unix::ffi::OsStrExt;
-            format!("cp {}", shell_quote(todo.as_os_str().as_bytes()))
-        };
-        let result = run_env(
-            &self.root,
-            &[b"rebase", b"-i", upstream],
-            &[("GIT_SEQUENCE_EDITOR", &editor[..]), ("GIT_EDITOR", "true")],
-        );
-        let _ = std::fs::remove_file(&todo);
-        result.map(|_| ())
+        // The message files outlive the script and die with the rebase: git
+        // reads each one when its `exec` line runs, which is somewhere in
+        // the middle of the process below.
+        let mut scratch: Vec<PathBuf> = Vec::new();
+        let script = plan.script(&mut |entry| {
+            let mut out = Vec::new();
+            if let Some(message) = &entry.message {
+                use std::os::unix::ffi::OsStrExt;
+                let at = write_private_tmpfile("message", message.clone())?;
+                let quoted = shell_quote(at.as_os_str().as_bytes());
+                scratch.push(at);
+                // `--only` for the same measured reason
+                // [`reset_author`](Self::reset_author) takes it: a bare
+                // `--amend` folds the index into the commit, and a keypress
+                // that said *reword* must not commit anything.
+                out.push(format!("git commit --amend --quiet --only -F {quoted}").into_bytes());
+            }
+            if entry.amend == Some(gitten_core::rebase::Amend::ResetAuthor) {
+                out.push(b"git commit --amend --quiet --only --no-edit --reset-author".to_vec());
+            }
+            Ok(out)
+        });
+        let ran = script.and_then(|script| self.run_todo(plan.upstream(), &script));
+        for at in scratch {
+            let _ = std::fs::remove_file(at);
+        }
+        ran
     }
 
+    fn rebase_onto_base(&self, onto: &[u8], base: &[u8]) -> Result<()> {
+        refuse_dashes(onto)?;
+        refuse_dashes(base)?;
+        run_bytes(&self.root, &[b"rebase", b"-q", b"--onto", onto, base]).map(|_| ())
+    }
+
+    fn nuke_worktree(&self) -> Result<()> {
+        // An unborn branch has no HEAD to reset to, and git's own answer
+        // there ("fatal: ambiguous argument 'HEAD'") names nothing a person
+        // can act on. The clean still runs: an untracked file is exactly
+        // what an unborn branch's working tree is made of.
+        if !matches!(self.head()?, HeadState::Branch { commit: None, .. }) {
+            run_bytes(&self.root, &[b"reset", b"-q", b"--hard", b"HEAD"])?;
+        }
+        run_bytes(&self.root, &[b"clean", b"-q", b"-f", b"-d"]).map(|_| ())
+    }
     fn rebase_onto(&self, upstream: &[u8]) -> Result<()> {
         refuse_dashes(upstream)?;
         run_bytes(&self.root, &[b"rebase", b"-q", upstream]).map(|_| ())
@@ -1766,6 +2726,29 @@ impl Repo for Binary {
         run_bytes(&self.root, &[b"cherry-pick", sha]).map(|_| ())
     }
 
+    fn cherry_pick_range(&self, shas: &[Vec<u8>]) -> Result<()> {
+        // The single pick's guard, then every sha's: a second start inside
+        // a standing pick would disturb the first, and a bare `cherry-pick`
+        // with no shas means "continue" in git's argv — a different verb
+        // wearing this one's shape, refused here rather than run by
+        // accident. Each sha is a revspec under the same dash guard.
+        if self.cherry_pick_in_progress() {
+            return Err("a cherry-pick is already in progress; finish or abort it \
+                 before starting another"
+                .into());
+        }
+        if shas.is_empty() {
+            return Err("nothing copied to cherry-pick".into());
+        }
+        for sha in shas {
+            refuse_dashes(sha)?;
+        }
+        let mut argv: Vec<&[u8]> = Vec::with_capacity(shas.len() + 1);
+        argv.push(b"cherry-pick");
+        argv.extend(shas.iter().map(Vec::as_slice));
+        run_bytes(&self.root, &argv).map(|_| ())
+    }
+
     fn cherry_pick_abort(&self) -> Result<()> {
         run_bytes(&self.root, &[b"cherry-pick", b"--abort"]).map(|_| ())
     }
@@ -1783,6 +2766,266 @@ impl Repo for Binary {
         ["CHERRY_PICK_HEAD", "sequencer"]
             .iter()
             .any(|state| self.git_state_exists(state))
+    }
+
+    fn merge(&self, target: &[u8], squash: bool) -> Result<()> {
+        if let Some(operation) = self.operation() {
+            return Err(format!(
+                "a {} is in progress; finish or abort it before starting another",
+                operation.kind.word()
+            ));
+        }
+        refuse_dashes(target)?;
+        // --no-edit: a client merge carries its own words ("Merge branch
+        // 'x'") and never opens an editor; the flag is a no-op where git
+        // would not prompt and the difference between an invisible hang and
+        // a finished write where it would.
+        let mut args: Vec<&[u8]> = vec![b"merge", b"--no-edit"];
+        if squash {
+            args.insert(1, b"--squash");
+        }
+        args.push(target);
+        run_bytes(&self.root, &args).map(|_| ())
+    }
+
+    fn merge_abort(&self) -> Result<()> {
+        run_bytes(&self.root, &[b"merge", b"--abort"]).map(|_| ())
+    }
+
+    fn merge_continue(&self) -> Result<()> {
+        run_env(
+            &self.root,
+            &[b"merge", b"--continue"],
+            &[("GIT_EDITOR", "true")],
+        )
+        .map(|_| ())
+    }
+
+    fn merge_in_progress(&self) -> bool {
+        self.git_state_exists("MERGE_HEAD")
+    }
+
+    fn rebase_skip(&self) -> Result<()> {
+        run_env(
+            &self.root,
+            &[b"rebase", b"--skip"],
+            &[("GIT_SEQUENCE_EDITOR", "true"), ("GIT_EDITOR", "true")],
+        )
+        .map(|_| ())
+    }
+
+    fn revert_abort(&self) -> Result<()> {
+        run_bytes(&self.root, &[b"revert", b"--abort"]).map(|_| ())
+    }
+
+    fn revert_continue(&self) -> Result<()> {
+        run_env(
+            &self.root,
+            &[b"revert", b"--continue"],
+            &[("GIT_EDITOR", "true")],
+        )
+        .map(|_| ())
+    }
+
+    fn revert_in_progress(&self) -> bool {
+        self.git_state_exists("REVERT_HEAD")
+    }
+
+    fn resolve(&self, path: &[u8], side: Side) -> Result<()> {
+        // A path rides argv like every name-shaped word; the stage readers
+        // below take it through git's own revspec spelling.
+        refuse_dashes(path)?;
+        match side {
+            Side::Keep => run_bytes(&self.root, &[b"add", b"--", path]).map(|_| ()),
+            Side::Both => {
+                // Stage revspecs are bytes too — ":2:" + the path, never a
+                // lossy string. git's own answer when a stage is absent (a
+                // delete/modify pair) names the missing stage verbatim.
+                let stage = |n: u8| {
+                    let mut rev: Vec<u8> = format!(":{n}:").into_bytes();
+                    rev.extend_from_slice(path);
+                    run_bytes(&self.root, &[b"show", &rev])
+                };
+                let ours = stage(2)?;
+                let theirs = stage(3)?;
+                let mut text = ours;
+                if !text.ends_with(b"\n") {
+                    text.push(b'\n');
+                }
+                text.extend_from_slice(&theirs);
+                // The working tree carries the answer before the index
+                // records it, so what the reader sees is what got staged.
+                let at = join_raw(&self.root, path);
+                std::fs::write(&at, &text)
+                    .map_err(|e| format!("could not write {}: {e}", at.display()))?;
+                run_bytes(&self.root, &[b"add", b"--", path]).map(|_| ())
+            }
+            Side::Ours | Side::Theirs => {
+                let which: &[u8] = match side {
+                    Side::Ours => b"--ours",
+                    _ => b"--theirs",
+                };
+                let want = match side {
+                    Side::Ours => 2,
+                    _ => 3,
+                };
+                // The stage decides the verb, before anything runs. A stage
+                // that exists: its content becomes the answer, checkout
+                // then add — and a checkout that fails anyway comes back as
+                // the error it is. One that does not: that side's answer
+                // *is* the deletion, and only that case reaches `git rm
+                // -f` — because "the working tree refused" silently turning
+                // into "the file was deleted" is how a resolution eats a
+                // file nobody asked to remove.
+                let have = self
+                    .unmerged(path)
+                    .is_ok_and(|stages| stages.iter().any(|stage| stage.stage == want));
+                if !have {
+                    run_bytes(&self.root, &[b"rm", b"-f", b"--", path]).map(|_| ())
+                } else {
+                    run_bytes(&self.root, &[b"checkout", which, b"--", path])
+                        .and_then(|_| run_bytes(&self.root, &[b"add", b"--", path]))
+                        .map(|_| ())
+                }
+            }
+        }
+    }
+
+    fn unmerged(&self, path: &[u8]) -> Result<Vec<UnmergedStage>> {
+        refuse_dashes(path)?;
+        // `-z` because a path may hold anything but NUL; the record shape is
+        // `mode SP oid SP stage TAB path NUL`, and the path on the record is
+        // the one asked for — checked, not trusted, because a pathspec that
+        // matched more than one name would quietly answer with somebody
+        // else's stages.
+        let raw = run_bytes(&self.root, &[b"ls-files", b"-u", b"-z", b"--", path])?;
+        let mut stages = Vec::new();
+        for record in raw.split(|&b| b == 0) {
+            if record.is_empty() {
+                continue;
+            }
+            let Some(tab) = record.iter().position(|&b| b == b'\t') else {
+                return Err("git ls-files -u answered a record without a path".into());
+            };
+            let head = String::from_utf8_lossy(&record[..tab]).into_owned();
+            let mut fields = head.split(' ');
+            let (Some(mode), Some(oid), Some(stage), None) =
+                (fields.next(), fields.next(), fields.next(), fields.next())
+            else {
+                return Err(format!(
+                    "git ls-files -u answered a record that is not mode, oid, stage: {head:?}"
+                ));
+            };
+            let stage: u8 = stage
+                .parse()
+                .map_err(|_| format!("stage {stage:?} is not a number"))?;
+            stages.push(UnmergedStage {
+                mode: mode.to_string(),
+                oid: oid.to_string(),
+                stage,
+            });
+        }
+        stages.sort_by_key(|s| s.stage);
+        Ok(stages)
+    }
+
+    fn conflict_file(&self, path: &[u8]) -> Result<gitten_core::conflict::ConflictFile> {
+        refuse_dashes(path)?;
+        let at = join_raw(&self.root, path);
+        let bytes =
+            std::fs::read(&at).map_err(|e| format!("could not read {}: {}", at.display(), e))?;
+        Ok(gitten_core::conflict::ConflictFile::parse(
+            gitten_core::status::PathBytes::from_bytes(path),
+            bytes,
+        ))
+    }
+
+    fn resolve_hunks(
+        &self,
+        path: &[u8],
+        choices: &[(usize, gitten_core::conflict::Answer)],
+    ) -> Result<()> {
+        refuse_dashes(path)?;
+        let at = join_raw(&self.root, path);
+        let bytes =
+            std::fs::read(&at).map_err(|e| format!("could not read {}: {e}", at.display()))?;
+        // The parse is the freshness check: the answers were composed
+        // against a snapshot of this file, and a file whose regions moved —
+        // resolved elsewhere, re-merged, edited by hand — refuses here
+        // rather than applying a choice to the wrong region.
+        let file = gitten_core::conflict::ConflictFile::parse(
+            gitten_core::status::PathBytes::from_bytes(path),
+            bytes,
+        );
+        if !file.is_conflicted() {
+            return Err(
+                "the file carries no conflict markers now — resolve it whole with the file-level answers".into(),
+            );
+        }
+        if file.is_nested() {
+            // A region inside another has no disjoint span to splice —
+            // refused with the same remedy as the unmarked file, because
+            // the remedy is the same: the file-level answers.
+            return Err(
+                "the file's conflicts nest — resolve it whole with the file-level answers".into(),
+            );
+        }
+        if choices.iter().any(|(i, _)| *i >= file.regions.len()) {
+            return Err(
+                "the conflict moved under the keyboard — reopen the file and answer again".into(),
+            );
+        }
+        let combined = gitten_core::conflict::apply(&file.bytes, &file.regions, choices)?;
+        // The working tree carries the answer before the index records it,
+        // so what the reader sees is what got staged.
+        std::fs::write(&at, &combined)
+            .map_err(|e| format!("could not write {}: {e}", at.display()))?;
+        run_bytes(&self.root, &[b"add", b"--", path]).map(|_| ())
+    }
+
+    fn restore_conflict(
+        &self,
+        path: &[u8],
+        bytes: Vec<u8>,
+        stages: &[UnmergedStage],
+    ) -> Result<()> {
+        refuse_dashes(path)?;
+        let at = join_raw(&self.root, path);
+        // git's own machinery first: `checkout -m` recreates the conflict
+        // from the same inputs the original merge read, with the conflict
+        // flags every reader agrees on — `ls-files -u` alone is not that,
+        // and a restore that left status spelling the path as merely
+        // modified would drop it from the conflict list it is supposed to
+        // rejoin.
+        if run_bytes(&self.root, &[b"checkout", b"-m", b"--", path]).is_ok() {
+            // The recreated conflict should be the snapshot byte for byte —
+            // same stages, same inputs — and the snapshot is what the
+            // session answered from, so it is what the worktree shows.
+            std::fs::write(&at, &bytes)
+                .map_err(|e| format!("could not write {}: {e}", at.display()))?;
+            return Ok(());
+        }
+        // No merge to re-run (the operation's refs are gone, or the
+        // conflict outlived them): the captured stages are the fallback —
+        // written by id, the contents never having moved. The index is
+        // exactly as it was; only status's spelling of it is coarser.
+        std::fs::write(&at, &bytes)
+            .map_err(|e| format!("could not write {}: {e}", at.display()))?;
+        if stages.is_empty() {
+            return Ok(());
+        }
+        let mut input = Vec::new();
+        for stage in stages {
+            input.extend_from_slice(stage.mode.as_bytes());
+            input.push(b' ');
+            input.extend_from_slice(stage.oid.as_bytes());
+            input.push(b' ');
+            input.extend_from_slice(stage.stage.to_string().as_bytes());
+            input.push(b'\t');
+            input.extend_from_slice(path);
+            input.push(b'\n');
+        }
+        run_stdin(&self.root, &[b"update-index", b"--index-info"], &input)
     }
 
     fn create_tag(&self, name: &[u8], target: &[u8], message: Option<&str>) -> Result<()> {
@@ -1834,6 +3077,42 @@ impl Repo for Binary {
         run_bytes(&self.root, argv).map(|_| ())
     }
 
+    fn push_tag(&self, remote: &[u8], name: &[u8]) -> Result<()> {
+        refuse_dashes(remote)?;
+        refuse_dashes(name)?;
+        // `push <remote> tag <name>`: the `tag` word is what keeps a tag
+        // named like a branch from pushing the branch instead. Bytes end
+        // to end, like every other push-shaped verb.
+        run_bytes(&self.root, &[b"push", remote, b"tag", name]).map(|_| ())
+    }
+
+    fn delete_remote_branch(&self, remote: &[u8], branch: &[u8]) -> Result<()> {
+        refuse_dashes(remote)?;
+        refuse_dashes(branch)?;
+        // `--delete` names the remote-tracking branch's *source*, never a
+        // local ref: the local branch of the same name survives, which is
+        // what makes this the remote half of branch deletion rather than
+        // the whole of it.
+        run_bytes(&self.root, &[b"push", remote, b"--delete", branch]).map(|_| ())
+    }
+
+    fn move_head(&self, target: &[u8], message: &str) -> Result<()> {
+        if target.first() == Some(&b'-') {
+            return Err("a revision never begins with `-`".into());
+        }
+        // `update-ref -m`, not a reset flag: pointing HEAD's ref at the
+        // target moves neither the index nor the working tree, which is
+        // the whole of undo's promise — the reader's uncommitted work is
+        // exactly where they left it. The message rides `-m` as one argv,
+        // so our own undo/redo sentences are exact strings the reflog can
+        // later be asked for, not substrings of git's own prose.
+        run_bytes(
+            &self.root,
+            &[b"update-ref", b"-m", message.as_bytes(), b"HEAD", target],
+        )
+        .map(|_| ())
+    }
+
     fn pull(&self) -> Result<()> {
         // Everything specific — which branch, which upstream, what a
         // divergence means — is git's to resolve from the repository's own
@@ -1858,9 +3137,383 @@ impl Repo for Binary {
             None => run_bytes(&self.root, &[b"fetch", b"-q", b"--all"]).map(|_| ()),
         }
     }
+
+    fn checkout_tracking(&self, remote: &[u8], branch: &[u8]) -> Result<()> {
+        refuse_dashes(remote)?;
+        refuse_dashes(branch)?;
+        // One argv token, `remote/branch`, joined here rather than in a
+        // shell: the two halves are the model's because a remote name may
+        // carry a slash, and the joined spelling is what git resolves.
+        let mut full = remote.to_vec();
+        full.push(b'/');
+        full.extend_from_slice(branch);
+        // `--track` creates the local branch of the same name and the
+        // tracking link in one move; a local branch of that name already
+        // existing is git's own refusal, surfaced verbatim.
+        run_bytes(&self.root, &[b"checkout", b"-q", b"--track", &full]).map(|_| ())
+    }
+
+    fn checkout_previous(&self) -> Result<()> {
+        // The `-` is a literal argv token — git's own spelling of "wherever
+        // HEAD was before this", resolved from the reflog — and not a name
+        // of ours, so [`refuse_dashes`] has nothing to guard here.
+        run_bytes(&self.root, &[b"checkout", b"-q", b"-"]).map(|_| ())
+    }
+
+    fn checkout_force(&self, name: &[u8]) -> Result<()> {
+        refuse_dashes(name)?;
+        run_bytes(&self.root, &[b"checkout", b"-q", b"-f", name]).map(|_| ())
+    }
+
+    fn set_upstream(&self, local: &[u8], remote: &[u8], branch: &[u8]) -> Result<()> {
+        refuse_dashes(local)?;
+        refuse_dashes(remote)?;
+        refuse_dashes(branch)?;
+        let mut full = remote.to_vec();
+        full.push(b'/');
+        full.extend_from_slice(branch);
+        run_bytes(&self.root, &[b"branch", b"--set-upstream-to", &full, local]).map(|_| ())
+    }
+
+    fn unset_upstream(&self, local: &[u8]) -> Result<()> {
+        refuse_dashes(local)?;
+        run_bytes(&self.root, &[b"branch", b"--unset-upstream", local]).map(|_| ())
+    }
+
+    fn fast_forward(&self, local: &[u8], remote: &[u8], branch: &[u8]) -> Result<()> {
+        refuse_dashes(local)?;
+        refuse_dashes(remote)?;
+        refuse_dashes(branch)?;
+        let mut full = remote.to_vec();
+        full.push(b'/');
+        full.extend_from_slice(branch);
+        // The shape is HEAD's own: a checked-out branch cannot be updated
+        // through a fetch refspec (git refuses to fetch into it), so it
+        // merges; every other branch takes the fetch spelling, which is
+        // fast-forward-only by construction — a refspec without `+` refuses
+        // to move a branch sideways. HEAD is read here, fresh, rather than
+        // remembered by the caller: the pane's row was drawn a moment ago,
+        // and the branch HEAD sits on is exactly the thing sync keys move.
+        let head_branch = match self.head()? {
+            HeadState::Branch { name, .. } => Some(name.as_bytes().to_vec()),
+            HeadState::Detached { .. } => None,
+        };
+        match head_branch.as_deref() == Some(local) {
+            true => run_bytes(&self.root, &[b"merge", b"--ff-only", &full]).map(|_| ()),
+            false => {
+                let mut spec = branch.to_vec();
+                spec.push(b':');
+                spec.extend_from_slice(local);
+                run_bytes(&self.root, &[b"fetch", b"-q", remote, &spec]).map(|_| ())
+            }
+        }
+    }
+
+    fn add_remote(&self, name: &[u8], url: &[u8]) -> Result<()> {
+        if !nameable(name) {
+            return Err("a remote needs a name".into());
+        }
+        refuse_dashes(name)?;
+        if !nameable(url) {
+            return Err("a remote needs a URL".into());
+        }
+        // The URL is one argv token, guarded like every name: a value
+        // beginning with `-` is an option to git, whatever it says about
+        // itself. Nothing here inspects the scheme — a file path, an ssh
+        // spelling and a `git://` URL are all one word to `remote add`.
+        refuse_dashes(url)?;
+        run_bytes(&self.root, &[b"remote", b"add", b"-q", name, url]).map(|_| ())
+    }
+
+    fn set_remote_url(&self, name: &[u8], url: &[u8]) -> Result<()> {
+        refuse_dashes(name)?;
+        if !nameable(url) {
+            return Err("a remote needs a URL".into());
+        }
+        refuse_dashes(url)?;
+        run_bytes(&self.root, &[b"remote", b"set-url", name, url]).map(|_| ())
+    }
+
+    fn remove_remote(&self, name: &[u8]) -> Result<()> {
+        refuse_dashes(name)?;
+        run_bytes(&self.root, &[b"remote", b"remove", b"-q", name]).map(|_| ())
+    }
 }
 
 impl Binary {
+    /// Whether the `git` on this machine is at least `major.minor`.
+    ///
+    /// Asked, never remembered: a binary can be upgraded under a running
+    /// process, and this costs one process on the rare plan that needs it.
+    /// A version string this cannot parse answers `true` — every git that
+    /// prints something unexpected is likelier to be newer than older, and
+    /// refusing a rewrite over an unreadable version string would be
+    /// refusing it for the wrong reason.
+    fn git_at_least(&self, major: u32, minor: u32) -> bool {
+        let Ok(out) = run(&self.root, &["--version"]) else {
+            return true;
+        };
+        let text = String::from_utf8_lossy(&out);
+        let Some(rest) = text.split_whitespace().nth(2) else {
+            return true;
+        };
+        let mut parts = rest.split('.').map(str::parse::<u32>);
+        match (parts.next(), parts.next()) {
+            (Some(Ok(found_major)), Some(Ok(found_minor))) => {
+                (found_major, found_minor) >= (major, minor)
+            }
+            _ => true,
+        }
+    }
+
+    // The one process every scripted rebase runs, shared by the two verbs
+    // above so a plan and a script cannot drift into two different
+    // invocations. Everything it does is documented on
+    // [`Repo::rebase_todo`]; the checks it does not make — a script's
+    // validation, a plan's — belong to the caller, because their words
+    // differ and the refusal is what a reader sees.
+    fn run_todo(&self, upstream: &[u8], script: &TodoScript) -> Result<()> {
+        if self.rebase_in_progress() {
+            return Err(
+                "a rebase is already in progress; finish or abort it before \
+                 starting another"
+                    .into(),
+            );
+        }
+        refuse_dashes(upstream)?;
+        let todo = write_private_tmpfile("todo", script.emit())?;
+        // git runs the sequencer editor as `$EDITOR <todo>`, through the
+        // shell. `cp <ours>` takes the todo path as its second argument,
+        // overwrites it with our plan and exits 0 — an editor that always
+        // agrees with us. The temp path rides as bytes: a `$TMPDIR` with an
+        // odd byte in it is unusual, not impossible.
+        //
+        // `GIT_EDITOR=true` answers the *second* editor: a `squash` opens it
+        // on a message template git already filled in, and `true` accepts
+        // that text untouched — which is precisely what keeps git's own
+        // message-concatenation rule while nothing blocks on a prompt.
+        let editor = {
+            use std::os::unix::ffi::OsStrExt;
+            format!("cp {}", shell_quote(todo.as_os_str().as_bytes()))
+        };
+        let result = run_env(
+            &self.root,
+            &[b"rebase", b"-i", upstream],
+            &[("GIT_SEQUENCE_EDITOR", &editor[..]), ("GIT_EDITOR", "true")],
+        );
+        let _ = std::fs::remove_file(&todo);
+        result.map(|_| ())
+    }
+
+    /// Whether `HEAD` names a commit, and which.
+    ///
+    /// `--verify --quiet` answers empty and nonzero when it does not — the
+    /// unborn branch every fresh `git init` produces, and a repository whose
+    /// HEAD is broken read the same way. Both are, for the readers below,
+    /// the same state: there is no tree here to compare anything against.
+    fn head_commit(&self) -> Result<Option<String>> {
+        let text = match run(&self.root, &["rev-parse", "--verify", "--quiet", "HEAD"]) {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).trim().to_string(),
+            // The nonzero answer is the point of `--quiet`: no commit to name.
+            Err(_) => String::new(),
+        };
+        Ok((!text.is_empty()).then_some(text))
+    }
+
+    /// The three `git` invocations behind [`Self::pairs`], split only so the
+    /// side reads below can share the argument shape.
+    fn raw_for(&self, revspec: &str) -> Result<Vec<u8>> {
+        // `-z` for NUL-separated paths, because a path may contain anything a
+        // filesystem allows and git otherwise quotes and escapes it. `-M` so a
+        // rename arrives as one file with two names instead of a delete and an
+        // add of an identical blob.
+        //
+        // `--abbrev=64` is load-bearing and looks like a no-op: `--raw` abbreviates
+        // OIDs by default, and `cat-file --batch` echoes back the *full* OID in its
+        // response header, so an abbreviated request cannot be matched to its
+        // answer. 64 is clamped to whatever the repository's hash length actually
+        // is, which makes this right for SHA-256 repositories too.
+        const RAW: [&str; 5] = ["--raw", "-z", "-M", "--abbrev=64", "--no-ext-diff"];
+        if revspec.is_empty() {
+            run(&self.root, &[&["diff"], &RAW[..], &["HEAD"]].concat())
+        } else if revspec.contains("..") {
+            run(
+                &self.root,
+                &[&["diff"], &RAW[..], &["--end-of-options", revspec]].concat(),
+            )
+        } else {
+            // A bare revision means "what did this commit change".
+            //
+            // Merges included. Modern git emits no diff at all for a merge unless
+            // asked — `git show --raw` prints zero records for one — so a merge
+            // commit selected in the log would render as an empty diff, silently.
+            // First-parent asks for the ordinary single-old/single-new records
+            // this parser already handles. Nothing else reaches this parser: the
+            // refusal of two-colon combined records in `parse_raw` below is
+            // belt-and-braces against future or unknown shapes, not a
+            // currently-reachable input. The flag needs git >= 2.31 (March 2021);
+            // older gits reject it and every bare-revision open fails wholesale
+            // rather than silently.
+            run(
+                &self.root,
+                &[
+                    &["show"],
+                    &RAW[..],
+                    &[
+                        "--format=",
+                        "--diff-merges=first-parent",
+                        "--end-of-options",
+                        revspec,
+                    ],
+                ]
+                .concat(),
+            )
+        }
+    }
+
+    /// One diff's blob road: the batch fetch and the per-file assembly, from
+    /// the records `parse_raw` produced. Shared by the aggregate read and
+    /// both side reads; `worktree` is whether the *new* side may hold
+    /// content that lives on disk and nowhere else.
+    ///
+    /// Every blob the whole diff needs, fetched by one `cat-file --batch` —
+    /// but held one file at a time. The batch answers strictly in request
+    /// order (it reads one OID and writes one answer before reading the
+    /// next), and requests go out in pair order, old side then new, so the
+    /// answers can be pulled back per file as each [`Pair`] is built instead
+    /// of parking every old+new blob of the diff in a map until the last one.
+    /// On a thousand-file diff that map was tens of MB of pure peak overlap.
+    /// A duplicate OID costs a second read rather than a second copy, which is
+    /// the trade the map made implicitly.
+    fn assemble(
+        &self,
+        changes: Vec<RawChange>,
+        top: &std::path::Path,
+        worktree: bool,
+    ) -> Result<Vec<Pair>> {
+        let mut wanted: Vec<&str> = Vec::with_capacity(changes.len() * 2);
+        for c in &changes {
+            for (mode, oid) in [(&c.old_mode, &c.old_oid), (&c.new_mode, &c.new_oid)] {
+                if fetchable(mode, oid) {
+                    wanted.push(oid);
+                }
+            }
+        }
+        let mut blobs = BlobStream::start(&self.root, &wanted)?;
+
+        let mut out = Vec::with_capacity(changes.len());
+        for c in changes {
+            // Both sides pull in request order — old, then new — which is what
+            // keeps this loop aligned with the stream.
+            //
+            // The two sides also read a null OID differently, and conflating them
+            // is a silent, plausible-looking bug: an added file whose old side
+            // falls back to the working tree diffs against itself and shows no
+            // change at all. The old side has no fallback: a null OID there means
+            // the file did not exist, and reading the tree for it would diff an
+            // added file against itself. On the new side a null OID is the
+            // ordinary case of a working-tree diff — what the file says now is on
+            // disk and nowhere else.
+            let fetched_old = if fetchable(&c.old_mode, &c.old_oid) {
+                blobs.answer()?
+            } else {
+                None
+            };
+            let fetched_new = if fetchable(&c.new_mode, &c.new_oid) {
+                blobs.answer()?
+            } else {
+                None
+            };
+            let old = RawChange::synthetic(&c.old_mode, &c.old_oid).or(fetched_old);
+            let new = RawChange::synthetic(&c.new_mode, &c.new_oid)
+                .or(fetched_new)
+                .or_else(|| {
+                    // Only a diff whose *new* side is the working tree can have
+                    // content outside the object database — the aggregate
+                    // HEAD→worktree read and the index→worktree side both. A
+                    // historical deletion has the same null new OID, but reading
+                    // a later recreation from disk would put bytes into a
+                    // revision where the file did not exist.
+                    worktree
+                        .then(|| new_side(&c.new_oid, top, c.path.as_bytes()))
+                        .flatten()
+                });
+            let binary = old.as_ref().is_some_and(|b| is_binary(b))
+                || new.as_ref().is_some_and(|b| is_binary(b));
+            // The lossy decode happens here and only here: everything above —
+            // the record, the batch alignment, the working-tree read — went
+            // through the raw bytes, so what reaches a frontend is the display
+            // form of the path git actually named.
+            //
+            // The OIDs ride along under exactly [`fetchable`]'s rule, which is
+            // also how they were chosen for the request list: a side with no
+            // blob behind it has no identity worth keying anything on.
+            out.push(Pair {
+                path: c.path.to_string_lossy().into_owned(),
+                old_path: c
+                    .old_path
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned()),
+                status: c.status,
+                old: if binary {
+                    Vec::new()
+                } else {
+                    lines(old.as_deref().unwrap_or_default())
+                },
+                new: if binary {
+                    Vec::new()
+                } else {
+                    lines(new.as_deref().unwrap_or_default())
+                },
+                old_oid: fetchable(&c.old_mode, &c.old_oid).then(|| c.old_oid.clone()),
+                new_oid: fetchable(&c.new_mode, &c.new_oid).then(|| c.new_oid.clone()),
+                // A side with no content has no final line, so the marker
+                // question never arises for it — `true` says so.
+                old_final_newline: old.as_ref().is_none_or(|b| b.ends_with(b"\n")),
+                new_final_newline: new.as_ref().is_none_or(|b| b.ends_with(b"\n")),
+                binary,
+            });
+        }
+        blobs.finish()?;
+        Ok(out)
+    }
+
+    /// One `git diff` read for a side: the arguments above, plus the
+    /// pathspec when one was asked for. The path travels as raw bytes —
+    /// [`run_bytes`], never a lossy spelling — and git does the matching,
+    /// which keeps rename records (whose record names either of its two
+    /// paths) and non-UTF-8 names exact.
+    fn side_raw(&self, args: Vec<&[u8]>, path: Option<&[u8]>) -> Result<Vec<u8>> {
+        match path {
+            None => run_bytes(&self.root, &args),
+            Some(p) => {
+                let mut args = args;
+                args.push(b"--");
+                args.push(p);
+                run_bytes(&self.root, &args)
+            }
+        }
+    }
+
+    /// A side read's records, narrowed to the path asked for when there was
+    /// one, then assembled. The narrowing is byte-exact on both names — a
+    /// rename's record matches either — so nothing is fetched for a file
+    /// nobody is looking at.
+    fn side_pairs(&self, raw: Vec<u8>, path: Option<&[u8]>, worktree: bool) -> Result<Vec<Pair>> {
+        let changes = parse_raw(&raw);
+        let changes = match path {
+            None => changes,
+            Some(p) => changes
+                .into_iter()
+                .filter(|c| {
+                    c.path.as_bytes() == p || c.old_path.as_ref().is_some_and(|o| o.as_bytes() == p)
+                })
+                .collect(),
+        };
+        let top = self.top.get_or_init(|| top_level(&self.root));
+        self.assemble(changes, top, worktree)
+    }
+
     /// Runs `head ++ paths` through [`run_bytes`], in as many processes as
     /// [`ARGV_BUDGET`] demands — one for every list a person actually
     /// stages, several only for the fresh-repository trees bulk exists for.
@@ -1923,6 +3576,21 @@ impl Binary {
         run(&self.root, &["rev-parse", "-q", "--verify", "stash@{0}"])
             .ok()
             .map(|oid| lossy(trimmed(&oid)))
+    }
+
+    /// Turns a stash entry's identity back into the position git's own verbs
+    /// address — the `n` of `stash@{n}` — against the stack as it is *right
+    /// now*.
+    ///
+    /// Not a convenience: `git stash pop` and `git stash drop` take only a
+    /// `stash@{n}` reference and answer a raw object id with "is not a stash
+    /// reference", so this is the only road an identity has to those two
+    /// verbs. Read immediately before the write, so a push or a drop between
+    /// the keypress and the queue's turn is seen rather than assumed away —
+    /// and answered by [`StashAt`](gitten_core::refs::StashAt) with a
+    /// refusal when the entry is gone or doubled.
+    fn stash_position(&self, id: &StashId) -> Result<usize> {
+        id.resolve(&self.stashes()?).position()
     }
 
     /// Where git would keep the state file called `name`, resolved once per
@@ -2198,6 +3866,22 @@ fn refuse_dashes(name: &[u8]) -> Result<()> {
 
 // ------------------------------------------------------------------- the pair
 
+/// One unmerged stage git still holds for a conflicted path, exactly as
+/// `git ls-files -u` spells it. The object id is the undo's anchor: a
+/// resolution `git add`s a new blob over the stages, and restoring the
+/// entries by id — the contents never moved — is how the stages come back
+/// without anybody re-reading their bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnmergedStage {
+    /// The tree entry's mode, as git spells it (`100644`, `100755`,
+    /// `120000`, `160000`).
+    pub mode: String,
+    /// The blob (or gitlink) object id, full.
+    pub oid: String,
+    /// 1 base, 2 ours, 3 theirs.
+    pub stage: u8,
+}
+
 /// One changed file, as the two versions of its text.
 ///
 /// `Vec<Arc<str>>` and not `&str` into one buffer because the two sides come
@@ -2233,6 +3917,15 @@ pub struct Pair {
     /// untracked file's contents live nowhere but disk, so its new side is
     /// `None` even though its text is right there in `new`.
     pub new_oid: Option<String>,
+    /// Whether each side's final line is newline-terminated.
+    ///
+    /// The terminator went with the raw bytes and [`lines`] throws it away,
+    /// so these ride beside the content rather than being re-derived by
+    /// whoever emits a patch: they are the facts a `\ No newline at end of
+    /// file` marker needs, and a side with no content at all reads `true` —
+    /// no final line, so no marker can ever attach to it.
+    pub old_final_newline: bool,
+    pub new_final_newline: bool,
     /// Either side contains a NUL byte. Nothing here can usefully diff it, and
     /// the frontend needs to say so rather than draw mojibake.
     pub binary: bool,
@@ -2266,8 +3959,14 @@ pub fn diff(
     differs: &Differs,
     over: &Overrides,
 ) -> Result<Vec<FileDiff>> {
-    Ok(repo
-        .pairs(revspec)?
+    Ok(diff_pairs(&repo.pairs(revspec)?, differs, over))
+}
+
+/// The differ pipeline over already-acquired pairs — [`diff`]'s second half,
+/// for the caller that acquired its pairs some other way: a single side, a
+/// file, a stash's untracked half.
+pub fn diff_pairs(pairs: &[Pair], differs: &Differs, over: &Overrides) -> Vec<FileDiff> {
+    pairs
         .iter()
         .map(|p| match p.binary {
             // Modelled as a file with no hunks rather than skipped: the diff
@@ -2286,7 +3985,7 @@ pub fn diff(
                 ..differs.file_using(over, &p.path, &p.old, &p.new, p.blobs())
             },
         })
-        .collect())
+        .collect()
 }
 
 // -------------------------------------------------------------------- status
@@ -2587,8 +4286,27 @@ fn loose_pair(entry: &UntrackedEntry, root: &Path) -> Option<Pair> {
         // by — every diff of it is computed, never cached.
         old_oid: None,
         new_oid: None,
+        old_final_newline: true,
+        new_final_newline: content.ends_with(b"\n"),
         binary,
     })
+}
+
+/// One `rev-parse --verify --quiet <rev>:<path>`, raw bytes end to end: the
+/// spec is built from the path git itself named, so a non-UTF-8 name looks
+/// up the entry that is actually there. `--quiet` makes "no such entry" a
+/// nonzero exit with nothing on the streams — which is a `None`, the
+/// ordinary answer for an unstaged or never-committed path, and not a
+/// failure; the same reading [`Repo::head_commit`] takes.
+fn tree_blob_oid(root: &Path, rev: &[u8], path: &[u8]) -> Result<Option<String>> {
+    let mut spec = Vec::with_capacity(rev.len() + 1 + path.len());
+    spec.extend_from_slice(rev);
+    spec.push(b':');
+    spec.extend_from_slice(path);
+    match run_bytes(root, &[b"rev-parse", b"--verify", b"--quiet", &spec]) {
+        Ok(bytes) => Ok(Some(lossy(trimmed(&bytes)))),
+        Err(_) => Ok(None),
+    }
 }
 
 // ----------------------------------------------------------------------- refs
@@ -2966,12 +4684,16 @@ fn parse_tags(raw: &[u8]) -> Vec<Tag> {
             continue;
         }
         let f: Vec<&[u8]> = line.split(|b| *b == 0).collect();
-        let [refname, peeled, object] = f[..] else {
+        let [refname, peeled, object, kind, subject] = f[..] else {
             continue;
         };
         out.push(Tag {
             name: PathBytes::from_bytes(short(refname, TAGS_PREFIX)),
             commit: lossy(if peeled.is_empty() { object } else { peeled }),
+            annotated: kind == b"tag",
+            // `contents:subject` on a lightweight tag is the *commit's*
+            // subject, not a tag message — only an annotated tag carries one.
+            subject: (kind == b"tag" && !subject.is_empty()).then(|| lossy(subject)),
         });
     }
     out
@@ -5135,6 +6857,8 @@ mod tests {
             new: Vec::new(),
             old_oid: None,
             new_oid: None,
+            old_final_newline: true,
+            new_final_newline: true,
             binary: false,
         };
         assert_eq!(p.label(), "old.rs → new.rs");
@@ -5493,6 +7217,556 @@ mod tests {
         }
     }
 
+    // ------------------------------------------------------------ the stash family
+
+    /// A repository with one path staged, another unstaged and a third
+    /// untracked — the three sides every stash scope has to keep apart.
+    fn three_sided(name: &str) -> Scratch {
+        let r = Scratch::new(name);
+        r.write("staged.txt", b"one\n");
+        r.write("unstaged.txt", b"one\n");
+        r.git(&["add", "."]);
+        r.git(&["commit", "-qm", "base"]);
+        r.write("staged.txt", b"one\nstaged\n");
+        r.git(&["add", "staged.txt"]);
+        r.write("unstaged.txt", b"one\nunstaged\n");
+        r.write("fresh.txt", b"new\n");
+        r
+    }
+
+    /// The three sides as sorted display paths, for one assertion per side.
+    fn sides(g: &Handle) -> (Vec<String>, Vec<String>, Vec<String>) {
+        let st = g.status().expect("a status");
+        let sorted = |mut v: Vec<String>| {
+            v.sort();
+            v
+        };
+        (
+            sorted(
+                st.staged
+                    .iter()
+                    .map(|e| e.path.to_string_lossy().into_owned())
+                    .collect(),
+            ),
+            sorted(
+                st.unstaged
+                    .iter()
+                    .map(|e| e.path.to_string_lossy().into_owned())
+                    .collect(),
+            ),
+            sorted(
+                st.untracked
+                    .iter()
+                    .map(|e| e.path.to_string_lossy().into_owned())
+                    .collect(),
+            ),
+        )
+    }
+
+    /// Every path the stash entry `commit` holds, tracked half and untracked
+    /// half together — what a preview of that entry would draw, and the only
+    /// honest test of what a push actually took.
+    fn parked(g: &Handle, commit: &str) -> Vec<String> {
+        let mut all: Vec<String> = g
+            .pairs(commit)
+            .expect("the tracked half")
+            .iter()
+            .chain(
+                g.pairs_stash_untracked(commit)
+                    .expect("the third parent")
+                    .iter(),
+            )
+            .map(|pair| pair.path.clone())
+            .collect();
+        all.sort();
+        all
+    }
+
+    #[test]
+    fn a_named_stash_carries_its_message_and_the_default_still_does_not() {
+        let r = three_sided("stash-named");
+        let g = r.open();
+
+        assert_eq!(g.stash_push(Some("parser rewrite")).unwrap(), 0);
+        assert_eq!(g.stashes().unwrap()[0].message, "On main: parser rewrite");
+        // The default path is untouched: no message means git's own WIP text,
+        // which is a sentence about where it was made and not an empty one.
+        r.write("unstaged.txt", b"one\nagain\n");
+        assert_eq!(g.stash_push(None).unwrap(), 0);
+        let stack = g.stashes().unwrap();
+        assert!(
+            stack[0].message.starts_with("WIP on main:"),
+            "git's own default: {:?}",
+            stack[0].message
+        );
+        assert_eq!(stack[1].message, "On main: parser rewrite");
+    }
+
+    #[test]
+    fn the_staged_scope_takes_the_index_and_leaves_the_rest_standing() {
+        let r = three_sided("stash-scope-staged");
+        let g = r.open();
+
+        g.stash_push_scoped(Some("index only"), &StashScope::Staged)
+            .expect("the staged side parks");
+        let entry = g.stashes().unwrap()[0].commit.clone();
+        assert_eq!(
+            parked(&g, &entry),
+            vec!["staged.txt"],
+            "the entry holds the index side and nothing else"
+        );
+        // Nothing excluded was stolen: the unstaged change and the untracked
+        // file are exactly where they were, and the index is clean.
+        assert_eq!(
+            sides(&g),
+            (
+                Vec::<String>::new(),
+                vec!["unstaged.txt".to_string()],
+                vec!["fresh.txt".to_string()]
+            )
+        );
+    }
+
+    #[test]
+    fn the_unstaged_scope_leaves_the_staged_work_staged() {
+        let r = three_sided("stash-scope-unstaged");
+        let g = r.open();
+
+        g.stash_push_scoped(Some("worktree only"), &StashScope::Unstaged)
+            .expect("the unstaged side parks");
+        // The promise this scope makes: the staged work is still staged, and
+        // still in the tree. The untracked file is untouched too.
+        assert_eq!(
+            sides(&g),
+            (
+                vec!["staged.txt".to_string()],
+                Vec::<String>::new(),
+                vec!["fresh.txt".to_string()]
+            )
+        );
+        assert_eq!(
+            std::fs::read(r.0.join("staged.txt")).unwrap(),
+            b"one\nstaged\n",
+            "the staged bytes are still on disk"
+        );
+        assert_eq!(
+            std::fs::read(r.0.join("unstaged.txt")).unwrap(),
+            b"one\n",
+            "the unstaged change is the one that left"
+        );
+    }
+
+    #[test]
+    fn the_untracked_scope_takes_new_files_and_the_tracked_one_does_not() {
+        let r = three_sided("stash-scope-untracked");
+        let g = r.open();
+
+        // Tracked first: the new file is not work git was asked about.
+        g.stash_push_scoped(None, &StashScope::Tracked).unwrap();
+        assert_eq!(
+            sides(&g),
+            (
+                Vec::<String>::new(),
+                Vec::<String>::new(),
+                vec!["fresh.txt".to_string()]
+            ),
+            "a tracked push leaves an untracked file alone"
+        );
+        assert_eq!(
+            parked(&g, &g.stashes().unwrap()[0].commit),
+            vec!["staged.txt", "unstaged.txt"]
+        );
+
+        // Then the scope that was asked for it by name.
+        g.stash_push_scoped(Some("and the new one"), &StashScope::WithUntracked)
+            .unwrap();
+        assert!(g.status().unwrap().is_empty(), "{:?}", g.status().unwrap());
+        assert!(
+            !r.0.join("fresh.txt").exists(),
+            "the untracked file left the working tree"
+        );
+        assert_eq!(
+            parked(&g, &g.stashes().unwrap()[0].commit),
+            vec!["fresh.txt"],
+            "and it is in the entry, read out of the third parent"
+        );
+    }
+
+    #[test]
+    fn the_path_scope_takes_one_file_and_no_other() {
+        let r = three_sided("stash-scope-path");
+        let g = r.open();
+
+        g.stash_push_scoped(
+            Some("just the unstaged one"),
+            &StashScope::Path {
+                path: "unstaged.txt".into(),
+                untracked: false,
+            },
+        )
+        .expect("one path parks");
+        // What matters, and what the scope promises: nothing excluded was
+        // taken away. The staged change is still staged and still on disk;
+        // the untracked file is still there; only the named path left the
+        // working tree.
+        assert_eq!(
+            sides(&g),
+            (
+                vec!["staged.txt".to_string()],
+                Vec::<String>::new(),
+                vec!["fresh.txt".to_string()]
+            ),
+            "every other path stayed on its own side"
+        );
+        assert_eq!(
+            std::fs::read(r.0.join("staged.txt")).unwrap(),
+            b"one\nstaged\n"
+        );
+        assert_eq!(std::fs::read(r.0.join("unstaged.txt")).unwrap(), b"one\n");
+        // And the limit, asserted rather than assumed: git records the whole
+        // working tree in the entry and reverts only the pathspec out of it,
+        // so the entry is not a patch of one file. Documented on the scope.
+        assert_eq!(
+            parked(&g, &g.stashes().unwrap()[0].commit),
+            vec!["staged.txt", "unstaged.txt"],
+            "the entry carries the moment, not the pathspec"
+        );
+    }
+
+    #[test]
+    fn an_untracked_path_needs_the_flag_that_lets_git_see_it() {
+        let r = three_sided("stash-scope-path-untracked");
+        let g = r.open();
+
+        // Without `-u` git answers a pathspec naming nothing it tracks with
+        // "did not match any file(s) known to git" and stashes nothing — so
+        // the scope carries the flag, and the wrong answer is a refusal
+        // rather than a silent nothing.
+        let refused = g
+            .stash_push_scoped(
+                None,
+                &StashScope::Path {
+                    path: "fresh.txt".into(),
+                    untracked: false,
+                },
+            )
+            .expect_err("git cannot see an untracked path without -u");
+        assert!(refused.contains("did not match"), "{refused}");
+        assert!(g.stashes().unwrap().is_empty(), "nothing was recorded");
+
+        g.stash_push_scoped(
+            Some("the new file"),
+            &StashScope::Path {
+                path: "fresh.txt".into(),
+                untracked: true,
+            },
+        )
+        .expect("with -u it parks");
+        assert!(!r.0.join("fresh.txt").exists());
+        assert_eq!(
+            sides(&g),
+            (
+                vec!["staged.txt".to_string()],
+                vec!["unstaged.txt".to_string()],
+                Vec::<String>::new()
+            ),
+            "the tracked sides were not touched"
+        );
+    }
+
+    #[test]
+    fn a_scope_with_nothing_in_it_refuses_instead_of_reporting_success() {
+        let r = Scratch::new("stash-scope-empty");
+        r.write("f.txt", b"one\n");
+        r.git(&["add", "."]);
+        r.git(&["commit", "-qm", "base"]);
+        r.write("f.txt", b"one\nunstaged\n");
+        let g = r.open();
+
+        // Nothing is staged, and git has its own words for that — surfaced
+        // verbatim, because "No staged changes" says more than a sentence of
+        // ours would.
+        let said = g
+            .stash_push_scoped(None, &StashScope::Staged)
+            .expect_err("an empty index parks nothing");
+        assert!(said.contains("No staged changes"), "{said}");
+        assert!(g.stashes().unwrap().is_empty());
+
+        // A clean tree is the other shape: git answers it on *stdout* with
+        // exit 0 — "No local changes to save" — and no flag makes that
+        // machine-readable, so the stack not having moved is what turns it
+        // into a refusal, and the scope's own label is what names it.
+        r.git(&["checkout", "-q", "--", "f.txt"]);
+        let said = g
+            .stash_push_scoped(None, &StashScope::Tracked)
+            .expect_err("a clean tree parks nothing");
+        assert!(said.contains("the working tree has no changes"), "{said}");
+        assert!(g.stashes().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_stash_verb_follows_its_commit_when_the_stack_moved_underneath() {
+        let r = Scratch::new("stash-identity-churn");
+        r.write("f.txt", b"one\n");
+        r.git(&["add", "."]);
+        r.git(&["commit", "-qm", "base"]);
+        let g = r.open();
+
+        for text in ["first", "second", "third"] {
+            r.write("f.txt", format!("{text}\n").as_bytes());
+            g.stash_push(Some(text)).unwrap();
+        }
+        // Chosen at stash@{1} — "second".
+        let chosen = StashId::of(&g.stashes().unwrap()[1]);
+        assert_eq!(chosen.index, 1);
+
+        // Then the stack churns: something drops the entry above it, and
+        // stash@{1} now names "first". A verb addressed by the number would
+        // take the wrong work; addressed by the commit it takes "second".
+        g.stash_drop(0).unwrap();
+        assert_eq!(g.stashes().unwrap()[1].message, "On main: first");
+        g.stash_apply_id(&chosen).expect("the chosen entry applies");
+        assert_eq!(std::fs::read(r.0.join("f.txt")).unwrap(), b"second\n");
+
+        // And a pop of the same identity takes that entry off, leaving the
+        // one the number would have hit.
+        r.git(&["checkout", "-q", "--", "f.txt"]);
+        g.stash_pop_id(&chosen).expect("the chosen entry pops");
+        let left: Vec<String> = g
+            .stashes()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.message)
+            .collect();
+        assert_eq!(left, vec!["On main: first".to_string()]);
+        assert_eq!(std::fs::read(r.0.join("f.txt")).unwrap(), b"second\n");
+    }
+
+    #[test]
+    fn a_stash_verb_refuses_an_entry_that_left_the_stack() {
+        let r = Scratch::new("stash-identity-gone");
+        r.write("f.txt", b"one\n");
+        r.git(&["add", "."]);
+        r.git(&["commit", "-qm", "base"]);
+        let g = r.open();
+
+        r.write("f.txt", b"parked\n");
+        g.stash_push(Some("wip")).unwrap();
+        let chosen = StashId::of(&g.stashes().unwrap()[0]);
+        r.write("f.txt", b"also parked\n");
+        g.stash_push(Some("later")).unwrap();
+        // Dropped by somebody else. The remembered number still names a row;
+        // the commit names nothing.
+        g.stash_drop(1).unwrap();
+
+        for outcome in [
+            g.stash_apply_id(&chosen),
+            g.stash_pop_id(&chosen),
+            g.stash_drop_id(&chosen),
+        ] {
+            let said = outcome.expect_err("a gone entry is refused");
+            assert!(said.contains("no longer on the stack"), "{said}");
+        }
+        assert_eq!(
+            g.stashes().unwrap().len(),
+            1,
+            "and the surviving entry was not touched"
+        );
+        assert_eq!(g.stashes().unwrap()[0].message, "On main: later");
+    }
+
+    #[test]
+    fn a_conflicted_pop_keeps_the_stash_and_says_so() {
+        let r = Scratch::new("stash-pop-conflict-id");
+        r.write("f.txt", b"one\n");
+        r.git(&["add", "."]);
+        r.git(&["commit", "-qm", "base"]);
+        let g = r.open();
+
+        r.write("f.txt", b"parked\n");
+        g.stash_push(Some("wip")).unwrap();
+        let chosen = StashId::of(&g.stashes().unwrap()[0]);
+        // The same file, changed again: the restore would overwrite work git
+        // was not asked to throw away.
+        r.write("f.txt", b"in the way\n");
+
+        let said = g
+            .stash_pop_id(&chosen)
+            .expect_err("git refuses the restore");
+        assert!(
+            said.contains("would be overwritten") || said.contains("conflict"),
+            "git's own words: {said}"
+        );
+        // The entry survived, addressed by the identity that chose it — a
+        // failed pop that lost the stash is the accident this asserts against.
+        assert_eq!(g.stashes().unwrap().len(), 1);
+        assert_eq!(
+            g.stashes().unwrap()[0].commit,
+            chosen.commit,
+            "the same entry, still recoverable"
+        );
+        assert_eq!(
+            std::fs::read(r.0.join("f.txt")).unwrap(),
+            b"in the way\n",
+            "and the working tree was not half-written"
+        );
+        // Recoverable means recoverable: with the way cleared it pops.
+        r.git(&["checkout", "-q", "--", "f.txt"]);
+        g.stash_pop_id(&chosen).expect("the kept entry still pops");
+        assert!(g.stashes().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_renamed_stash_keeps_its_commit_and_is_re_filed_on_top() {
+        let r = Scratch::new("stash-rename");
+        r.write("f.txt", b"one\n");
+        r.git(&["add", "."]);
+        r.git(&["commit", "-qm", "base"]);
+        let g = r.open();
+
+        for text in ["first", "second"] {
+            r.write("f.txt", format!("{text}\n").as_bytes());
+            g.stash_push(None).unwrap();
+        }
+        // The older entry — stash@{1}, "first".
+        let chosen = StashId::of(&g.stashes().unwrap()[1]);
+        g.stash_rename(&chosen, "the parser one").unwrap();
+
+        let stack = g.stashes().unwrap();
+        assert_eq!(stack.len(), 2, "renaming adds no entry: {stack:?}");
+        // The commit is the identity and it did not change; git's stash is a
+        // reflog and only appends, so the entry is re-filed at the top.
+        assert_eq!(stack[0].message, "the parser one");
+        assert_eq!(stack[0].commit, chosen.commit);
+        assert!(
+            stack[1].message.starts_with("WIP on main:"),
+            "the other entry is untouched: {:?}",
+            stack[1].message
+        );
+        // And it is still the same work.
+        g.stash_apply_id(&StashId::of(&stack[0])).unwrap();
+        assert_eq!(std::fs::read(r.0.join("f.txt")).unwrap(), b"first\n");
+
+        let empty = g
+            .stash_rename(&StashId::of(&stack[0]), "   ")
+            .expect_err("a blank message is refused");
+        assert!(empty.contains("needs a message"), "{empty}");
+    }
+
+    #[test]
+    fn a_branch_from_a_stash_starts_where_the_stash_was_made() {
+        let r = Scratch::new("stash-branch");
+        r.write("f.txt", b"one\n");
+        r.git(&["add", "."]);
+        r.git(&["commit", "-qm", "base"]);
+        let base = r.rev_parse("HEAD");
+        let g = r.open();
+
+        r.write("f.txt", b"one\nwip\n");
+        r.git(&["add", "f.txt"]);
+        r.write("f.txt", b"one\nwip\nmore\n");
+        g.stash_push(Some("wip")).unwrap();
+        let chosen = StashId::of(&g.stashes().unwrap()[0]);
+        // History moves on, so the stash's base is no longer HEAD — which is
+        // the whole reason this verb exists rather than a checkout plus an
+        // apply.
+        r.write("f.txt", b"one\nsomething else\n");
+        r.git(&["commit", "-qam", "moved on"]);
+        assert_ne!(r.rev_parse("HEAD"), base);
+
+        g.stash_branch(&chosen, b"wip-branch").expect("the branch");
+
+        assert_eq!(
+            r.rev_parse("HEAD"),
+            base,
+            "the branch starts at the commit the stash was made on"
+        );
+        match g.head().unwrap() {
+            HeadState::Branch { name, .. } => assert_eq!(name.as_bytes(), b"wip-branch"),
+            other => panic!("checked out onto {other:?}"),
+        }
+        // Applied with its index intact: what was staged is staged again.
+        assert_eq!(
+            sides(&g),
+            (
+                vec!["f.txt".to_string()],
+                vec!["f.txt".to_string()],
+                Vec::<String>::new()
+            )
+        );
+        assert_eq!(
+            std::fs::read(r.0.join("f.txt")).unwrap(),
+            b"one\nwip\nmore\n"
+        );
+        // Addressed by stash@{n} and not by the raw commit, which is what
+        // lets git drop the entry after a clean apply.
+        assert!(
+            g.stashes().unwrap().is_empty(),
+            "the entry was dropped: {:?}",
+            g.stashes().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_branch_from_a_stash_refuses_a_name_that_is_not_one() {
+        let r = Scratch::new("stash-branch-name");
+        r.write("f.txt", b"one\n");
+        r.git(&["add", "."]);
+        r.git(&["commit", "-qm", "base"]);
+        let g = r.open();
+        r.write("f.txt", b"two\n");
+        g.stash_push(None).unwrap();
+        let chosen = StashId::of(&g.stashes().unwrap()[0]);
+
+        for (name, word) in [
+            (b"".as_slice(), "needs a name"),
+            (b"  ".as_slice(), "needs a name"),
+            (b"--detach".as_slice(), "beginning with '-'"),
+        ] {
+            let said = g
+                .stash_branch(&chosen, name)
+                .expect_err("a name git would read as an option");
+            assert!(said.contains(word), "{said}");
+        }
+        assert_eq!(g.stashes().unwrap().len(), 1, "and nothing happened");
+    }
+
+    #[test]
+    fn a_stash_entry_holds_both_its_halves_for_a_preview() {
+        // What an inspection before applying draws: the tracked half from
+        // the stash commit itself, the untracked half out of the third
+        // parent `-u` writes. Both, in one list, before anything is applied.
+        let r = three_sided("stash-preview-halves");
+        let g = r.open();
+
+        g.stash_push_scoped(Some("everything"), &StashScope::WithUntracked)
+            .unwrap();
+        let entry = g.stashes().unwrap()[0].commit.clone();
+
+        let tracked = g.pairs(&entry).unwrap();
+        assert_eq!(
+            paths(&tracked),
+            vec!["staged.txt", "unstaged.txt"],
+            "the tracked half is what the stash commit changed"
+        );
+        let untracked = g.pairs_stash_untracked(&entry).unwrap();
+        assert_eq!(paths(&untracked), vec!["fresh.txt"]);
+        // The new file's contents are there to read, with nothing opposite
+        // them — it existed nowhere before the stash took it.
+        assert!(untracked[0].old.is_empty(), "nothing on the old side");
+        assert_eq!(
+            untracked[0]
+                .new
+                .iter()
+                .map(|l| l.as_ref())
+                .collect::<Vec<&str>>(),
+            vec!["new"]
+        );
+        // And the working tree is clean, so this really was inspection
+        // before application.
+        assert!(g.status().unwrap().is_empty());
+    }
+
     #[test]
     fn the_ref_run_is_the_wave_and_never_the_answer() {
         // The one-run share must never outlive its wave: whatever a call
@@ -5608,6 +7882,219 @@ mod tests {
         assert_eq!(got[1].commit, r.rev_parse("stash@{1}"));
     }
 
+    fn worktree_sibling(name: &str) -> std::path::PathBuf {
+        // A sibling of the scratch root, not inside it: a worktree is a
+        // second checkout, and nesting it would make the parent's own
+        // status and cleanup lie. Owned by the test, not by the Scratch's
+        // Drop — every test below removes its own.
+        let dir = std::env::temp_dir().join(format!("gitten-git-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn seed(r: &Scratch) {
+        r.write("f.txt", b"one\n");
+        r.git(&["add", "."]);
+        r.git(&["commit", "-qm", "base"]);
+    }
+
+    #[test]
+    fn worktrees_list_names_each_checkout_and_what_it_holds() {
+        let r = Scratch::new("wt-list");
+        seed(&r);
+        r.git(&["branch", "feature"]);
+        let wt = worktree_sibling("wt-list-wt");
+        r.git(&["worktree", "add", "-q", wt.to_str().unwrap(), "feature"]);
+
+        let got = r.open().worktrees().unwrap();
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(got[0].branch.as_deref(), Some(b"main".as_slice()));
+        assert!(!got[0].bare);
+        // Porcelain prints symlink-resolved paths (`/private/var` on
+        // macOS), so the expectation is canonicalized the same way.
+        let wt_canon = std::fs::canonicalize(&wt).unwrap();
+        assert_eq!(got[1].path, wt_canon.as_os_str().as_encoded_bytes());
+        assert_eq!(got[1].branch.as_deref(), Some(b"feature".as_slice()));
+        assert_eq!(got[1].head, r.rev_parse("feature"));
+
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn worktree_add_and_remove_round_trip_through_the_verbs() {
+        let r = Scratch::new("wt-verbs");
+        seed(&r);
+        r.git(&["branch", "feature"]);
+        let g = r.open();
+        let wt = worktree_sibling("wt-verbs-wt");
+        let path = wt.as_os_str().as_encoded_bytes().to_vec();
+
+        g.worktree_add(&path, b"feature", None).unwrap();
+        let got = g.worktrees().unwrap();
+        assert_eq!(got.len(), 2, "{got:?}");
+        let wt_canon = std::fs::canonicalize(&wt).unwrap();
+        assert_eq!(got[1].path, wt_canon.as_os_str().as_encoded_bytes());
+        assert_eq!(got[1].branch.as_deref(), Some(b"feature".as_slice()));
+        assert!(wt.join("f.txt").exists(), "a real checkout landed");
+
+        g.worktree_remove(&path, false).unwrap();
+        assert_eq!(g.worktrees().unwrap().len(), 1);
+        assert!(!wt.exists(), "the directory went with the metadata");
+    }
+
+    #[test]
+    fn worktree_add_at_a_commit_checks_out_detached() {
+        let r = Scratch::new("wt-detached");
+        seed(&r);
+        let sha = r.rev_parse("HEAD");
+        r.git(&["branch", "elsewhere"]);
+        let g = r.open();
+        let wt = worktree_sibling("wt-detached-wt");
+        let path = wt.as_os_str().as_encoded_bytes().to_vec();
+
+        g.worktree_add(&path, sha.as_bytes(), None).unwrap();
+        let got = g.worktrees().unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[1].branch, None, "no branch was named");
+        assert_eq!(got[1].head, sha);
+
+        g.worktree_remove(&path, false).unwrap();
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn worktree_remove_refuses_a_dirty_tree_until_forced() {
+        let r = Scratch::new("wt-dirty");
+        seed(&r);
+        r.git(&["branch", "feature"]);
+        let g = r.open();
+        let wt = worktree_sibling("wt-dirty-wt");
+        let path = wt.as_os_str().as_encoded_bytes().to_vec();
+        g.worktree_add(&path, b"feature", None).unwrap();
+        std::fs::write(wt.join("dirty.txt"), b"uncommitted\n").unwrap();
+
+        let err = g.worktree_remove(&path, false).unwrap_err();
+        assert!(err.contains("force"), "git names the force spelling: {err}");
+        assert!(wt.exists(), "the refusal changed nothing");
+
+        g.worktree_remove(&path, true).unwrap();
+        assert_eq!(g.worktrees().unwrap().len(), 1);
+        assert!(!wt.exists());
+    }
+
+    #[test]
+    fn worktree_add_refuses_a_dash_path_before_any_process() {
+        let r = Scratch::new("wt-dash");
+        seed(&r);
+        let err = r.open().worktree_add(b"-oops", b"main", None).unwrap_err();
+        assert!(err.contains("'-'"), "our refusal, not git's: {err}");
+    }
+
+    #[test]
+    fn bisect_reaches_the_introduced_commit_and_reset_restores() {
+        let r = Scratch::new("bisect-trip");
+        // Eight commits; the file turns bad at the fourth. The test drives
+        // like a human: it reads the file, never the commit list.
+        let mut shas = Vec::new();
+        for i in 0..8 {
+            // Unique bodies — an unchanged file is nothing to commit —
+            // with the verdict in the first word, which is what the
+            // driver below reads, the way a human reads the file.
+            let body = if i < 3 {
+                format!("good {i}\n")
+            } else {
+                format!("bad {i}\n")
+            };
+            r.write("f.txt", body.as_bytes());
+            r.git(&["add", "."]);
+            r.git(&["commit", "-qm", &format!("c{i}")]);
+            shas.push(r.rev_parse("HEAD"));
+        }
+        let g = r.open();
+        assert_eq!(g.bisect_state(), None, "no bisection standing");
+
+        g.bisect_start(shas[7].as_bytes(), &[shas[0].as_bytes().to_vec()])
+            .unwrap();
+        let state = g.bisect_state().expect("the log stands");
+        assert_eq!(
+            state.original, "main",
+            "reset returns to the starting branch"
+        );
+
+        let mut found = false;
+        for _ in 0..12 {
+            let body = std::fs::read(r.0.join("f.txt")).unwrap();
+            if body.starts_with(b"bad") {
+                g.bisect_bad(b"").unwrap();
+            } else {
+                g.bisect_good(b"").unwrap();
+            }
+            // The announcement is git's, replayed by `bisect log`:
+            // `# first 'bad' commit: [<sha>]`. Quoted — an unquoted
+            // grep misses it, as an earlier draft of this test proved.
+            let log = r.git_os_out(&["bisect".into(), "log".into()]);
+            if String::from_utf8_lossy(&log).contains("first 'bad' commit") {
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "the bisection converged");
+        let log = r.git_os_out(&["bisect".into(), "log".into()]);
+        let announced = String::from_utf8_lossy(&log)
+            .lines()
+            .filter_map(|line| {
+                let (_, rest) = line.split_once("first 'bad' commit: [")?;
+                rest.split(']').next()
+            })
+            .next_back()
+            .expect("the announcement names the commit")
+            .to_string();
+        assert_eq!(announced, shas[3], "the commit that introduced it");
+
+        g.bisect_reset().unwrap();
+        assert_eq!(g.bisect_state(), None, "the log is gone");
+        assert_eq!(r.rev_parse("HEAD"), shas[7], "back on main");
+        assert_eq!(
+            std::fs::read(r.0.join("f.txt")).unwrap()[..3],
+            b"bad"[..],
+            "the tree came back too"
+        );
+    }
+
+    #[test]
+    fn bisect_marks_outside_a_bisection_are_gits_refusal() {
+        let r = Scratch::new("bisect-idle");
+        seed(&r);
+        let g = r.open();
+        let err = g.bisect_good(b"").unwrap_err();
+        assert!(err.contains("bisect"), "git's own words: {err}");
+        // And reset outside one is the quiet no-op, not an error.
+        g.bisect_reset().unwrap();
+    }
+
+    #[test]
+    fn bisect_start_twice_refuses_before_git_runs() {
+        let r = Scratch::new("bisect-twice");
+        seed(&r);
+        let sha = r.rev_parse("HEAD");
+        let g = r.open();
+        // A one-commit history cannot bisect, so borrow a second commit.
+        r.write("f.txt", b"two\n");
+        r.git(&["commit", "-qam", "second"]);
+        let tip = r.rev_parse("HEAD");
+        g.bisect_start(tip.as_bytes(), &[sha.as_bytes().to_vec()])
+            .unwrap();
+        let err = g
+            .bisect_start(tip.as_bytes(), &[sha.as_bytes().to_vec()])
+            .unwrap_err();
+        assert!(
+            err.contains("already in progress"),
+            "our refusal, not git's: {err}"
+        );
+        g.bisect_reset().unwrap();
+        assert_eq!(g.bisect_state(), None);
+    }
+
     #[test]
     fn remotes_list_each_distinct_url_once() {
         let r = Scratch::new("ref-remotes-model");
@@ -5658,6 +8145,14 @@ mod tests {
         assert_eq!(
             v2.commit, head,
             "annotated: peeled past the tag object git created for it"
+        );
+        assert!(!v1.annotated, "bare ref is lightweight");
+        assert_eq!(v1.subject, None, "a lightweight tag carries no message");
+        assert!(v2.annotated, "a -a tag stored a tag object");
+        assert_eq!(
+            v2.subject.as_deref(),
+            Some("release two"),
+            "the panel shows the subject, not the whole message"
         );
     }
 
@@ -5815,14 +8310,18 @@ mod tests {
     #[test]
     fn tag_records_peel_only_when_a_peel_arrived() {
         let raw = b"\
-            refs/tags/v1\0\0aa11\n\
-            refs/tags/v2\0bb22\0cc33\n";
+            refs/tags/v1\0\0aa11\0commit\0\n\
+            refs/tags/v2\0bb22\0cc33\0tag\0release two\n";
         let got = parse_tags(raw);
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].name.as_bytes(), b"v1");
         assert_eq!(got[0].commit, "aa11", "lightweight: object is commit");
+        assert!(!got[0].annotated);
+        assert_eq!(got[0].subject, None);
         assert_eq!(got[1].name.as_bytes(), b"v2");
         assert_eq!(got[1].commit, "bb22", "annotated: the peel wins");
+        assert!(got[1].annotated);
+        assert_eq!(got[1].subject.as_deref(), Some("release two"));
     }
 
     // ------------------------------------------------------------------ writes
@@ -5899,6 +8398,82 @@ mod tests {
         assert_eq!(
             ReadsOnly.stash_drop(0).unwrap_err(),
             "this repository does not serve dropping a stash"
+        );
+        // The scoped push and the identity-addressed trio borrow their
+        // singulars' words: a backend that serves no stashing serves no
+        // *kind* of stashing either, and there is nothing new to say.
+        assert_eq!(
+            ReadsOnly
+                .stash_push_scoped(None, &StashScope::Staged)
+                .unwrap_err(),
+            "this repository does not serve stashing"
+        );
+        let id = StashId {
+            index: 0,
+            commit: "abc".into(),
+        };
+        assert_eq!(
+            ReadsOnly.stash_apply_id(&id).unwrap_err(),
+            "this repository does not serve applying a stash"
+        );
+        assert_eq!(
+            ReadsOnly.stash_pop_id(&id).unwrap_err(),
+            "this repository does not serve popping a stash"
+        );
+        assert_eq!(
+            ReadsOnly.stash_drop_id(&id).unwrap_err(),
+            "this repository does not serve dropping a stash"
+        );
+        assert_eq!(
+            ReadsOnly.stash_rename(&id, "new").unwrap_err(),
+            "this repository does not serve renaming a stash"
+        );
+        assert_eq!(
+            ReadsOnly.stash_branch(&id, b"side").unwrap_err(),
+            "this repository does not serve a branch from a stash"
+        );
+    }
+
+    #[test]
+    fn a_staged_scope_over_a_path_changed_on_both_sides_says_what_it_left() {
+        // Git's own limit, and worth a test because the failure is not clean:
+        // `--staged` writes the entry and *then* tries to take the change
+        // back out of the index, which for a path changed on both sides is a
+        // reversal it cannot perform. It exits nonzero with the entry
+        // already recorded. Nothing here drops that entry — a stash git just
+        // made is not ours to destroy behind somebody's back — so the
+        // refusal says both halves and the reader decides.
+        let r = Scratch::new("stash-staged-both-sides");
+        r.write("f.txt", b"one\n");
+        r.git(&["add", "."]);
+        r.git(&["commit", "-qm", "base"]);
+        r.write("f.txt", b"one\nstaged\n");
+        r.git(&["add", "f.txt"]);
+        r.write("f.txt", b"one\nstaged\nunstaged\n");
+        let g = r.open();
+
+        let said = g
+            .stash_push_scoped(Some("index only"), &StashScope::Staged)
+            .expect_err("git cannot lift the staged side out alone");
+        assert!(
+            said.contains("the entry was recorded")
+                && said.contains("index and working tree are untouched"),
+            "{said}"
+        );
+        // Both halves are true: the entry is there, and every byte of the
+        // working tree and the index survived.
+        assert_eq!(g.stashes().unwrap().len(), 1);
+        assert_eq!(
+            std::fs::read(r.0.join("f.txt")).unwrap(),
+            b"one\nstaged\nunstaged\n"
+        );
+        assert_eq!(
+            sides(&g),
+            (
+                vec!["f.txt".to_string()],
+                vec!["f.txt".to_string()],
+                Vec::<String>::new()
+            )
         );
     }
 
@@ -6254,6 +8829,398 @@ mod tests {
         );
     }
 
+    // --------------------------------------------------- partial staging
+    //
+    // The acceptance bar the plan sets for W3: real scratch repositories,
+    // exact HEAD/index/worktree bytes after stage/unstage/discard of a
+    // subset of ONE replacement hunk, and the untouched changes untouched.
+    // Everything here runs the pipeline the verb runs — per-side pair,
+    // `diff_pairs`, `line_window`, `emit_with`, `git apply` — and nothing
+    // inspects a git argument that was not also executed.
+
+    /// HEAD=A, index=B, worktree=C, all inside one replacement hunk's
+    /// reach: B stages `STAGED ONE`, C additionally changes the next line
+    /// to `WORKTREE TWO`. The shape every partial-stage bug hides in.
+    fn mixed_repo(name: &str) -> (Scratch, Handle) {
+        let r = Scratch::new(name);
+        r.write("f.txt", b"alpha\nkeep one\nkeep two\nkeep three\nomega\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+        // B: staged. C: staged change plus an unstaged one.
+        r.write("f.txt", b"alpha\nSTAGED ONE\nkeep two\nkeep three\nomega\n");
+        r.git(&["add", "f.txt"]);
+        r.write(
+            "f.txt",
+            b"alpha\nSTAGED ONE\nWORKTREE TWO\nkeep three\nomega\n",
+        );
+        let g = r.open();
+        (r, g)
+    }
+
+    /// The one path's per-side pair, diffed through the pipeline the view
+    /// and the verb share.
+    fn side_files(g: &Handle, unstaged: bool, path: &[u8]) -> Vec<gitten_core::FileDiff> {
+        let differs = gitten_core::differ::Differs::builtin();
+        let pair = if unstaged {
+            g.pairs_unstaged(Some(path))
+                .expect("the unstaged side reads")
+                .pop()
+                .expect("a change is there")
+        } else {
+            g.pairs_staged(Some(path))
+                .expect("the staged side reads")
+                .pop()
+                .expect("a change is there")
+        };
+        crate::diff_pairs(&[pair], &differs, &Default::default())
+    }
+
+    fn bytes_of(r: &Scratch, rev: &str) -> Vec<u8> {
+        let out = r
+            .cmd(&["show".into(), format!("{rev}:f.txt").into()])
+            .output()
+            .expect("git show runs");
+        assert!(
+            out.status.success(),
+            "show {rev}:f.txt: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out.stdout
+    }
+
+    fn porcelain_of(r: &Scratch) -> String {
+        String::from_utf8_lossy(
+            &r.cmd(&["status".into(), "--porcelain".into()])
+                .output()
+                .expect("status")
+                .stdout,
+        )
+        .into_owned()
+    }
+
+    #[test]
+    fn staging_a_subset_of_one_replacement_hunk_moves_exactly_the_chosen_lines() {
+        let (r, g) = mixed_repo("partial-stage-lines");
+        let files = side_files(&g, true, b"f.txt");
+        assert_eq!(files.len(), 1, "one file's unstaged side");
+        let hunk = &files[0].hunks[0];
+        // The hunk is one replacement: `-keep two` paired with
+        // `+WORKTREE TWO`, context around both.
+        let plus = hunk
+            .lines
+            .iter()
+            .position(|l| l.kind == gitten_core::LineKind::Added)
+            .expect("an addition to select");
+        // Stage the ADDITION alone. The index gains the new line; the
+        // removal was not chosen, so the old line stays in the index and
+        // remains the unstaged half.
+        let window = gitten_core::patch::line_window(
+            hunk,
+            plus,
+            plus,
+            gitten_core::patch::Unselected::KeepRemovals,
+        )
+        .expect("a changed line");
+        let sides = gitten_core::patch::Sides {
+            old_lines: 5,
+            old_final_newline: true,
+            new_lines: 5,
+            new_final_newline: true,
+        };
+        let patch = gitten_core::patch::emit_with("f.txt", &[&window], &sides)
+            .expect("the sides agree about their final newline");
+        assert!(!patch.is_empty());
+        g.stage_patch(&patch).expect("the subset stages");
+
+        let index = bytes_of(&r, "");
+        assert_eq!(
+            String::from_utf8(index).unwrap(),
+            "alpha\nSTAGED ONE\nkeep two\nWORKTREE TWO\nkeep three\nomega\n",
+            "the chosen line is in the index, the unchosen removal is still there"
+        );
+        assert_eq!(
+            porcelain_of(&r),
+            "MM f.txt\n",
+            "the removal remains unstaged"
+        );
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(),
+            b"alpha\nSTAGED ONE\nWORKTREE TWO\nkeep three\nomega\n",
+            "the worktree was never touched by --cached"
+        );
+
+        // Now stage the removal too. The index has moved — the first apply
+        // saw to that — so the verb's contract is followed here as well:
+        // the side is re-read, and the selection matched against what git
+        // holds now, not against the hunk the first patch came from.
+        let files = side_files(&g, true, b"f.txt");
+        let hunk = &files[0].hunks[0];
+        let minus = hunk
+            .lines
+            .iter()
+            .position(|l| l.kind == gitten_core::LineKind::Removed)
+            .expect("the removal is now the whole unstaged change");
+        let window = gitten_core::patch::line_window(
+            hunk,
+            minus,
+            minus,
+            gitten_core::patch::Unselected::KeepRemovals,
+        )
+        .expect("a changed line");
+        let patch = gitten_core::patch::emit_with("f.txt", &[&window], &sides)
+            .expect("the sides agree about their final newline");
+        g.stage_patch(&patch).expect("the removal stages");
+        let index = bytes_of(&r, "");
+        assert_eq!(
+            String::from_utf8_lossy(&index),
+            "alpha\nSTAGED ONE\nWORKTREE TWO\nkeep three\nomega\n",
+            "staging the rest of the hunk completes it"
+        );
+        assert_eq!(porcelain_of(&r), "M  f.txt\n", "fully staged");
+        let head = bytes_of(&r, "HEAD");
+        assert_ne!(index, head, "HEAD holds A, untouched by any of this");
+    }
+
+    #[test]
+    fn an_unstage_patch_is_built_from_the_staged_side_and_takes_exactly_its_lines() {
+        let (r, g) = mixed_repo("partial-unstage");
+        let files = side_files(&g, false, b"f.txt");
+        let hunk = &files[0].hunks[0];
+        let plus = hunk
+            .lines
+            .iter()
+            .position(|l| l.kind == gitten_core::LineKind::Added)
+            .expect("the staged addition");
+        // An unstage is a reverse verb: the window keeps the unchosen
+        // additions and drops the unchosen removals — unstaging the
+        // addition alone leaves the removal staged, and neither half of
+        // the pair in the index.
+        let window = gitten_core::patch::line_window(
+            hunk,
+            plus,
+            plus,
+            gitten_core::patch::Unselected::KeepAdditions,
+        )
+        .expect("a changed line");
+        let sides = gitten_core::patch::Sides {
+            old_lines: 5,
+            old_final_newline: true,
+            new_lines: 5,
+            new_final_newline: true,
+        };
+        let patch = gitten_core::patch::emit_with("f.txt", &[&window], &sides)
+            .expect("the sides agree about their final newline");
+        g.unstage_patch(&patch).expect("the subset unstages");
+
+        let index = bytes_of(&r, "");
+        assert_eq!(
+            String::from_utf8_lossy(&index),
+            "alpha\nkeep two\nkeep three\nomega\n",
+            "the addition left, the removal still staged"
+        );
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(),
+            b"alpha\nSTAGED ONE\nWORKTREE TWO\nkeep three\nomega\n",
+            "the worktree was never touched"
+        );
+        assert_eq!(porcelain_of(&r), "MM f.txt\n", "still work on both sides");
+    }
+
+    #[test]
+    fn a_discard_patch_takes_exactly_the_unstaged_lines_from_the_worktree() {
+        let (r, g) = mixed_repo("partial-discard");
+        let files = side_files(&g, true, b"f.txt");
+        let hunk = &files[0].hunks[0];
+        let plus = hunk
+            .lines
+            .iter()
+            .position(|l| l.kind == gitten_core::LineKind::Added)
+            .expect("the unstaged addition");
+        // A discard's window keeps the unchosen additions — the worktree
+        // they live in is what `--reverse` matches against.
+        let window = gitten_core::patch::line_window(
+            hunk,
+            plus,
+            plus,
+            gitten_core::patch::Unselected::KeepAdditions,
+        )
+        .expect("a changed line");
+        let sides = gitten_core::patch::Sides {
+            old_lines: 5,
+            old_final_newline: true,
+            new_lines: 5,
+            new_final_newline: true,
+        };
+        let patch = gitten_core::patch::emit_with("f.txt", &[&window], &sides)
+            .expect("the sides agree about their final newline");
+        // DESTRUCTIVE in the view; here it simply runs.
+        g.discard_patch(&patch).expect("reverses onto the worktree");
+
+        // The worktree loses exactly the addition — keep two was never in
+        // it to come back, and the discard does not pretend otherwise.
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(),
+            b"alpha\nSTAGED ONE\nkeep three\nomega\n",
+            "the addition is gone, the worktree otherwise untouched"
+        );
+        let index = bytes_of(&r, "");
+        assert_eq!(
+            String::from_utf8(index).unwrap(),
+            "alpha\nSTAGED ONE\nkeep two\nkeep three\nomega\n",
+            "the index was never touched by a discard"
+        );
+        assert_eq!(
+            porcelain_of(&r),
+            "MM f.txt\n",
+            "staged work survives, and the worktree differs from the index again"
+        );
+    }
+
+    #[test]
+    fn a_patch_against_content_without_a_final_newline_carries_the_marker_and_applies() {
+        // The acquisition-level gap `emit` documented for years: content
+        // that does not end in a newline produced a patch `git apply`
+        // refuses. With the sides' final-line facts, the marker is written
+        // the way git writes it and the patch applies.
+        let r = Scratch::new("partial-no-newline");
+        r.write("f.txt", b"alpha\nend");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+        let g = r.open();
+
+        // The unsayable shape first: an addition after a final line that
+        // has no newline — the old side's last line becomes the new side's
+        // middle, and no partial patch can say both at once.
+        r.write("f.txt", b"alpha\nend\nappended");
+        let files = side_files(&g, true, b"f.txt");
+        let pair_old = g.pairs_unstaged(Some(b"f.txt")).unwrap().pop().unwrap();
+        let err = gitten_core::patch::emit_with(
+            "f.txt",
+            &[&files[0].hunks[0]],
+            &gitten_core::patch::Sides {
+                old_lines: pair_old.old.len(),
+                old_final_newline: pair_old.old_final_newline,
+                new_lines: pair_old.new.len(),
+                new_final_newline: pair_old.new_final_newline,
+            },
+        )
+        .expect_err("the disagreement refuses");
+        assert!(
+            err.contains("final newline"),
+            "the refusal names the shape: {err}"
+        );
+
+        // The sayable shape: a modified final line both sides end on, the
+        // marker riding each side's own last line.
+        r.write("f.txt", b"alpha\nEND");
+        let files = side_files(&g, true, b"f.txt");
+        let pair_old = g.pairs_unstaged(Some(b"f.txt")).unwrap().pop().unwrap();
+        assert!(
+            !pair_old.old_final_newline && !pair_old.new_final_newline,
+            "both sides end without the newline"
+        );
+        let hunk = &files[0].hunks[0];
+        let patch = gitten_core::patch::emit_with(
+            "f.txt",
+            &[hunk],
+            &gitten_core::patch::Sides {
+                old_lines: pair_old.old.len(),
+                old_final_newline: pair_old.old_final_newline,
+                new_lines: pair_old.new.len(),
+                new_final_newline: pair_old.new_final_newline,
+            },
+        )
+        .expect("the agreeing sides say their patch");
+        let text = String::from_utf8(patch.clone()).unwrap();
+        assert!(
+            text.contains("-end\n\\ No newline at end of file\n"),
+            "the marker rides the removal: {text}"
+        );
+        assert!(
+            text.contains("+END\n\\ No newline at end of file\n"),
+            "and the addition: {text}"
+        );
+        g.stage_patch(&patch).expect("the marked patch applies");
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(),
+            b"alpha\nEND",
+            "the worktree bytes, reproduced exactly in the index"
+        );
+        let index = bytes_of(&r, "");
+        assert_eq!(index, b"alpha\nEND");
+
+        // The removal direction: taking the no-newline final line away.
+        r.git(&["reset", "-q", "HEAD", "--"]);
+        r.write("f.txt", b"alpha\n");
+        let files = side_files(&g, true, b"f.txt");
+        let pair_old = g.pairs_unstaged(Some(b"f.txt")).unwrap().pop().unwrap();
+        assert!(
+            !pair_old.old_final_newline,
+            "the old side's last line is the one without the newline"
+        );
+        let hunk = &files[0].hunks[0];
+        let patch = gitten_core::patch::emit_with(
+            "f.txt",
+            &[hunk],
+            &gitten_core::patch::Sides {
+                old_lines: pair_old.old.len(),
+                old_final_newline: pair_old.old_final_newline,
+                new_lines: pair_old.new.len(),
+                new_final_newline: pair_old.new_final_newline,
+            },
+        )
+        .expect("the removal direction says its marker");
+        let text = String::from_utf8(patch.clone()).unwrap();
+        assert!(
+            text.contains("-end\n\\ No newline at end of file\n"),
+            "the marker rides the removal: {text}"
+        );
+        g.discard_patch(&patch).expect("reverses cleanly");
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(),
+            b"alpha\nend",
+            "discarding the removal restores the line, marker and all"
+        );
+    }
+
+    #[test]
+    fn the_revalidation_reads_answer_the_index_and_head_byte_exactly() {
+        // index_blob_oid and head_blob_oid are the write-time half of the
+        // staleness contract; their answers are checked against the same
+        // OIDs acquisition carries in the pair — one definition of "this
+        // side's blob", not two.
+        let r = Scratch::new("partial-oids");
+        r.write("f.txt", b"head bytes\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+        r.write("f.txt", b"index bytes\n");
+        r.git(&["add", "f.txt"]);
+        // The unstaged side needs a change of its own to read: the worktree
+        // moves past the index.
+        r.write("f.txt", b"worktree bytes\n");
+        r.write("notes.md", b"untracked\n");
+        let g = r.open();
+
+        let head_oid = g.pairs_staged(Some(b"f.txt")).unwrap()[0].old_oid.clone();
+        let index_oid = g.pairs_unstaged(Some(b"f.txt")).unwrap()[0].old_oid.clone();
+        assert!(head_oid.is_some() && index_oid.is_some());
+        assert_ne!(head_oid, index_oid, "the two sides really differ");
+        assert_eq!(
+            g.index_blob_oid(b"f.txt").unwrap().as_deref(),
+            index_oid.as_deref(),
+            "the revalidation read answers what acquisition read"
+        );
+        assert_eq!(
+            g.head_blob_oid(b"f.txt").unwrap().as_deref(),
+            head_oid.as_deref()
+        );
+        assert_eq!(
+            g.index_blob_oid(b"notes.md").unwrap(),
+            None,
+            "an untracked path has no index entry to revalidate against"
+        );
+    }
+
     #[test]
     fn an_empty_patch_is_refused_before_anything_runs() {
         let r = Scratch::new("hunk-empty");
@@ -6434,15 +9401,156 @@ mod tests {
                     .push([b"d".to_vec(), p.to_vec()].concat());
                 Ok(())
             }
+            fn apply_patch(&self, p: &[u8]) -> Result<()> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push([b"a".to_vec(), p.to_vec()].concat());
+                Ok(())
+            }
         }
         let patches = Arc::new(Patches(Mutex::new(Vec::new())));
         let g: Handle = Arc::clone(&patches) as Handle;
         g.discard_patch(b"-- hunk\n").expect("discard reaches");
+        g.apply_patch(b"++ hunk\n").expect("apply reaches");
         assert_eq!(
             *patches.0.lock().unwrap(),
-            vec![b"d-- hunk\n".to_vec()],
+            vec![b"d-- hunk\n".to_vec(), b"a++ hunk\n".to_vec()],
             "the bytes arrived whole"
         );
+    }
+
+    #[test]
+    fn an_apply_patch_writes_into_the_worktree_and_leaves_the_index() {
+        let r = Scratch::new("patch-apply-worktree");
+        r.write("f.txt", b"old\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+
+        let g = r.open();
+        let patch =
+            b"diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n@@ -1 +1 @@\n-old\n+new\n";
+        g.apply_patch(patch).expect("applies onto the worktree");
+
+        let now = std::fs::read(join_raw(&r.0, b"f.txt")).unwrap();
+        assert_eq!(now, b"new\n", "the worktree took the patch");
+        let porcelain = String::from_utf8_lossy(
+            &r.cmd(&["status".into(), "--porcelain".into()])
+                .output()
+                .expect("status")
+                .stdout,
+        )
+        .into_owned();
+        assert_eq!(porcelain, " M f.txt\n", "the index stood still");
+
+        let err = g.apply_patch(patch).expect_err("a second apply refuses");
+        assert!(
+            err.contains("patch failed") || err.contains("does not apply"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn commit_files_names_what_a_commit_touched() {
+        let r = Scratch::new("commit-files");
+        r.write("keep.txt", b"keep\n");
+        r.write("chg.txt", b"before\n");
+        r.write("del.txt", b"gone\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+        r.write("chg.txt", b"after\n");
+        r.git(&["rm", "-q", "del.txt"]);
+        r.write("new.txt", b"new\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "second"]);
+
+        let g = r.open();
+        let named = |files: Vec<(char, Vec<u8>)>| {
+            files
+                .into_iter()
+                .map(|(s, p)| (s, String::from_utf8(p).unwrap()))
+                .collect::<Vec<_>>()
+        };
+        let second = named(
+            g.commit_files(r.rev_parse("HEAD").as_bytes())
+                .expect("lists the second commit"),
+        );
+        assert!(
+            second.contains(&('M', "chg.txt".to_string())),
+            "modified: {second:?}"
+        );
+        assert!(
+            second.contains(&('D', "del.txt".to_string())),
+            "deleted: {second:?}"
+        );
+        assert!(
+            second.contains(&('A', "new.txt".to_string())),
+            "added: {second:?}"
+        );
+        assert!(
+            !second.iter().any(|(_, p)| p == "keep.txt"),
+            "untouched stays out: {second:?}"
+        );
+
+        r.git(&["mv", "new.txt", "renamed.txt"]);
+        r.git(&["commit", "-qm", "rename"]);
+        let renamed = named(
+            g.commit_files(r.rev_parse("HEAD").as_bytes())
+                .expect("lists the rename"),
+        );
+        assert_eq!(
+            renamed,
+            vec![('R', "renamed.txt".to_string())],
+            "a rename reports the new path: {renamed:?}"
+        );
+
+        r.git(&["commit", "-q", "--allow-empty", "-m", "empty"]);
+        let empty = g
+            .commit_files(r.rev_parse("HEAD").as_bytes())
+            .expect("an empty commit lists");
+        assert!(empty.is_empty(), "nothing touched is empty, not an error");
+    }
+
+    #[test]
+    fn amend_no_edit_folds_staged_work_keeping_everything_else() {
+        let r = Scratch::new("amend-no-edit");
+        r.write("f.txt", b"one\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "first"]);
+        let before = r.rev_parse("HEAD");
+        let author = |r: &Scratch| {
+            String::from_utf8(r.git_os_out(&[
+                "log".into(),
+                "-1".into(),
+                "--format=%an <%ae>".into(),
+            ]))
+            .unwrap()
+        };
+        let message = |r: &Scratch| {
+            String::from_utf8(r.git_os_out(&["log".into(), "-1".into(), "--format=%B".into()]))
+                .unwrap()
+        };
+        let author_before = author(&r);
+        let message_before = message(&r);
+
+        r.write("f.txt", b"one\ntwo\n");
+        r.git(&["add", "f.txt"]);
+        let g = r.open();
+        let after = g.amend_no_edit().expect("amends without rewording");
+        assert_ne!(before, after, "the replacement is a new commit");
+        assert_eq!(r.rev_parse("HEAD"), after, "HEAD moved onto it");
+        assert_eq!(message(&r), message_before, "the message stands");
+        assert_eq!(author(&r), author_before, "the author stands");
+        let now = std::fs::read(join_raw(&r.0, b"f.txt")).unwrap();
+        assert_eq!(now, b"one\ntwo\n", "the staged work landed");
+        let porcelain = String::from_utf8_lossy(
+            &r.cmd(&["status".into(), "--porcelain".into()])
+                .output()
+                .expect("status")
+                .stdout,
+        )
+        .into_owned();
+        assert!(porcelain.is_empty(), "amending cleaned the index");
     }
 
     #[test]
@@ -6848,6 +9956,54 @@ mod tests {
         let e = r.open().commit("nothing staged").unwrap_err();
         assert!(e.starts_with("git commit:"), "{e}");
         assert!(!e.trim().is_empty(), "git's stderr travelled");
+    }
+
+    #[test]
+    fn a_fixup_commit_names_its_target_and_nothing_else() {
+        let r = Scratch::new("commit-fixup");
+        r.write("f.txt", b"x\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "the target"]);
+        r.write("f.txt", b"y\n");
+        r.git(&["add", "f.txt"]);
+
+        let g = r.open();
+        let target = g.log(5).unwrap()[0].sha.clone();
+        let sha = g
+            .commit_fixup(target.as_bytes(), FixupKind::Fixup)
+            .expect("fixups");
+        assert_eq!(sha, r.rev_parse("HEAD"));
+        let subject = String::from_utf8(r.git_os_out(&[
+            "show".into(),
+            "-s".into(),
+            "--format=%s".into(),
+            sha.into(),
+        ]))
+        .unwrap();
+        assert_eq!(subject.trim_end(), "fixup! the target");
+    }
+
+    // No scratch test for the amend!/reword! spellings: unlike plain
+    // `--fixup=`, those two open an editor, and a headless test has no
+    // answer for one — the probe hung on the ambient `$EDITOR` (nvim).
+    // The flags themselves are pinned in core's
+    // `the_fixup_kind_cycles_and_spells_gits_flag`, and creation with
+    // either kind refuses before any process runs until the external-
+    // editor door (W10) exists.
+
+    #[test]
+    fn a_fixup_with_nothing_staged_is_gits_refusal_not_a_commit() {
+        let r = Scratch::new("commit-fixup-empty");
+        r.write("f.txt", b"x\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "the target"]);
+        let g = r.open();
+        let target = g.log(5).unwrap()[0].sha.clone();
+        let e = g
+            .commit_fixup(target.as_bytes(), FixupKind::Fixup)
+            .unwrap_err();
+        assert!(!e.is_empty(), "git's own sentence travelled");
+        assert_eq!(g.log(5).unwrap().len(), 1, "nothing was committed");
     }
 
     // ------------------------------------------------------- the branch verbs
@@ -7502,6 +10658,431 @@ mod tests {
         assert_eq!(g.log(5).unwrap().len(), 3, "nothing landed");
     }
 
+    /// A side branch with three file-adding commits, checked back out to
+    /// main: the shape every cherry-pick test below replays from.
+    fn side_three(name: &str) -> (Scratch, String, String, String) {
+        let r = Scratch::new(name);
+        r.write("base.txt", b"base\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "base"]);
+        r.git(&["checkout", "-qb", "side"]);
+        for (file, msg) in [
+            ("one.txt", "one"),
+            ("two.txt", "two"),
+            ("three.txt", "three"),
+        ] {
+            r.write(file, format!("{msg}\n").as_bytes());
+            r.git(&["add", "-A"]);
+            r.git(&["commit", "-qm", msg]);
+        }
+        let (one, two, three) = (
+            r.rev_parse("side~2"),
+            r.rev_parse("side~1"),
+            r.rev_parse("side"),
+        );
+        r.git(&["checkout", "-q", "main"]);
+        (r, one, two, three)
+    }
+
+    #[test]
+    fn a_cherry_pick_replays_the_commit_onto_head() {
+        let (r, one, _, _) = side_three("pick-single");
+        let g = r.open();
+        let base = r.rev_parse("main");
+
+        g.cherry_pick(one.as_bytes()).expect("picks");
+        assert_eq!(r.rev_parse("HEAD~1"), base, "the pick lands on top");
+        let log = g.log(5).unwrap();
+        assert_eq!(log.len(), 2);
+        assert_eq!(log[0].subject, "one", "git keeps the message");
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"one.txt")).unwrap(),
+            b"one\n",
+            "and the tree rode along"
+        );
+        let tree = g.status().unwrap();
+        assert_eq!(
+            tree.staged.len() + tree.unstaged.len(),
+            0,
+            "the pick committed itself"
+        );
+    }
+
+    #[test]
+    fn a_cherry_pick_range_lands_in_clipboard_order() {
+        // Oldest first, as the clipboard arranges a marked range: the log
+        // reads newest-first, so the replay order is the log reversed.
+        let (r, one, two, three) = side_three("pick-range");
+        let g = r.open();
+
+        g.cherry_pick_range(&[one.into_bytes(), two.into_bytes(), three.into_bytes()])
+            .expect("picks");
+        let log = g.log(5).unwrap();
+        assert_eq!(log.len(), 4, "base plus three replays");
+        assert_eq!(
+            [&log[0].subject, &log[1].subject, &log[2].subject],
+            [&"three".to_string(), &"two".to_string(), &"one".to_string()],
+            "newest first, replay order preserved"
+        );
+        for (file, want) in [
+            ("one.txt", &b"one\n"[..]),
+            ("two.txt", &b"two\n"[..]),
+            ("three.txt", &b"three\n"[..]),
+        ] {
+            assert_eq!(
+                std::fs::read(join_raw(&r.0, file.as_bytes())).unwrap(),
+                want,
+                "{file} rode along"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cherry_pick_range_stops_mid_sequence_on_conflict() {
+        let r = Scratch::new("pick-range-conflict");
+        r.write("f.txt", b"base\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "base"]);
+        r.git(&["checkout", "-qb", "side"]);
+        r.write("g.txt", b"clean\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "clean"]);
+        r.write("f.txt", b"side\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "clash"]);
+        let (clean, clash) = (r.rev_parse("side~1"), r.rev_parse("side"));
+        r.git(&["checkout", "-q", "main"]);
+        r.write("f.txt", b"main\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "main-side"]);
+        let g = r.open();
+
+        // The clean pick lands; the clashing one stops the sequence with
+        // git's own words and the sequencer standing for abort/continue.
+        let e = g
+            .cherry_pick_range(&[clean.into_bytes(), clash.into_bytes()])
+            .unwrap_err();
+        assert!(e.contains("could not apply"), "{e}");
+        assert!(g.cherry_pick_in_progress(), "the remainder stands");
+        let log = g.log(5).unwrap();
+        assert_eq!(log.len(), 3, "base, main-side, and the clean pick");
+        assert_eq!(log[0].subject, "clean");
+        g.cherry_pick_abort().expect("aborts");
+        assert!(!g.cherry_pick_in_progress());
+    }
+
+    #[test]
+    fn cherry_picking_nothing_is_refused_before_git() {
+        let r = two_commits("pick-empty-range");
+        let before = r.rev_parse("HEAD");
+        let e = r.open().cherry_pick_range(&[]).unwrap_err();
+        assert!(e.contains("nothing copied"), "{e}");
+        assert_eq!(r.rev_parse("HEAD"), before, "nothing ran");
+    }
+
+    #[test]
+    fn cherry_picking_an_empty_commit_is_gits_refusal() {
+        // An empty commit has no change to replay: git stops rather than
+        // landing a duplicate, and the branch stands still. No `--allow-empty`
+        // here — inventing an empty twin is not a pick. Unlike the merge
+        // refusal below, this one *is* a state: git leaves CHERRY_PICK_HEAD
+        // standing and asks for `--skip` or `--abort`, so the W5 lifecycle
+        // finds a pick in progress with a clean tree and nothing to commit.
+        let r = Scratch::new("pick-empty-commit");
+        r.write("f.txt", b"x\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "base"]);
+        r.git(&["commit", "-q", "--allow-empty", "-m", "empty"]);
+        let empty = r.rev_parse("HEAD");
+        r.git(&["checkout", "-q", "HEAD~1"]);
+        r.git(&["checkout", "-qb", "elsewhere"]);
+        let g = r.open();
+
+        let e = g.cherry_pick(empty.as_bytes()).unwrap_err();
+        assert!(e.contains("empty"), "{e}");
+        assert_eq!(g.log(5).unwrap().len(), 1, "nothing landed");
+        assert!(
+            g.cherry_pick_in_progress(),
+            "the pick stands for the lifecycle to skip or abort"
+        );
+        let tree = g.status().unwrap();
+        assert_eq!(
+            tree.staged.len() + tree.unstaged.len(),
+            0,
+            "and there is nothing to resolve"
+        );
+        g.cherry_pick_abort().expect("aborts");
+        assert!(!g.cherry_pick_in_progress());
+        assert_eq!(g.log(5).unwrap().len(), 1, "still nothing landed");
+    }
+
+    #[test]
+    fn a_cherry_pick_leaves_unrelated_dirty_work_alone() {
+        // A dirty tree git's pick does not touch is not a reason to stop:
+        // the pick lands and the dirty bytes are exactly what they were.
+        let (r, one, _, _) = side_three("pick-dirty");
+        r.write("dirty.txt", b"unsaved\n");
+        let g = r.open();
+
+        g.cherry_pick(one.as_bytes()).expect("picks past the dirt");
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"dirty.txt")).unwrap(),
+            b"unsaved\n",
+            "untouched and uncommitted"
+        );
+        assert_eq!(g.log(5).unwrap()[0].subject, "one");
+    }
+
+    #[test]
+    fn a_detached_checkout_of_a_commit_sha_moves_head_alone() {
+        // The shape `commits.checkout` aims: a full sha, not a branch name —
+        // HEAD detaches onto it while the branch tip stands still.
+        let r = two_commits("checkout-detached");
+        let g = r.open();
+        let (tip, target) = (r.rev_parse("HEAD"), r.rev_parse("HEAD~1"));
+
+        g.checkout(target.as_bytes()).expect("checks out");
+        match g.head().unwrap() {
+            HeadState::Detached { commit } => assert_eq!(commit, target),
+            other => panic!("detached expected, got {other:?}"),
+        };
+        assert_eq!(
+            r.git_os_out(&["rev-parse".into(), "main".into()]),
+            format!("{tip}\n").into_bytes(),
+            "the branch never moved"
+        );
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(),
+            b"first\n",
+            "the working tree went with HEAD"
+        );
+    }
+
+    #[test]
+    fn reset_author_hands_head_a_new_author_and_nothing_else() {
+        // Committed under a foreign hand, re-authored to the current user:
+        // `--reset-author` takes the committer, which the scratch config
+        // fixed as gitten-test before the commit ever ran.
+        let r = Scratch::new("reset-author");
+        r.write("f.txt", b"x\n");
+        r.git(&["add", "-A"]);
+        r.git(&[
+            "commit",
+            "-qm",
+            "mine",
+            "--author=Someone Else <else@example.com>",
+        ]);
+        let g = r.open();
+        let before = r.rev_parse("HEAD");
+
+        g.reset_author().expect("re-authors");
+        let after = r.rev_parse("HEAD");
+        assert_ne!(after, before, "the commit was replaced");
+        let who = String::from_utf8(r.git_os_out(&[
+            "log".into(),
+            "-1".into(),
+            "--format=%an <%ae>".into(),
+        ]))
+        .unwrap();
+        assert_eq!(who.trim(), "gitten-test <test@gitten.local>");
+        let what =
+            String::from_utf8(r.git_os_out(&["log".into(), "-1".into(), "--format=%s".into()]))
+                .unwrap();
+        assert_eq!(what.trim(), "mine", "the message stood still");
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(),
+            b"x\n",
+            "and so did the tree"
+        );
+    }
+
+    #[test]
+    fn reset_author_on_an_unborn_branch_is_refused() {
+        let r = Scratch::new("reset-author-unborn");
+        r.write("f.txt", b"x\n");
+        let e = r.open().reset_author().unwrap_err();
+        assert!(e.contains("no commits yet"), "{e}");
+    }
+
+    #[test]
+    fn a_pick_into_the_dirty_file_it_touches_is_gits_refusal() {
+        // The counterpart to the pick that steps past unrelated dirt: git
+        // will not overwrite a local edit to a file the patch needs, and it
+        // says so before touching anything. The dirty bytes are the proof —
+        // a refusal that ate them would be worse than one that ran.
+        let (r, one, _, _) = side_three("pick-dirty-clash");
+        r.write("one.txt", b"mine, unsaved\n");
+        let g = r.open();
+        let before = r.rev_parse("HEAD");
+
+        let e = g.cherry_pick(one.as_bytes()).unwrap_err();
+        assert!(!e.is_empty(), "git refused, verbatim");
+        assert_eq!(r.rev_parse("HEAD"), before, "history stood still");
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"one.txt")).unwrap(),
+            b"mine, unsaved\n",
+            "the local edit was eaten"
+        );
+        assert!(!g.cherry_pick_in_progress(), "nothing stands to abort");
+    }
+
+    #[test]
+    fn a_second_range_pick_inside_a_standing_one_is_refused_before_git() {
+        // The sequencer holds one pick at a time; a second start would
+        // disturb the first's plan, so the guard runs before any process.
+        let r = Scratch::new("pick-range-twice");
+        r.write("f.txt", b"base\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "base"]);
+        r.git(&["checkout", "-qb", "side"]);
+        r.write("f.txt", b"side\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "clash"]);
+        let clash = r.rev_parse("side");
+        r.git(&["checkout", "-q", "main"]);
+        r.write("f.txt", b"main\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "main-side"]);
+        let g = r.open();
+
+        g.cherry_pick_range(&[clash.clone().into_bytes()])
+            .unwrap_err();
+        assert!(g.cherry_pick_in_progress(), "the conflict stands");
+        let at = r.rev_parse("HEAD");
+        let e = g.cherry_pick_range(&[clash.into_bytes()]).unwrap_err();
+        assert!(e.contains("already in progress"), "{e}");
+        assert_eq!(r.rev_parse("HEAD"), at, "the standing pick was disturbed");
+        g.cherry_pick_abort().expect("aborts");
+    }
+
+    #[test]
+    fn reset_author_leaves_the_standing_tree_exactly_where_it_was() {
+        // The trap this verb exists to avoid: a bare `--amend` would fold
+        // `staged.txt` into HEAD, so a keypress meant to fix a name would
+        // commit somebody's work in progress. `--only` is what keeps the
+        // staged path staged and HEAD's tree exactly what it was.
+        let r = Scratch::new("reset-author-dirty");
+        r.write("f.txt", b"x\n");
+        r.git(&["add", "-A"]);
+        r.git(&[
+            "commit",
+            "-qm",
+            "mine",
+            "--author=Someone Else <else@example.com>",
+        ]);
+        r.write("staged.txt", b"queued\n");
+        r.git(&["add", "staged.txt"]);
+        r.write("loose.txt", b"not yet\n");
+        let g = r.open();
+        let before = r.rev_parse("HEAD");
+
+        g.reset_author().expect("re-authors past the dirt");
+        assert_ne!(r.rev_parse("HEAD"), before, "the commit was replaced");
+        let tree = g.status().unwrap();
+        assert_eq!(tree.staged.len(), 1, "the staged file moved: {tree:?}");
+        assert_eq!(tree.untracked.len(), 1, "the loose file moved: {tree:?}");
+        assert_eq!(
+            g.log(5).unwrap()[0].subject,
+            "mine",
+            "the message stood still"
+        );
+        let tracked = String::from_utf8(r.git_os_out(&[
+            "ls-tree".into(),
+            "--name-only".into(),
+            "HEAD".into(),
+        ]))
+        .unwrap();
+        assert_eq!(
+            tracked.trim(),
+            "f.txt",
+            "the staged file was folded into HEAD"
+        );
+    }
+
+    #[test]
+    fn a_hard_reset_onto_the_root_shortens_history_to_one() {
+        // The root is a legal reset target like any other commit — the one
+        // edge where the branch keeps a commit but loses every descendant.
+        let r = Scratch::new("reset-to-root");
+        r.write("f.txt", b"first\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "root"]);
+        let root = r.rev_parse("HEAD");
+        for n in ["second", "third"] {
+            r.write("f.txt", format!("{n}\n").as_bytes());
+            r.git(&["add", "-A"]);
+            r.git(&["commit", "-qm", n]);
+        }
+        let g = r.open();
+        assert_eq!(g.log(5).unwrap().len(), 3);
+
+        g.reset(ResetMode::Hard, root.as_bytes()).expect("resets");
+        assert_eq!(g.log(5).unwrap().len(), 1, "history did not shorten");
+        assert_eq!(r.rev_parse("HEAD"), root);
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(),
+            b"first\n",
+            "the working tree did not follow"
+        );
+        assert_eq!(g.status().unwrap().staged.len(), 0, "and nothing is staged");
+    }
+
+    #[test]
+    fn reverting_the_root_commit_leaves_an_empty_tree() {
+        // The root has no parent to diff against, but its inverse is still
+        // well-defined: everything it added, removed.
+        let r = Scratch::new("revert-root");
+        r.write("f.txt", b"only\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "root"]);
+        let g = r.open();
+
+        g.revert(b"HEAD").expect("reverts the root");
+        let log = g.log(5).unwrap();
+        assert_eq!(log.len(), 2);
+        assert!(!join_raw(&r.0, b"f.txt").exists(), "the file is gone");
+        let tree = g.status().unwrap();
+        assert_eq!(
+            tree.staged.len() + tree.unstaged.len(),
+            0,
+            "the undo committed itself"
+        );
+    }
+
+    #[test]
+    fn a_merge_commit_is_not_reverted_or_picked_without_a_parent() {
+        // `-m` names which parent the inverse is taken against; these verbs
+        // do not take one — a merge through them is git's refusal, verbatim,
+        // and the history it would have rewritten stands still. The
+        // mainline-aware variants are a later slice's work, said here so the
+        // refusal is a documented gap and not a mystery.
+        let r = Scratch::new("merge-no-mainline");
+        r.write("f.txt", b"base\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "base"]);
+        r.git(&["checkout", "-qb", "side"]);
+        r.write("f.txt", b"side\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "side"]);
+        r.git(&["checkout", "-q", "main"]);
+        r.write("g.txt", b"main\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "main"]);
+        r.git(&["merge", "--no-ff", "-qm", "merge", "side"]);
+        let g = r.open();
+        let merge = r.rev_parse("HEAD");
+        assert_eq!(g.log(5).unwrap().len(), 4);
+
+        let e = g.revert(merge.as_bytes()).unwrap_err();
+        assert!(e.contains("-m"), "{e}");
+        let e = g.cherry_pick(merge.as_bytes()).unwrap_err();
+        assert!(!e.is_empty(), "git refused the pick too");
+        // The failed pick leaves no sequencer behind: a refusal is not a
+        // state, and the lifecycle has nothing to carry.
+        assert!(!g.cherry_pick_in_progress());
+        assert_eq!(r.rev_parse("HEAD"), merge, "history stood still");
+    }
+
     #[test]
     fn an_amend_replaces_head_with_new_message_and_staged_content() {
         let r = two_commits("amend-roundtrip");
@@ -7612,6 +11193,136 @@ mod tests {
     }
 
     #[test]
+    fn a_pushed_tag_lands_on_the_remote_not_a_branch_of_the_same_name() {
+        let origin = Scratch::bare("tag-push-origin");
+        let r = Scratch::new("tag-push");
+        r.write("seed.txt", b"seed\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "seed"]);
+        r.git(&["branch", "v1"]);
+        r.git(&["tag", "v1"]);
+        r.git(&[
+            "remote",
+            "add",
+            "origin",
+            &format!("{}", origin.0.display()),
+        ]);
+
+        r.open().push_tag(b"origin", b"v1").expect("the tag pushes");
+
+        assert_eq!(
+            origin.rev_parse("refs/tags/v1"),
+            r.rev_parse("refs/tags/v1"),
+            "the tag arrived"
+        );
+        assert!(
+            origin
+                .git_os_out(&["for-each-ref".into(), "refs/heads/v1".into()])
+                .is_empty(),
+            "the branch of the same name stayed home"
+        );
+    }
+
+    #[test]
+    fn deleting_a_remote_branch_leaves_the_local_branch_standing() {
+        let origin = Scratch::bare("remote-delete-origin");
+        let r = Scratch::new("remote-delete");
+        r.write("seed.txt", b"seed\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "seed"]);
+        r.git(&["branch", "doomed"]);
+        r.git(&[
+            "remote",
+            "add",
+            "origin",
+            &format!("{}", origin.0.display()),
+        ]);
+        r.git(&["push", "-q", "origin", "doomed"]);
+
+        r.open()
+            .delete_remote_branch(b"origin", b"doomed")
+            .expect("the remote branch deletes");
+
+        assert!(
+            origin
+                .git_os_out(&["for-each-ref".into(), "refs/heads/doomed".into()])
+                .is_empty(),
+            "the remote ref is gone"
+        );
+        assert_eq!(
+            r.rev_parse("refs/heads/doomed"),
+            r.rev_parse("HEAD"),
+            "the local branch never moved"
+        );
+    }
+
+    #[test]
+    fn move_head_walks_back_a_commit_and_leaves_tree_and_index() {
+        let r = Scratch::new("move-head");
+        r.write("f.txt", b"one\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "one"]);
+        r.write("f.txt", b"two\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "two"]);
+        // Uncommitted work on both sides of the index: the promise is that
+        // neither moves — bytes below, staged and unstaged alike.
+        r.write("f.txt", b"two-and-a-half\n");
+        r.git(&["add", "-A"]);
+        r.write("f.txt", b"two-and-three-quarters\n");
+
+        let g = r.open();
+        let back = r.rev_parse("HEAD~1");
+        g.move_head(back.as_bytes(), "gitten: undo")
+            .expect("the walk back");
+
+        assert_eq!(r.rev_parse("HEAD"), back, "the branch moved");
+        assert_eq!(r.rev_parse("HEAD"), r.rev_parse("main"));
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(),
+            b"two-and-three-quarters\n",
+            "the working tree is untouched"
+        );
+        assert_eq!(
+            r.git_os_out(&["diff".into(), "--cached".into(), "--name-only".into()]),
+            b"f.txt\n".as_slice(),
+            "the index still holds what was staged"
+        );
+    }
+
+    #[test]
+    fn move_head_writes_the_sentence_it_was_given() {
+        let r = Scratch::new("move-head-message");
+        r.write("f.txt", b"one\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "one"]);
+
+        let g = r.open();
+        let back = r.rev_parse("HEAD");
+        r.write("f.txt", b"two\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "two"]);
+        g.move_head(back.as_bytes(), "gitten: undo")
+            .expect("the walk back");
+
+        let log = g.reflog(1).expect("the reflog reads");
+        assert_eq!(log[0].message, "gitten: undo", "the exact sentence");
+        assert_eq!(log[0].selector, "HEAD@{0}");
+    }
+
+    #[test]
+    fn move_head_refuses_a_dash_revision() {
+        let r = Scratch::new("move-head-dash");
+        r.write("f.txt", b"one\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "one"]);
+        let before = r.rev_parse("HEAD");
+        let e = r.open().move_head(b"-x", "gitten: undo").unwrap_err();
+        assert!(e.contains("never begins"), "{e}");
+        assert_eq!(r.rev_parse("HEAD"), before, "nothing moved");
+    }
+
+    #[test]
     fn a_fast_forward_pull_moves_the_branch_and_the_tree() {
         let (r, origin) = upstream_fixture("sync-ff");
         // The other machine moves; this side has not.
@@ -7663,6 +11374,466 @@ mod tests {
             std::fs::read(join_raw(&r.0, b"ours.txt")).unwrap(),
             b"ours\n"
         );
+    }
+
+    // --------------------------------------------------------- operations
+    // Merge, rebase, cherry-pick and revert stopping mid-flight: state on
+    // disk a *later* client must see, sides a human must choose, and
+    // continue/abort/skip semantics that are git's, not ours.
+
+    /// A repository with `ours`/`theirs` branches having diverged over one
+    /// file, so `git merge theirs` stops with exactly one conflicted path.
+    fn conflicted_merge(name: &str) -> Scratch {
+        let r = Scratch::new(name);
+        r.write("f.txt", b"base\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "base"]);
+        r.git(&["checkout", "-qb", "theirs"]);
+        r.write("f.txt", b"theirs\n");
+        r.git(&["commit", "-aqm", "theirs"]);
+        r.git(&["checkout", "-q", "main"]);
+        r.write("f.txt", b"ours\n");
+        r.git(&["commit", "-aqm", "ours"]);
+        r.git_failing(&["merge", "theirs"]);
+        r
+    }
+
+    #[test]
+    fn a_stopped_merge_reports_its_kind_and_its_unmerged_count() {
+        let r = conflicted_merge("operation-merge");
+        let g = r.open();
+        let operation = g.operation().expect("a merge is standing");
+        assert_eq!(operation.kind, gitten_core::operation::Kind::Merge);
+        assert_eq!(operation.conflicts, 1);
+        assert!(g.merge_in_progress());
+        // Only one kind stands, and the others say so:
+        assert!(!g.rebase_in_progress());
+        assert!(!g.cherry_pick_in_progress());
+        assert!(!g.revert_in_progress());
+        assert!(!operation.can_skip(), "a merge has no skip");
+    }
+
+    #[test]
+    fn an_externally_started_merge_is_seen_by_a_fresh_client() {
+        // The state came from git itself, not from any Repo method: the
+        // detection is disk truth, so a client opened later sees it.
+        let r = conflicted_merge("operation-external");
+        let seen = r.open().operation().expect("the standing merge");
+        assert_eq!(seen.kind, gitten_core::operation::Kind::Merge);
+    }
+
+    #[test]
+    fn a_second_merge_refuses_while_one_stands() {
+        let r = conflicted_merge("operation-second-merge");
+        let err = r.open().merge(b"theirs", false).unwrap_err();
+        assert!(
+            err.contains("a merge is in progress"),
+            "the refusal names the way out: {err}"
+        );
+    }
+
+    #[test]
+    fn a_merge_resolved_ours_and_continued_makes_the_merge_commit() {
+        let r = conflicted_merge("operation-merge-ours");
+        let g = r.open();
+        g.resolve(b"f.txt", Side::Ours).expect("resolve");
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(),
+            b"ours\n",
+            "ours' bytes are the answer"
+        );
+        g.merge_continue().expect("continue");
+        assert!(g.operation().is_none(), "the merge is over");
+        // A real merge commit: two parents, and the tree holds our side.
+        let parents = String::from_utf8(r.git_os_out(&[
+            "rev-list".into(),
+            "--parents".into(),
+            "-n".into(),
+            "1".into(),
+            "HEAD".into(),
+        ]))
+        .unwrap();
+        assert_eq!(parents.split_whitespace().count(), 3, "HEAD + two parents");
+        assert_eq!(std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(), b"ours\n");
+    }
+
+    #[test]
+    fn a_merge_resolved_both_carries_both_sides_into_the_commit() {
+        let r = conflicted_merge("operation-merge-both");
+        let g = r.open();
+        g.resolve(b"f.txt", Side::Both).expect("resolve");
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(),
+            b"ours\ntheirs\n",
+            "stage 2 then stage 3, one boundary"
+        );
+        g.merge_continue().expect("continue");
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(),
+            b"ours\ntheirs\n"
+        );
+    }
+
+    #[test]
+    fn a_merge_resolved_theirs_takes_the_other_side() {
+        let r = conflicted_merge("operation-merge-theirs");
+        let g = r.open();
+        g.resolve(b"f.txt", Side::Theirs).expect("resolve");
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(),
+            b"theirs\n"
+        );
+        g.merge_continue().expect("continue");
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(),
+            b"theirs\n"
+        );
+    }
+
+    #[test]
+    fn a_merge_resolved_keep_records_the_working_tree() {
+        let r = conflicted_merge("operation-merge-keep");
+        let g = r.open();
+        // A human's own answer, conflict markers and all: Keep records it,
+        // it does not second-guess it.
+        std::fs::write(join_raw(&r.0, b"f.txt"), b"hand-written\n").unwrap();
+        g.resolve(b"f.txt", Side::Keep).expect("resolve");
+        g.merge_continue().expect("continue");
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(),
+            b"hand-written\n"
+        );
+    }
+
+    #[test]
+    fn a_merge_abort_puts_everything_back_where_it_started() {
+        let r = conflicted_merge("operation-merge-abort");
+        let ours = r.rev_parse("HEAD");
+        r.open().merge_abort().expect("abort");
+        assert_eq!(r.rev_parse("HEAD"), ours);
+        assert_eq!(std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(), b"ours\n");
+        assert!(r.open().operation().is_none());
+    }
+
+    #[test]
+    fn a_squash_merge_stages_the_collision_and_offers_no_continue() {
+        // A branch whose change does not conflict: the squash stages it and
+        // commits nothing — which is why there is no merge state standing.
+        let r = Scratch::new("operation-squash");
+        r.write("f.txt", b"base\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "base"]);
+        r.git(&["checkout", "-qb", "side"]);
+        r.write("g.txt", b"side\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "side"]);
+        r.git(&["checkout", "-q", "main"]);
+        r.open().merge(b"side", true).expect("squash");
+        assert!(
+            r.open().operation().is_none(),
+            "a squash leaves no merge state"
+        );
+        // The collision is staged and uncommitted.
+        let staged = r
+            .open()
+            .status()
+            .unwrap()
+            .staged
+            .iter()
+            .any(|e| e.path.as_bytes() == b"g.txt");
+        assert!(staged, "the squash staged side's file");
+        let err = r.open().merge_continue().unwrap_err();
+        assert!(
+            err.to_lowercase().contains("merge"),
+            "git names the missing MERGE_HEAD: {err}"
+        );
+    }
+
+    #[test]
+    fn a_rebase_stopped_on_a_conflict_skips_the_stopped_commit() {
+        let r = Scratch::new("operation-rebase-skip");
+        r.write("f.txt", b"base\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "base"]);
+        r.git(&["checkout", "-qb", "topic"]);
+        r.write("f.txt", b"topic\n");
+        r.git(&["commit", "-aqm", "topic one"]);
+        r.write("other.txt", b"other\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "topic two"]);
+        r.git(&["checkout", "-q", "main"]);
+        r.write("f.txt", b"main\n");
+        r.git(&["commit", "-aqm", "main moves f"]);
+        r.git(&["checkout", "-q", "topic"]);
+        r.git_failing(&["rebase", "main"]);
+
+        let g = r.open();
+        let operation = g.operation().expect("the rebase is standing");
+        assert_eq!(operation.kind, gitten_core::operation::Kind::Rebase);
+        assert!(operation.can_skip(), "a rebase has a skip");
+
+        g.rebase_skip().expect("skip");
+        assert!(g.operation().is_none(), "the rebase finished");
+        // The skipped commit's changes are gone; the next commit's arrived.
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(),
+            b"main\n",
+            "topic one left the branch"
+        );
+        assert!(join_raw(&r.0, b"other.txt").exists(), "topic two replayed");
+    }
+
+    #[test]
+    fn a_revert_stopped_on_a_conflict_resolves_theirside_and_continues() {
+        let r = Scratch::new("operation-revert");
+        r.write("f.txt", b"one\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "one"]);
+        let one = r.rev_parse("HEAD");
+        r.write("f.txt", b"one\ntwo\n");
+        r.git(&["commit", "-aqm", "two"]);
+        // Reverting 'one' wants the file gone; the tree since edited it.
+        r.git_failing(&["revert", &one]);
+
+        let g = r.open();
+        let operation = g.operation().expect("the revert is standing");
+        assert_eq!(operation.kind, gitten_core::operation::Kind::Revert);
+        assert!(!operation.can_skip());
+
+        // Theirs is the revert's own answer: the file's removal. Our side's
+        // stage does not exist for the deletion, so the rm records it.
+        g.resolve(b"f.txt", Side::Theirs).expect("resolve");
+        assert!(!join_raw(&r.0, b"f.txt").exists());
+        g.revert_continue().expect("continue");
+        assert!(g.operation().is_none());
+        // The inverse commit: 'one' is no longer in the tree's files.
+        let content = String::from_utf8(r.git_os_out(&[
+            "ls-tree".into(),
+            "--name-only".into(),
+            "HEAD".into(),
+        ]))
+        .unwrap();
+        assert!(
+            !content.lines().any(|line| line == "f.txt"),
+            "the reverted file is gone from the tree"
+        );
+    }
+
+    #[test]
+    fn a_cherry_pick_conflict_resolves_ours_and_continues() {
+        let r = Scratch::new("operation-cherry-pick");
+        r.write("f.txt", b"base\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "base"]);
+        r.git(&["checkout", "-qb", "side"]);
+        r.write("f.txt", b"side\n");
+        r.git(&["commit", "-aqm", "side edit"]);
+        let pick = r.rev_parse("HEAD");
+        r.git(&["checkout", "-q", "main"]);
+        r.write("f.txt", b"main\n");
+        r.git(&["commit", "-aqm", "main edit"]);
+        r.open().cherry_pick(pick.as_bytes()).unwrap_err();
+
+        let g = r.open();
+        let operation = g.operation().expect("the pick is standing");
+        assert_eq!(operation.kind, gitten_core::operation::Kind::CherryPick);
+        // Both sides: a resolution that changes the tree, so the continued
+        // pick is a real commit and not the empty one git refuses to make.
+        g.resolve(b"f.txt", Side::Both).expect("resolve");
+        g.cherry_pick_continue().expect("continue");
+        assert!(g.operation().is_none());
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(),
+            b"main\nside\n"
+        );
+    }
+
+    /// A merge that stopped on a two-region conflict in `f.txt` and a
+    /// second conflicted file `other.txt` — the world the region answers
+    /// are aimed at, where answering one file must not resolve the other.
+    fn two_region_conflict(name: &str) -> Scratch {
+        // A five-line gap between the edits: git folds two conflicts whose
+        // unchanged gap is too small into one region, and this fixture is
+        // about two regions.
+        let r = Scratch::new(name);
+        r.write("f.txt", b"top\nmid1\nmid2\nmid3\nmid4\nmid5\ntail\n");
+        r.write("other.txt", b"same on both sides\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "base"]);
+        r.git(&["checkout", "-qb", "theirs"]);
+        r.write(
+            "f.txt",
+            b"top\ntheirs one\nmid1\nmid2\nmid3\nmid4\nmid5\ntheirs two\ntail\n",
+        );
+        r.write("other.txt", b"changed by theirs\n");
+        r.git(&["commit", "-aqm", "theirs"]);
+        r.git(&["checkout", "-q", "main"]);
+        r.write(
+            "f.txt",
+            b"top\nours one\nmid1\nmid2\nmid3\nmid4\nmid5\nours two\ntail\n",
+        );
+        r.write("other.txt", b"changed by ours\n");
+        r.git(&["commit", "-aqm", "ours"]);
+        r.git_failing(&["merge", "theirs"]);
+        r
+    }
+
+    #[test]
+    fn region_answers_write_the_combined_file_and_stage_it() {
+        let r = two_region_conflict("merge-hunks-answers");
+        let g = r.open();
+        // The parse is what git wrote, two regions, no base (no diff3).
+        let file = g.conflict_file(b"f.txt").expect("the conflicted file");
+        assert_eq!(file.regions.len(), 2);
+        let stages = g.unmerged(b"f.txt").expect("the stages");
+        assert_eq!(
+            stages.iter().map(|s| s.stage).collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "base, ours and theirs are what a merge holds"
+        );
+
+        // Ours in region one; region two keeps its markers.
+        g.resolve_hunks(b"f.txt", &[(0, gitten_core::conflict::Answer::Ours)])
+            .expect("the answer");
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(),
+            b"top\nours one\nmid1\nmid2\nmid3\nmid4\nmid5\n<<<<<<< HEAD\nours two\n=======\ntheirs two\n>>>>>>> theirs\ntail\n",
+        );
+        // Staged, and no longer unmerged: git's own shape for a path whose
+        // stages collapsed under `git add`.
+        let status =
+            String::from_utf8(r.git_os_out(&["status".into(), "--porcelain".into()])).unwrap();
+        assert!(
+            status.contains("M  f.txt"),
+            "the answered file is staged: {status:?}"
+        );
+        assert!(g.unmerged(b"f.txt").unwrap().is_empty());
+
+        // The other conflicted file was not touched by f.txt's answer.
+        assert_eq!(g.unmerged(b"other.txt").unwrap().len(), 3);
+    }
+
+    #[test]
+    fn a_nested_file_refuses_hunk_answers_and_keeps_its_bytes() {
+        // Real git never writes nested markers, so the scratch conflict's
+        // file is overwritten by hand; the unmerged stages are left
+        // standing, which is exactly the merge-inside-a-rebase state.
+        let r = two_region_conflict("merge-hunks-nested");
+        let nested: &[u8] = b"<<<<<<<<< outer\nouter ours\n<<<<<<< inner\ninner ours\n=======\ninner theirs\n>>>>>>> inner\nouter theirs\n=========\nouter theirs side\n>>>>>>>>> outer\n";
+        r.write("f.txt", nested);
+        let g = r.open();
+        let file = g.conflict_file(b"f.txt").expect("the conflicted file");
+        assert!(file.is_nested(), "the fixture is not nested: {file:?}");
+        let err = g
+            .resolve_hunks(b"f.txt", &[(0, gitten_core::conflict::Answer::Ours)])
+            .unwrap_err();
+        assert!(err.contains("resolve it whole"), "{err:?}");
+        // A refusal changes nothing: the bytes are the conflict still,
+        // and the stages still stand.
+        assert_eq!(std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(), nested);
+        assert_eq!(g.unmerged(b"f.txt").unwrap().len(), 3);
+    }
+
+    #[test]
+    fn an_undo_puts_the_bytes_and_the_stages_back() {
+        let r = two_region_conflict("merge-hunks-undo");
+        let g = r.open();
+        let before = g.conflict_file(b"f.txt").unwrap();
+        let stages = g.unmerged(b"f.txt").unwrap();
+
+        g.resolve_hunks(b"f.txt", &[(0, gitten_core::conflict::Answer::Both)])
+            .expect("the answer");
+        assert!(g.unmerged(b"f.txt").unwrap().is_empty());
+
+        g.restore_conflict(b"f.txt", before.bytes.clone(), &stages)
+            .expect("the undo");
+        // The bytes are the conflict again, byte for byte, and the stages
+        // are in the index — the path is unmerged in git's own eyes, which
+        // `git status` spells `UU`.
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(),
+            before.bytes,
+        );
+        assert_eq!(g.unmerged(b"f.txt").unwrap().len(), 3);
+        let status =
+            String::from_utf8(r.git_os_out(&["status".into(), "--porcelain".into()])).unwrap();
+        assert!(
+            status.contains("UU f.txt"),
+            "the undo re-merged: {status:?}"
+        );
+    }
+
+    #[test]
+    fn a_stale_region_answer_refuses_before_anything_is_written() {
+        let r = two_region_conflict("merge-hunks-stale");
+        let g = r.open();
+        let before = g.conflict_file(b"f.txt").unwrap();
+        let err = g
+            .resolve_hunks(b"f.txt", &[(5, gitten_core::conflict::Answer::Ours)])
+            .unwrap_err();
+        assert!(
+            err.contains("moved under the keyboard"),
+            "the refusal names the staleness: {err}"
+        );
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(),
+            before.bytes,
+            "a refused answer wrote nothing"
+        );
+        assert_eq!(g.unmerged(b"f.txt").unwrap().len(), 3);
+    }
+
+    #[test]
+    fn a_file_whose_markers_are_gone_refuses_region_answers() {
+        let r = two_region_conflict("merge-hunks-resolved");
+        let g = r.open();
+        g.resolve_hunks(b"f.txt", &[(0, gitten_core::conflict::Answer::Ours)])
+            .expect("the first answer");
+        g.resolve_hunks(b"f.txt", &[(0, gitten_core::conflict::Answer::Ours)])
+            .expect("the second answer");
+        let err = g
+            .resolve_hunks(b"f.txt", &[(0, gitten_core::conflict::Answer::Ours)])
+            .unwrap_err();
+        assert!(
+            err.contains("no conflict markers"),
+            "the refusal says the file is whole: {err}"
+        );
+    }
+
+    #[test]
+    fn a_delete_modify_side_takes_the_rm_only_where_the_stage_is_gone() {
+        // Theirs deleted the file; ours edited it. `DU` in git's own
+        // spelling: stage 2 exists, stage 3 does not.
+        let r = Scratch::new("merge-hunks-delete-modify");
+        r.write("f.txt", b"base\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "base"]);
+        r.git(&["checkout", "-qb", "theirs"]);
+        r.git(&["rm", "-q", "f.txt"]);
+        r.git(&["commit", "-aqm", "theirs deleted it"]);
+        r.git(&["checkout", "-q", "main"]);
+        r.write("f.txt", b"ours kept it\n");
+        r.git(&["commit", "-aqm", "ours edited it"]);
+        r.git_failing(&["merge", "theirs"]);
+
+        let g = r.open();
+        let stages = g.unmerged(b"f.txt").unwrap();
+        assert_eq!(
+            stages.iter().map(|s| s.stage).collect::<Vec<_>>(),
+            vec![1, 2],
+            "base and ours exist; theirs' deletion has no stage"
+        );
+        // Ours' stage exists: checkout answers, and no rm ever runs.
+        g.resolve(b"f.txt", Side::Ours).expect("resolve ours");
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(),
+            b"ours kept it\n",
+        );
+        // Theirs' answer *is* the deletion — and by now the first answer
+        // collapsed the stages, so the rider falls to the rm on a file
+        // that is there to remove.
+        g.resolve(b"f.txt", Side::Theirs).expect("resolve theirs");
+        assert!(!join_raw(&r.0, b"f.txt").exists());
     }
 
     #[test]
@@ -7803,7 +11974,7 @@ mod tests {
 
     // ------------------------------------------------------------- the rebase
 
-    use gitten_core::rebase::{Action, Line, Rewrite, TodoScript};
+    use gitten_core::rebase::{Action, Line, Plan, Rewrite, TodoScript};
 
     /// A straight line of work over separate files: `base`, then three
     /// commits each adding its own file, so a rewrite that loses content
@@ -8143,7 +12314,7 @@ mod tests {
     }
 
     #[test]
-    fn reword_and_edit_are_refused_before_any_process_runs() {
+    fn a_bare_reword_is_refused_before_any_process_runs() {
         let r = linear_repo("rebase-reword");
         let before = r.rev_parse("HEAD");
         let g = r.open();
@@ -8157,6 +12328,412 @@ mod tests {
         // Nothing started: no state directory, HEAD where it was.
         assert!(!g.rebase_in_progress(), "the refusal predated any process");
         assert_eq!(r.rev_parse("HEAD"), before);
+    }
+
+    /// The loaded window a plan is built over — the same read a log pane
+    /// makes, so a test's plan is composed over exactly what a user's is.
+    fn window(r: &Scratch) -> Vec<Commit> {
+        r.open().log(50).expect("a log")
+    }
+
+    /// Every commit's author name, newest first.
+    fn authors(r: &Scratch) -> Vec<String> {
+        let out = r.git_os_out(&["log".into(), "--format=%an".into(), "--topo-order".into()]);
+        String::from_utf8_lossy(&out)
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn a_planned_reword_replaces_one_message_and_moves_nothing_else() {
+        let r = linear_repo("plan-reword");
+        let g = r.open();
+        let commits = window(&r);
+        let mut plan = Plan::over(&commits, 1).expect("a straight window");
+        // The row below HEAD — `two` — reworded, with the message this
+        // client already holds. git's own `reword` would open an editor for
+        // exactly these bytes.
+        plan.set_message(1, b"two, said properly\n".to_vec())
+            .expect("a message");
+        g.rebase_plan(&plan).expect("the plan runs");
+
+        assert_eq!(
+            subjects(&r),
+            vec!["three", "two, said properly", "one", "base"],
+            "one message changed and the order did not"
+        );
+        // And the content is all still there: a reword rewrites a message,
+        // never a tree.
+        for file in ["base.txt", "one.txt", "two.txt", "three.txt"] {
+            assert!(r.0.join(file).exists(), "{file} left the tree");
+        }
+        assert!(!g.rebase_in_progress(), "the rebase finished");
+    }
+
+    #[test]
+    fn a_planned_reword_on_a_detached_head_moves_the_detached_head() {
+        // The analog the graft guard deliberately does not cover: the
+        // todo path never detaches and restores, it runs `git rebase`
+        // with HEAD implicit — and git moves a detached HEAD onto the
+        // replayed tip itself. No dangling replacement, no byte-identical
+        // no-op: the position visibly moves to the rewritten history.
+        let r = linear_repo("plan-detached");
+        let at = r.rev_parse("HEAD");
+        r.git(&["checkout", "-q", &at]);
+        let g = r.open();
+        let commits = window(&r);
+        let mut plan = Plan::over(&commits, 1).expect("a straight window");
+        plan.set_message(1, b"two, said properly\n".to_vec())
+            .expect("a message");
+        g.rebase_plan(&plan).expect("the plan runs");
+        assert_eq!(
+            subjects(&r),
+            vec!["three", "two, said properly", "one", "base"],
+            "the reword landed"
+        );
+        assert_ne!(
+            r.rev_parse("HEAD"),
+            at,
+            "the detached HEAD rode the replay instead of dangling"
+        );
+        assert!(!g.rebase_in_progress(), "the rebase finished");
+    }
+
+    #[test]
+    fn a_planned_drop_and_reorder_rewrite_the_line_they_cover() {
+        let r = linear_repo("plan-drop-reorder");
+        let g = r.open();
+        let commits = window(&r);
+        let mut plan = Plan::over(&commits, 1).expect("a window");
+        plan.set_action(0, Action::Drop).expect("a drop");
+        g.rebase_plan(&plan).expect("the plan runs");
+        assert_eq!(subjects(&r), vec!["two", "one", "base"]);
+        assert!(!r.0.join("three.txt").exists(), "the dropped file stayed");
+
+        // And a reorder over what is left: the two newest swap places.
+        let commits = window(&r);
+        let mut plan = Plan::over(&commits, 1).expect("a window");
+        assert_eq!(plan.move_down(0), Ok(1));
+        g.rebase_plan(&plan).expect("the plan runs");
+        assert_eq!(subjects(&r), vec!["one", "two", "base"]);
+        // Both files survive the swap — a reorder moves commits, not work.
+        for file in ["one.txt", "two.txt"] {
+            assert!(r.0.join(file).exists(), "{file} left the tree");
+        }
+    }
+
+    #[test]
+    fn a_planned_fold_keeps_both_messages_and_a_fixup_keeps_one() {
+        let r = linear_repo("plan-fold");
+        let g = r.open();
+        let commits = window(&r);
+        let mut plan = Plan::over(&commits, 1).expect("a window");
+        plan.set_action(0, Action::Squash).expect("a fold");
+        g.rebase_plan(&plan).expect("the plan runs");
+        assert_eq!(subjects(&r), vec!["two", "one", "base"]);
+        let body = body_of(&r, "HEAD");
+        assert!(body.contains("two"), "{body}");
+        assert!(
+            body.contains("three"),
+            "the folded message went missing: {body}"
+        );
+        assert!(
+            r.0.join("three.txt").exists(),
+            "the folded work went missing"
+        );
+
+        // The fixup keeps the change and drops the message.
+        let r = linear_repo("plan-fixup");
+        let g = r.open();
+        let commits = window(&r);
+        let mut plan = Plan::over(&commits, 1).expect("a window");
+        plan.set_action(0, Action::Fixup).expect("a fold");
+        g.rebase_plan(&plan).expect("the plan runs");
+        assert_eq!(subjects(&r), vec!["two", "one", "base"]);
+        assert!(
+            !body_of(&r, "HEAD").contains("three"),
+            "the message survived"
+        );
+        assert!(r.0.join("three.txt").exists());
+    }
+
+    #[test]
+    fn an_edit_entry_stops_the_rebase_and_the_lifecycle_carries_it_on() {
+        let r = linear_repo("plan-edit");
+        let g = r.open();
+        let commits = window(&r);
+        let mut plan = Plan::over(&commits, 1).expect("a window");
+        plan.set_action(1, Action::Edit).expect("an edit");
+        assert!(plan.pauses(), "the plan says it will stop");
+
+        // It exits clean and leaves the rebase standing: that pause is a
+        // state, not a failure, and it is the state W5's banner draws.
+        g.rebase_plan(&plan).expect("the plan runs");
+        assert!(g.rebase_in_progress(), "the edit did not stop the rebase");
+        assert_eq!(
+            String::from_utf8_lossy(&r.git_os_out(&[
+                "log".into(),
+                "-1".into(),
+                "--format=%s".into()
+            ]))
+            .trim(),
+            "two",
+            "the rebase stopped on the commit the plan named"
+        );
+
+        // A human amends and carries on, exactly as the lifecycle keys do.
+        r.write("extra.txt", b"extra\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-q", "--amend", "--no-edit"]);
+        g.rebase_continue().expect("continue");
+        assert!(!g.rebase_in_progress(), "the rebase never finished");
+        assert_eq!(subjects(&r), vec!["three", "two", "one", "base"]);
+        assert!(
+            r.0.join("extra.txt").exists(),
+            "the amendment was replayed over"
+        );
+    }
+
+    #[test]
+    fn a_commit_deeper_than_head_is_reauthored_through_the_plan() {
+        let r = Scratch::new("plan-reauthor");
+        r.write("base.txt", b"base\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "base"]);
+        r.write("mid.txt", b"mid\n");
+        r.git(&["add", "-A"]);
+        r.git(&[
+            "commit",
+            "-qm",
+            "mid",
+            "--author=Someone Else <else@example.com>",
+        ]);
+        r.write("tip.txt", b"tip\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "tip"]);
+        assert_eq!(authors(&r)[1], "Someone Else", "the fixture set the stage");
+        let before = authors(&r);
+
+        let g = r.open();
+        let commits = window(&r);
+        let mut plan = Plan::over(&commits, 1).expect("a window");
+        plan.set_amend(1, gitten_core::rebase::Amend::ResetAuthor)
+            .expect("an amendment");
+        g.rebase_plan(&plan).expect("the plan runs");
+
+        // The amended commit takes the identity git itself would use — the
+        // repository's own configuration, since the rebase runs as its own
+        // process — and its neighbours keep the authors they had.
+        let after = authors(&r);
+        assert_eq!(after[1], "gitten-test", "the deep commit kept its author");
+        assert_eq!(
+            (&after[0], &after[2]),
+            (&before[0], &before[2]),
+            "a neighbour's author moved too"
+        );
+        assert_eq!(subjects(&r), vec!["tip", "mid", "base"]);
+        for file in ["base.txt", "mid.txt", "tip.txt"] {
+            assert!(r.0.join(file).exists(), "{file} left the tree");
+        }
+    }
+
+    #[test]
+    fn a_fold_that_keeps_its_own_message_runs_or_says_why_it_cannot() {
+        let r = linear_repo("plan-fixup-keep");
+        let g = r.open();
+        let commits = window(&r);
+        let mut plan = Plan::over(&commits, 1).expect("a window");
+        plan.set_fixup_keeping_message(0).expect("a fold");
+        assert!(plan.keeps_a_message());
+
+        match g.rebase_plan(&plan) {
+            Ok(()) => {
+                // git 2.32 or newer: the newest commit folds into its
+                // parent and the *folded* commit's message is what stands.
+                assert_eq!(subjects(&r), vec!["three", "one", "base"]);
+                assert!(
+                    r.0.join("two.txt").exists() && r.0.join("three.txt").exists(),
+                    "the fold lost work"
+                );
+            }
+            Err(e) => {
+                // Older git: refused before anything started, naming the
+                // version and the answer that does work here.
+                assert!(e.contains("2.32"), "{e}");
+                assert!(e.contains("squash"), "the way out is named: {e}");
+                assert!(!g.rebase_in_progress(), "a refusal started something");
+                assert_eq!(subjects(&r), vec!["three", "two", "one", "base"]);
+            }
+        }
+    }
+
+    #[test]
+    fn an_empty_commit_in_the_window_survives_the_rewrite_around_it() {
+        // A commit with no changes is still somebody's commit — a marker, a
+        // trigger, an `--allow-empty` on purpose — and a rewrite that
+        // quietly swallowed one would be a rewrite that dropped a commit
+        // nobody asked it to.
+        let r = Scratch::new("plan-empty-commit");
+        r.write("base.txt", b"base\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "base"]);
+        r.git(&["commit", "-q", "--allow-empty", "-m", "nothing"]);
+        r.write("tip.txt", b"tip\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "tip"]);
+
+        let g = r.open();
+        let commits = window(&r);
+        let mut plan = Plan::over(&commits, 1).expect("a window");
+        plan.set_message(0, b"tip, reworded\n".to_vec())
+            .expect("a message");
+        g.rebase_plan(&plan).expect("the plan runs");
+
+        assert_eq!(
+            subjects(&r),
+            vec!["tip, reworded", "nothing", "base"],
+            "the empty commit was swallowed by the rewrite"
+        );
+        assert!(!g.rebase_in_progress());
+    }
+
+    #[test]
+    fn a_dirty_tree_refuses_the_rewrite_in_gits_own_words() {
+        // No autostash, deliberately: stashing work behind a keypress that
+        // said *rebase* hides exactly the state the reader should decide
+        // about. git's own sentence comes back, and nothing moves.
+        let r = linear_repo("plan-dirty");
+        let g = r.open();
+        let before = r.rev_parse("HEAD");
+        r.write("one.txt", b"edited, uncommitted\n");
+
+        let commits = window(&r);
+        let mut plan = Plan::over(&commits, 1).expect("a window");
+        plan.set_action(0, Action::Drop).expect("a drop");
+        let err = g.rebase_plan(&plan).unwrap_err();
+        assert!(
+            err.contains("unstaged") || err.contains("cannot rebase"),
+            "git's own refusal did not come back: {err}"
+        );
+        assert_eq!(r.rev_parse("HEAD"), before, "a refused rebase moved HEAD");
+        assert!(!g.rebase_in_progress(), "a refusal left state standing");
+        assert_eq!(
+            std::fs::read(r.0.join("one.txt")).expect("still there"),
+            b"edited, uncommitted\n",
+            "the uncommitted work was touched"
+        );
+    }
+
+    #[test]
+    fn a_plan_git_would_refuse_is_refused_before_any_process_runs() {
+        let r = linear_repo("plan-refused");
+        let g = r.open();
+        let before = r.rev_parse("HEAD");
+        let commits = window(&r);
+
+        // Every commit dropped is an empty todo, which git refuses — said
+        // here instead, with nothing started.
+        let mut plan = Plan::over(&commits, 1).expect("a window");
+        for i in 0..plan.len() {
+            plan.set_action(i, Action::Drop).expect("a drop");
+        }
+        let err = g.rebase_plan(&plan).unwrap_err();
+        assert!(err.contains("reset to the base"), "{err}");
+        assert!(!g.rebase_in_progress(), "a refusal started something");
+        assert_eq!(r.rev_parse("HEAD"), before);
+
+        // And a reword with no message: the plan knows before git does.
+        let mut plan = Plan::over(&commits, 1).expect("a window");
+        plan.set_action(0, Action::Reword).expect("an action");
+        let err = g.rebase_plan(&plan).unwrap_err();
+        assert!(err.contains("no message"), "{err}");
+        assert_eq!(r.rev_parse("HEAD"), before);
+    }
+
+    #[test]
+    fn rebase_onto_base_replays_only_what_follows_the_marked_commit() {
+        // A trunk, and a side branch of two commits growing off its tip.
+        let r = Scratch::new("rebase-onto-base");
+        r.write("base.txt", b"base\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "base"]);
+        r.git(&["checkout", "-q", "-b", "side"]);
+        for (file, msg) in [("keep.txt", "keep"), ("move.txt", "move")] {
+            r.write(file, b"x\n");
+            r.git(&["add", "-A"]);
+            r.git(&["commit", "-qm", msg]);
+        }
+        let keep = r.rev_parse("HEAD~1");
+        r.git(&["checkout", "-q", "main"]);
+        r.write("trunk.txt", b"trunk\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "trunk"]);
+        r.git(&["checkout", "-q", "side"]);
+
+        // The marked commit is the base and is *exclusive*: only what grew
+        // after it moves, which is the whole reason the mark is worth a key.
+        r.open()
+            .rebase_onto_base(b"main", keep.as_bytes())
+            .expect("rebases");
+        assert_eq!(
+            subjects(&r),
+            vec!["move", "trunk", "base"],
+            "the marked commit stayed behind and its child moved"
+        );
+        assert!(!r.0.join("keep.txt").exists(), "the base commit came along");
+
+        // Both names pass the dash guard before any process runs.
+        let err = r
+            .open()
+            .rebase_onto_base(b"--exec=touch /tmp/x", b"HEAD~1")
+            .unwrap_err();
+        assert!(err.contains("refused"), "{err}");
+    }
+
+    #[test]
+    fn nuking_the_working_tree_keeps_the_commits_and_the_ignored_files() {
+        let r = Scratch::new("nuke");
+        r.write(".gitignore", b"build/\n");
+        r.write("kept.txt", b"committed\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "base"]);
+        let head = r.rev_parse("HEAD");
+
+        r.write("kept.txt", b"edited\n");
+        r.write("new.txt", b"untracked\n");
+        r.write("build/artifact.o", b"expensive\n");
+        r.git(&["add", "kept.txt"]);
+
+        r.open().nuke_worktree().expect("nukes");
+
+        assert_eq!(r.rev_parse("HEAD"), head, "a nuke moved the branch");
+        assert_eq!(
+            std::fs::read(r.0.join("kept.txt")).expect("still there"),
+            b"committed\n",
+            "the staged edit survived the nuke"
+        );
+        assert!(!r.0.join("new.txt").exists(), "the untracked file survived");
+        // Ignored files are not somebody's work: `clean` runs without `-x`,
+        // so half an hour of compilation is not what the key spent.
+        assert!(
+            r.0.join("build/artifact.o").exists(),
+            "the nuke took the ignored build directory with it"
+        );
+        // And the index is clean afterwards.
+        let status = r.open().status().expect("a status");
+        assert!(status.staged.is_empty() && status.unstaged.is_empty());
+        assert!(status.untracked.is_empty(), "{:?}", status.untracked);
+    }
+
+    #[test]
+    fn nuking_an_unborn_branch_cleans_rather_than_failing() {
+        let r = Scratch::new("nuke-unborn");
+        r.write("new.txt", b"untracked\n");
+        // No commit yet: there is no HEAD to reset to, and the clean is the
+        // whole of what an unborn branch's working tree needs.
+        r.open().nuke_worktree().expect("nukes");
+        assert!(!r.0.join("new.txt").exists(), "the untracked file survived");
     }
 
     #[test]
@@ -8394,8 +12971,8 @@ mod tests {
         // so the file answers to a stricter contract than convenience:
         // owner-only however the umask feels, never the same name twice,
         // bytes intact, gone when the caller removes it.
-        let first = write_todo_tmpfile(b"pick 1111111\n".to_vec()).expect("first");
-        let second = write_todo_tmpfile(b"pick 2222222\n".to_vec()).expect("second");
+        let first = write_private_tmpfile("todo", b"pick 1111111\n".to_vec()).expect("first");
+        let second = write_private_tmpfile("todo", b"pick 2222222\n".to_vec()).expect("second");
         assert_ne!(first, second, "two plans never share a file");
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(&first).unwrap().permissions().mode();

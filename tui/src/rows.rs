@@ -648,6 +648,10 @@ impl Present for TextRows {
     fn hunk_at(&self, index: usize) -> Option<(usize, usize)> {
         self.flat.hunk_at(index)
     }
+
+    fn line_at(&self, index: usize) -> Option<(usize, usize, usize)> {
+        self.flat.line_at(index)
+    }
 }
 
 impl Rows for TextRows {

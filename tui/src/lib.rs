@@ -48,6 +48,7 @@
 //! | [`files`] | the working tree: sections, files, and the armed discard |
 //! | [`scrollbar`] | where you are in a list, drawn over its right-hand column |
 //! | [`help`] | what the keys do, as a function of the keymap |
+//! | [`todo`] | the rebase plan: one editable list, over `core`'s model |
 //! | [`term`] | the only module that touches `crossterm` |
 
 pub mod branches;
@@ -56,12 +57,19 @@ pub mod diff;
 pub mod files;
 pub mod help;
 pub mod markdown;
+pub mod merging;
+pub mod patch;
+pub mod reflog;
+pub mod remotes;
 pub mod rows;
 pub mod screen;
 pub mod scrollbar;
 pub mod split;
 pub mod stashes;
+pub mod tags;
 pub mod term;
+pub mod todo;
+pub mod worktrees;
 
 /// The two rendering budgets, from `gitten_app` — where they are shared rather
 /// than picked independently by three clients that all picked the same numbers.

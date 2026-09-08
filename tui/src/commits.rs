@@ -48,6 +48,7 @@ use crate::screen::{Ink, Pen, Screen};
 use crate::scrollbar::{self, Bar};
 use gitten_core::graph::{lane_count, Hues, MAX_LANES};
 use gitten_core::host::Host;
+use gitten_core::rebase::FixupKind;
 use gitten_core::search::Index;
 use gitten_core::theme::{Rgb, Theme};
 use gitten_core::view::Viewport;
@@ -217,6 +218,39 @@ pub struct Commits {
     /// held here rather than inferred again, and a keyboard *move* clears it.
     sel: Option<(usize, usize)>,
     dragging: bool,
+    /// The marked range — **rows kept for the next action**, lazygit's `v`,
+    /// and a different thing from `sel`: that one is what a copy takes, this
+    /// one is what an action will be aimed at. Visible-table rows, so a
+    /// filter's renumbering kills it the way it kills everything else that
+    /// names a row. Drawing it earns its own ink when the first action
+    /// consumes it (history surgery); until then the status line says what
+    /// is marked, and nothing borrows the copy selection's colour to mean
+    /// something else.
+    marks: Option<(usize, usize)>,
+    /// Whether the mark is armed — `v` opened it and the arrows extend it
+    /// until `v` says stop. The toggle lazygit's drag-select key has.
+    marking: bool,
+    /// The shas on the cherry-pick clipboard, for drawing alone — the
+    /// clipboard itself is [`gitten_core::clipboard::CherryClipboard`] and
+    /// the client owns it, because the *order* in it is a paste's contract
+    /// and a pane has no business holding that.
+    ///
+    /// Shas and not rows, so it survives [`Commits::replace`] the way the
+    /// clipboard survives a refresh: what was copied is still copied after
+    /// a write renumbered every row. A membership test per visible row is
+    /// a walk of at most a handful of strings, which is why this is a `Vec`
+    /// and not a set — the clipboard is a keyboard's worth of commits.
+    copied: Vec<String>,
+    /// The short sha of the commit marked as a rebase base, when one is —
+    /// display only, said on the status line. The mark itself is the
+    /// client's, because it outlives this pane's every refresh.
+    base: Option<String>,
+    /// What the fixup-creation key writes next: `fixup!` unless the kind
+    /// key said otherwise. Pane state, because both keys live here and
+    /// the status line that names it is this pane's; the creation itself
+    /// still goes through the shared action, which re-reads nothing —
+    /// the kind travels as an argument, never as ambient state.
+    fixup_kind: FixupKind,
 }
 
 impl Commits {
@@ -259,6 +293,11 @@ impl Commits {
             bar: Bar::default(),
             sel: None,
             dragging: false,
+            marks: None,
+            copied: Vec::new(),
+            base: None,
+            marking: false,
+            fixup_kind: FixupKind::default(),
         }
     }
 
@@ -289,6 +328,74 @@ impl Commits {
     /// reads through here, which is why filtering cannot desync them.
     pub fn current(&self) -> Option<&Commit> {
         self.commits.get(*self.visible.get(self.view.cursor())?)
+    }
+
+    /// Tells the pane which commits are on the cherry-pick clipboard, so a
+    /// copied row can say so. Called by the client whenever the clipboard
+    /// changes and never on the render path: the set is small and stable,
+    /// and a per-frame rebuild of it would be a rebuild of nothing.
+    pub fn set_copied(&mut self, shas: &[Vec<u8>]) {
+        self.copied.clear();
+        self.copied.extend(
+            shas.iter()
+                .map(|sha| String::from_utf8_lossy(sha).into_owned()),
+        );
+    }
+
+    /// Tells the pane which commit is the marked rebase base, so the status
+    /// line can say so. Called by the client whenever the mark changes and
+    /// never on the render path.
+    /// What the fixup-creation key will write, for the dispatch that aims it.
+    pub fn fixup_kind(&self) -> FixupKind {
+        self.fixup_kind
+    }
+
+    /// The next fixup kind, for the key that chooses what a creation
+    /// writes: fixup, then amend, then reword, then round again. Returns
+    /// the one now standing, so the press can say it.
+    pub fn cycle_fixup_kind(&mut self) -> FixupKind {
+        self.fixup_kind = self.fixup_kind.cycle();
+        self.fixup_kind
+    }
+
+    pub fn set_base(&mut self, short: Option<String>) {
+        self.base = short;
+    }
+
+    /// Whether the commit at a *source* index is on the clipboard.
+    pub fn is_copied(&self, index: usize) -> bool {
+        self.commits
+            .get(index)
+            .is_some_and(|c| self.copied.contains(&c.sha))
+    }
+
+    /// The commit a *visible* row holds — what a marked range resolves
+    /// through, since the range is rows and a paste needs shas. Out of
+    /// range answers `None`; under a filter the visible table is what the
+    /// eye marked, so this is the only honest way from one to the other.
+    pub fn at(&self, row: usize) -> Option<&Commit> {
+        self.commits.get(*self.visible.get(row)?)
+    }
+
+    /// The whole loaded window, newest first, and the source index of
+    /// the cursor — what a history rewrite composes its plan over.
+    /// `None` under a query or past the list's end: a filtered list is
+    /// not a straight window, and a plan built from one would not cover
+    /// what the rebase touches. Unfiltered the visible table is the
+    /// identity, so the cursor already is the source index.
+    pub fn history_window(&self) -> Option<(&[Commit], usize)> {
+        if self.query.is_some() {
+            return None;
+        }
+        let cursor = self.view.cursor();
+        (cursor < self.commits.len()).then_some((self.commits.as_slice(), cursor))
+    }
+
+    /// The commit an object id names, from the rows this pane holds — the
+    /// subject a preview's label borrows. `None` when the pane does not
+    /// hold it: a filtered list, a history the drilldown replaced.
+    pub fn with_sha(&self, sha: &str) -> Option<&Commit> {
+        self.commits.iter().find(|c| c.sha == sha)
     }
 
     pub fn resize(&mut self, cols: usize, height: usize) {
@@ -341,6 +448,10 @@ impl Commits {
         self.refilter();
         self.sel = None;
         self.dragging = false;
+        // The marks named rows of the visible table, and the table just
+        // changed under them.
+        self.marks = None;
+        self.marking = false;
         // `set_len` clamped the cursor onto the surviving rows; the anchor,
         // where it survived, is put back by name.
         let cursor = anchored
@@ -367,9 +478,32 @@ impl Commits {
         self.view.set_len(self.visible.len());
     }
 
+    /// The next — or previous — row of the visible list, wrapping. With a
+    /// filter standing the visible list *is* the matches, so this is what
+    /// iterating them is; with none standing it says so by doing nothing.
+    /// A move of the keyboard, with a move's usual costs: the copy range
+    /// dies, and an armed mark grows.
+    pub fn next_match(&mut self, by: isize) {
+        if self.query.is_none() || self.visible.is_empty() {
+            return;
+        }
+        let len = self.visible.len() as isize;
+        let at = (self.view.cursor() as isize + by).rem_euclid(len) as usize;
+        self.sel = None;
+        self.view.go_to(at);
+        self.extend_marks();
+    }
+
+    /// Takes the filter off. The one door `search.clear` opens, so a search
+    /// that is cancelled restores the list it filtered.
+    pub fn clear_search(&mut self) {
+        self.apply_query("");
+    }
+
     pub fn move_by(&mut self, by: isize) {
         self.sel = None;
         self.view.move_by(by);
+        self.extend_marks();
     }
 
     pub fn down(&mut self) {
@@ -383,6 +517,7 @@ impl Commits {
     pub fn page(&mut self, pages: isize) {
         self.sel = None;
         self.view.page(pages);
+        self.extend_marks();
     }
 
     /// Scrolls the viewport without moving the cursor. The wheel.
@@ -398,17 +533,20 @@ impl Commits {
     pub fn to_top(&mut self) {
         self.sel = None;
         self.view.to_top();
+        self.extend_marks();
     }
 
     pub fn to_bottom(&mut self) {
         self.sel = None;
         self.view.to_bottom();
+        self.extend_marks();
     }
 
     /// Puts a saved row on screen, for a session restored across a restart.
     pub fn go_to(&mut self, row: usize) {
         self.sel = None;
         self.view.go_to(row);
+        self.extend_marks();
     }
 
     /// Swaps in a refreshed list, keeping the selection by identity.
@@ -430,6 +568,8 @@ impl Commits {
         // renumbered. It is the mouse's, and the mouse has let go.
         self.sel = None;
         self.dragging = false;
+        self.marks = None;
+        self.marking = false;
         self.commits = commits;
         let rows = assign_lanes(&self.commits);
         self.lanes = lane_count(&rows);
@@ -664,7 +804,17 @@ impl Commits {
         // long the sha or the name is — a fixed column that a long value moves
         // is not a column.
         let dim = Ink::new(theme.chrome.dim, bg);
-        pen.take(SHA_W - 1).put(&c.short, dim);
+        // A copied commit says so in its sha and nowhere else. The column is
+        // pure furniture — it spends its foreground on nothing, unlike the
+        // author's hue or a lane's — so lifting it to the accent costs no
+        // information, takes no cell, and stays invisible while the
+        // clipboard is empty. Not a background: that is the cursor's and the
+        // drag's, and a row can only have one of those.
+        let sha_ink = match self.is_copied(index) {
+            true => Ink::new(theme.chrome.accent, bg),
+            false => dim,
+        };
+        pen.take(SHA_W - 1).put(&c.short, sha_ink);
         pen.put(" ", dim);
         pen.take(WHO_W - 1)
             .put(&d.initials, Ink::new(theme.author(&c.author), bg));
@@ -778,6 +928,53 @@ impl Commits {
         }
     }
 
+    // ---------------------------------------------------------------- the mark
+
+    /// `select.mark`, lazygit's `v`: arm a range at the cursor, extend it by
+    /// moving, and `v` again takes it off. A range of one row is a real
+    /// range — the mark is what the *next* action is aimed at, and one row
+    /// is a legal aim.
+    pub fn select_mark(&mut self) {
+        if self.marks.is_some() {
+            self.marks = None;
+            self.marking = false;
+            return;
+        }
+        let at = self.view.cursor();
+        self.marks = Some((at, at));
+        self.marking = true;
+    }
+
+    /// The marked range, normalized — anchors first. `None` when nothing is
+    /// marked. Rows of the visible list, so the caller resolves them to
+    /// commits the way the cursor does.
+    pub fn marks(&self) -> Option<(usize, usize)> {
+        self.marks.map(|(a, b)| (a.min(b), a.max(b)))
+    }
+
+    /// Whether a mark is armed and the arrows extend it.
+    pub fn is_marking(&self) -> bool {
+        self.marking
+    }
+
+    /// How many rows are marked, for a status line. `None` when nothing is.
+    pub fn mark_note(&self) -> Option<String> {
+        self.marks().map(|(a, b)| format!("{} marked", b - a + 1))
+    }
+
+    /// The cursor moved; an armed mark grows to cover it, a standing one
+    /// stays what it was. One lookup, once per move — never per frame.
+    fn extend_marks(&mut self) {
+        if !self.marking {
+            return;
+        }
+        let at = self.view.cursor();
+        self.marks = Some(match self.marks {
+            Some((anchor, _)) => (anchor, at),
+            None => (at, at),
+        });
+    }
+
     /// One line describing the list, for whatever draws a status bar. The lane
     /// count is the uncapped one: "280 lanes" is worth knowing when twelve are
     /// drawn. Position is counted over the *visible* rows — what the cursor
@@ -803,6 +1000,21 @@ impl Commits {
         let mut out = format!("{position} · {} lanes", self.lanes);
         if self.lanes > MAX_LANES {
             out.push_str(&format!(" · {MAX_LANES} drawn"));
+        }
+        if let Some(note) = self.mark_note() {
+            out.push_str(&format!(" · {note}"));
+        }
+        // A marked base is carried into a rebase the reader may run from
+        // another pane entirely, so the list that holds it says so for as
+        // long as it stands.
+        if let Some(base) = &self.base {
+            out.push_str(&format!(" · base {base}"));
+        }
+        // The pending fixup kind is said only while it is not the default:
+        // the default is what the help entry promises, and a quiet status
+        // line is the point.
+        if self.fixup_kind != FixupKind::default() {
+            out.push_str(&format!(" · F:{}", self.fixup_kind.describe()));
         }
         out
     }
@@ -1173,6 +1385,41 @@ r\x1fr\x1f\x1fA\x1f1\x1froot\x1e";
             "the connector broke a lane: {:?}",
             rows[1]
         );
+    }
+
+    #[test]
+    fn a_copied_commit_lifts_its_sha_to_the_accent_and_moves_nothing() {
+        // The clipboard's one visible claim: the sha column, which spends
+        // its foreground on nothing otherwise. Two rows, one copied, and
+        // the *text* of every row identical either way — an indicator that
+        // took a cell would shift the graph and the subject with it.
+        let (mut c, host) = view(LOG, 60, 4);
+        let before = painted(&c, &host);
+        let dim = host.theme.chrome.dim;
+        let accent = host.theme.chrome.accent;
+        assert_ne!(dim, accent, "the theme cannot tell a copy apart");
+
+        let mut screen = Screen::new(60, 4);
+        screen.clear(Ink::new(host.theme.chrome.fg, host.theme.chrome.bg));
+        c.paint(&mut screen, 0, 0, true, &host);
+        assert_eq!(screen.ink(0, 1).unwrap().fg, dim, "quiet while empty");
+
+        // `a` is the second row of `LOG`; the row the cursor is on is the
+        // first, so the ink is not the cursor's doing.
+        c.set_copied(&[b"a".to_vec()]);
+        assert!(c.is_copied(1));
+        assert!(!c.is_copied(0));
+        let mut screen = Screen::new(60, 4);
+        screen.clear(Ink::new(host.theme.chrome.fg, host.theme.chrome.bg));
+        c.paint(&mut screen, 0, 0, true, &host);
+        assert_eq!(screen.ink(0, 1).unwrap().fg, accent, "the copy is unmarked");
+        assert_eq!(screen.ink(0, 0).unwrap().fg, dim, "the ink spread");
+        assert_eq!(painted(&c, &host), before, "the ink moved a column");
+
+        // A refresh renumbers rows and the copy is still the copy: the set
+        // is shas, and `replace` is documented not to change how it draws.
+        c.replace(parse_log(LOG));
+        assert!(c.is_copied(1), "the refresh forgot the clipboard");
     }
 
     #[test]
