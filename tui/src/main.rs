@@ -13642,6 +13642,169 @@ diff --git a/tracked.txt b/tracked.txt
         assert_eq!(app.geometry.as_ref().map(|(k, _)| *k), cached);
     }
 
+    /// The sidebar's sections, end to end: what the headers say, what a
+    /// click on a tab and on a header do, what `[`/`]` reach, and that
+    /// nothing absent is ever advertised or landed on.
+    #[test]
+    fn tui_parity_sections_tab_by_key_and_click_and_advertise_only_what_exists() {
+        let (handle, _state) = fake(&[]);
+        let mut app = commits_app(&handle);
+        app.draw();
+
+        // Four headers, in the order the column reads, each with its own
+        // section's tabs and the focus key of the tab that names it. Only
+        // the open one has rows, so these are rows 1, 2, 3 and 22.
+        let header = |app: &App, y: usize| {
+            app.screen
+                .row_text(y)
+                .chars()
+                .take(40)
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        };
+        assert_eq!(
+            [1, 2, 3, 22].map(|y| header(&app, y)),
+            [
+                "  2  files - worktrees",
+                "  3  branches - remotes - tags",
+                "  4  commits - reflog",
+                "  5  stashes",
+            ]
+        );
+
+        // A click on a tab's word focuses *that* tab: the section opens
+        // where it has always been in the column, the tab that had the slot
+        // gives up its rectangle, and the header still lists all three.
+        let tags_at = header(&app, 2).find("tags").expect("the tab is drawn");
+        app.mouse(click(MouseKind::Down, tags_at + 1, 2));
+        app.mouse(click(MouseKind::Up, tags_at + 1, 2));
+        assert_eq!(app.panes.focused_name(), "tags");
+        app.draw();
+        assert_eq!(
+            app.pane_rect("tags").map(|r| (r.y, r.height)),
+            Some((2, 19))
+        );
+        assert_eq!(app.pane_rect("branches"), None, "the tab behind kept rows");
+        assert_eq!(header(&app, 2), "  3  branches - remotes - tags");
+        // The accent is the one "which pane has the keyboard" mark, and it
+        // is on the active tab alone.
+        let accent = app.host.theme.chrome.accent;
+        let branches_at = header(&app, 2).find("branches").expect("drawn");
+        assert_eq!(app.screen.ink(tags_at, 2).map(|i| i.fg), Some(accent));
+        assert_ne!(app.screen.ink(branches_at, 2).map(|i| i.fg), Some(accent));
+
+        // A click anywhere else on a header — the gap between two tabs, or
+        // the empty tail — focuses the tab that section is *showing*, not
+        // the one the pointer is nearest. The commits section is collapsed
+        // to one row and it has moved down the column, because the section
+        // above it is the open one now.
+        let commits_head = app.pane_rect("commits").expect("placed").y;
+        assert_eq!(commits_head, 21, "the collapsed sections did not close up");
+        app.mouse(click(MouseKind::Down, 38, commits_head));
+        assert_eq!(app.panes.focused_name(), "commits");
+        app.mouse(click(MouseKind::Up, 38, commits_head));
+        app.draw();
+        // ...and the tags section remembers the tab it was left on, so a
+        // press on its header comes back to `tags` and not to `branches`.
+        app.mouse(click(MouseKind::Down, 38, 2));
+        assert_eq!(app.panes.focused_name(), "tags");
+        app.mouse(click(MouseKind::Up, 38, 2));
+
+        // `]`/`[` walk that section and wrap inside it, never reaching the
+        // commits section next door.
+        app.press(Key::plain(Code::Char(']')));
+        assert_eq!(app.panes.focused_name(), "branches");
+        app.press(Key::plain(Code::Char(']')));
+        assert_eq!(app.panes.focused_name(), "remotes");
+        app.press(Key::plain(Code::Char(']')));
+        assert_eq!(app.panes.focused_name(), "tags", "the tabs did not wrap");
+        app.press(Key::plain(Code::Char('[')));
+        assert_eq!(app.panes.focused_name(), "remotes");
+
+        // The keymap and the availability agree with all of that: the pair
+        // is the shipped `panes` mode's, and the dispatch runs both.
+        let keys = Host::new().keys;
+        let mut modes = Modes::new();
+        modes.push(panes::MODE);
+        modes.push("branches");
+        assert_eq!(
+            keys.resolve(&modes, &[Key::plain(Code::Char(']'))]),
+            Resolve::Run("tab.next")
+        );
+        assert_eq!(
+            keys.resolve(&modes, &[Key::plain(Code::Char('['))]),
+            Resolve::Run("tab.prev")
+        );
+        // In the main region the older and more urgent pair wins: a diff
+        // has files to jump between and no section to tab through.
+        let mut in_diff = Modes::new();
+        in_diff.push(panes::MODE);
+        in_diff.push("diff");
+        assert_eq!(
+            keys.resolve(&in_diff, &[Key::plain(Code::Char(']'))]),
+            Resolve::Run("diff.next-file")
+        );
+        let availability = tui_availability(true, None, None);
+        for name in ["tab.next", "tab.prev"] {
+            assert!(
+                availability.runnable(name),
+                "{name} is not runnable, but the keymap resolves it"
+            );
+        }
+        // And the help panel lists them where they run, out of the same
+        // registry — no local table anywhere in the chain.
+        app.screen = Screen::new(120, 50);
+        app.press(Key::char('?'));
+        app.press(Key::plain(Code::End));
+        app.draw();
+        let help = (0..50)
+            .map(|y| app.screen.row_text(y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for doc in [
+            "the next tab in this section",
+            "the previous tab in this section",
+        ] {
+            assert!(help.contains(doc), "help dropped {doc:?}: {help:?}");
+        }
+        app.press(Key::char('?'));
+
+        // A launch with no repository has one list, so there are no tabs to
+        // walk and none advertised: the `panes` mode is not on the stack,
+        // `]` is unbound there, and the one header names exactly the pane
+        // that registered — never the reflog nobody read.
+        let started = gitten_app::Started {
+            view: View::Commits,
+            source: Source::Fixtures,
+            host: Host::new(),
+            loaded: acquire::Loaded {
+                label: "fixture history".into(),
+                data: Data::Commits(gitten_core::parse_log(
+                    "00000000\x1f00000000\x1f\x1fAda\x1f1\x1fone\x1e",
+                )),
+            },
+            config: std::path::PathBuf::from("/nonexistent/gitten.toml"),
+            repo: None,
+        };
+        let mut fixture = App::new(started, Glyphs::default());
+        fixture.screen = Screen::new(120, 24);
+        fixture.dispatch("commits.focus");
+        fixture.draw();
+        assert!(
+            !fixture.modes.as_slice().contains(&panes::MODE.to_string()),
+            "{:?}",
+            fixture.modes.as_slice()
+        );
+        fixture.press(Key::plain(Code::Char(']')));
+        assert_eq!(
+            fixture.message, "] is not bound — ? for the keys",
+            "a tab key ran where there are no tabs"
+        );
+        assert_eq!(header(&fixture, 1), "  4  commits");
+        assert_eq!(fixture.panes.focused_name(), "commits");
+    }
+
     #[test]
     fn wave_one_and_plan_016_features_survive_stash_registration() {
         let (handle, state) = fake(&[]);
