@@ -100,6 +100,14 @@ const TICK: Duration = Duration::from_millis(150);
 /// never held longer than that.
 const STREAM_TICK: Duration = Duration::from_millis(16);
 
+/// The poll while a preview read is in flight: how long a preview answer
+/// may wait for the frame after its bytes. The answer arrives on a channel
+/// the loop drains before each frame, and the loop blocks on input — without
+/// the short tick a cursor run through the commits drew the frame before the
+/// read came home and then waited out the full tick to show it. 16 ms is one
+/// 60 Hz frame; the read itself is longer than the wait it buys.
+const PREVIEW_TICK: Duration = Duration::from_millis(16);
+
 /// The most input one frame takes from the queue.
 ///
 /// A wheel burst arrives as dozens of notches, and a frame per notch is the
@@ -2646,13 +2654,15 @@ impl App {
             // The first frame draws before anything waits, so its poll does not
             // block; every later frame blocks here for the first event, or the
             // tick, which is the only thing that bounds how soon a saved config
-            // is noticed. While the log's tail is streaming, the tick is short:
-            // its rows land on the frame after the bytes arrive, and a full
-            // tick would hold them back for nothing — the same shortness bounds
-            // input latency, which is what makes it harmless.
-            let tick = match self.tail.is_some() {
-                true => STREAM_TICK,
-                false => TICK,
+            // is noticed. While the log's tail is streaming, or a preview read
+            // is in flight, the tick is short: their answers land on the frame
+            // after the bytes arrive, and a full tick would hold them back for
+            // nothing — the same shortness bounds input latency, which is what
+            // makes it harmless.
+            let tick = match (self.tail.is_some(), self.preview_pending > 0) {
+                (true, _) => STREAM_TICK,
+                (_, true) => PREVIEW_TICK,
+                (false, false) => TICK,
             };
             match Term::poll(if first { Duration::ZERO } else { tick })? {
                 // A resize stays in the loop, which keeps the size it compares
