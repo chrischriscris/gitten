@@ -2573,7 +2573,23 @@ impl App {
             width: w,
             height: h - 2,
         };
-        let geometry = self.layout.arrange(&self.panes.spots(), body);
+        // The registry does not read the keymap, so the focus keys the
+        // section headers advertise are carried in here — from
+        // [`App::focus_keys`], resolved once per host or registry change,
+        // because the key's width is what decides where the tabs start and a
+        // frame has no business formatting strings. A reload that moves a key
+        // therefore has to drop the cache, which is what
+        // [`App::sync_header_keys`] does.
+        let mut spots = self.panes.spots();
+        for spot in &mut spots {
+            spot.key = self
+                .focus_keys
+                .iter()
+                .find(|(n, _)| n == spot.name)
+                .map(|(_, k)| k.as_str())
+                .unwrap_or("");
+        }
+        let geometry = self.layout.arrange(&spots, body);
         self.geometry = Some((key, geometry));
     }
 
@@ -2590,6 +2606,10 @@ impl App {
     /// per host or registry change into [`App::focus_keys`], because a frame
     /// has no business formatting strings.
     fn sync_header_keys(&mut self) {
+        // A moved key moves every tab on every section header, because the
+        // key's width is where the first tab starts — so the cached geometry
+        // dies with the keys it was laid out against.
+        self.geometry = None;
         let host = &self.host;
         self.focus_keys = self
             .panes
@@ -4595,11 +4615,25 @@ impl App {
                 // A press on the header focuses and nothing else — the same
                 // answer the window's pane headers give — so a gesture that
                 // started there has a pane to be released against and no more.
+                //
+                // On a section header that means the *tab* under the pointer
+                // when the pointer is on one of their words, and the section
+                // itself — its shown tab, which is what the rectangle belongs
+                // to — anywhere else on the row. Both focus, and focusing a
+                // tab is what expands its section: there is no separate
+                // "expand", because the open section is only ever the one the
+                // keyboard is in.
                 if m.row == rect.y {
-                    if !was_focused {
-                        self.focus_named(&name);
+                    let target = self
+                        .geometry
+                        .as_ref()
+                        .and_then(|(_, g)| g.hit_tab(m.col, m.row))
+                        .unwrap_or(&name)
+                        .to_string();
+                    if self.panes.focused_name() != target {
+                        self.focus_named(&target);
                     }
-                    self.gesture = Some(name);
+                    self.gesture = Some(target);
                     return;
                 }
                 let local_col = m.col - rect.x;
@@ -4820,6 +4854,8 @@ impl App {
             "pane.right" => self.pane_walk(1),
             "pane.next" => self.cycle_pane(1),
             "pane.prev" => self.cycle_pane(-1),
+            "tab.next" => self.cycle_tab(1),
+            "tab.prev" => self.cycle_tab(-1),
             "status.focus" | "files.focus" | "branches.focus" | "commits.focus"
             | "stashes.focus" | "remotes.focus" | "tags.focus" | "reflog.focus"
             | "worktrees.focus" | "diff.focus" => {
@@ -5582,6 +5618,30 @@ impl App {
         }
         if self.panes.cycle_sidebar(by) {
             self.sync_modes();
+        }
+    }
+
+    /// Walks the tabs of the focused section — what `[`/`]` do.
+    ///
+    /// A section is a slot in the sidebar its lists take turns in, so this is
+    /// the *inner* move: the numbers name a section, ctrl-j/ctrl-k walk every
+    /// list in the column, and these two stay inside the one the keyboard is
+    /// in. Nothing to walk is said rather than swallowed — a `stashes` on its
+    /// own is a section of one, and so is the main region, which is not a
+    /// section at all.
+    fn cycle_tab(&mut self, by: isize) {
+        if self.panes.section_tabs(self.panes.focused_name()).len() < 2 {
+            self.message = "no second tab in this section".into();
+            return;
+        }
+        if self.panes.cycle_tab(by) {
+            self.sync_modes();
+            // The same reason the focus commands ask: an unfocused commits
+            // pane's highlighted row is still the main preview's source, and
+            // arriving on it must show that row and not the one before.
+            if self.panes.focused_name() == "commits" {
+                self.request_commit_preview(false);
+            }
         }
     }
 
@@ -6731,23 +6791,37 @@ impl App {
                     continue;
                 };
                 let focused = panes.focused_name() == name;
-                let key = focus_keys
-                    .iter()
-                    .find(|(n, _)| n == name)
-                    .map(|(_, k)| k.as_str())
-                    .unwrap_or("");
                 // The header pen is the rectangle's own header row, and the
                 // content pen its content — the same subdivision the resize
                 // above used, read back rather than recomputed.
                 let head = rect.header();
-                header(
-                    &mut screen.span(head.y, head.x, head.width),
-                    host,
-                    key,
-                    name,
-                    pane.label(),
-                    focused,
-                );
+                // A sidebar rectangle's header row is its *section's*: the
+                // tabs, where the layout put them, and the label only where
+                // there are rows under it to label. The main region has no
+                // section and draws its own one-pane header.
+                match geometry.header_of(name) {
+                    Some(section) => section_header(
+                        &mut screen.span(head.y, head.x, head.width),
+                        host,
+                        section,
+                        focused,
+                    ),
+                    None => {
+                        let key = focus_keys
+                            .iter()
+                            .find(|(n, _)| n == name)
+                            .map(|(_, k)| k.as_str())
+                            .unwrap_or("");
+                        header(
+                            &mut screen.span(head.y, head.x, head.width),
+                            host,
+                            key,
+                            name,
+                            pane.label(),
+                            focused,
+                        )
+                    }
+                }
                 let content = rect.content();
                 if content.width > 0 && content.height > 0 {
                     pane.paint(&mut *screen, content.x, content.y, focused, host, runs);
@@ -7022,6 +7096,8 @@ fn tui_availability(
         "pane.right",
         "pane.next",
         "pane.prev",
+        "tab.next",
+        "tab.prev",
         "files.focus",
         "branches.focus",
         "commits.focus",
@@ -8224,6 +8300,63 @@ fn header(pen: &mut Pen, host: &Host, key: &str, name: &str, label: &str, focuse
     if !label.is_empty() {
         pen.put("  ", dim);
         pen.put(label, label_ink);
+    }
+    pen.wash(dim);
+}
+
+/// A sidebar section's header row: its focus key, its tabs, and — when there
+/// are rows under it — what the tab it is showing is showing.
+///
+/// The tab positions are read back from the layout rather than re-derived
+/// here: [`panes::header`] worked them out once, the mouse hit-tests against
+/// the same table, and a second copy of that arithmetic is what would put the
+/// highlight and the click on different words.
+///
+/// The accent stays singular — it is the one "which pane has the keyboard"
+/// mark a cell grid gets — so an *open* section whose keyboard has gone to the
+/// diff draws its active tab in the ordinary pane ink, not the accent. The
+/// tabs behind it are faint: reachable, and not competing with the row the eye
+/// is on.
+///
+/// **No label.** A lone pane's header shows what the pane is showing, and
+/// three tabs do not leave room for it: `  3  branches - remotes - tags` is 30
+/// of a 40-column sidebar, so `fake (main) · 2 local` would arrive as
+/// `fake (ma` — which reads as a bug and not as a repository. Drawing it only
+/// where it happens to fit is worse than not drawing it, because then whether
+/// the sidebar tells you the branch depends on how long a tab's name is. The
+/// title bar says it in full, at the width of the whole window, and it is the
+/// focused pane's label that anybody is reading.
+fn section_header(pen: &mut Pen, host: &Host, head: &panes::Header, focused: bool) {
+    let c = &host.theme.chrome;
+    let bg = c.title_bg;
+    let key_ink = match focused {
+        true => Ink::new(c.accent, bg),
+        false => Ink::new(c.faint, bg),
+    };
+    let active_ink = match focused {
+        true => Ink::new(c.accent, bg).bold(),
+        false => Ink::new(c.dim, bg),
+    };
+    let dim = Ink::new(c.faint, bg);
+    pen.put("  ", dim);
+    if !head.key.is_empty() {
+        pen.put(&head.key, key_ink);
+        pen.put("  ", dim);
+    }
+    for (i, tab) in head.tabs.iter().enumerate() {
+        if i > 0 {
+            pen.put(panes::TAB_GAP, dim);
+        }
+        // Where the layout said, not where the pen happens to have got to:
+        // the two agree by construction and this is what keeps them agreeing.
+        pen.seek(tab.x.saturating_sub(head.rect.x));
+        pen.put(
+            &tab.name,
+            match tab.active {
+                true => active_ink,
+                false => dim,
+            },
+        );
     }
     pen.wash(dim);
 }
@@ -11045,6 +11178,9 @@ diff --git a/tracked.txt b/tracked.txt
         // and is available, which a failed read never is.
         let (handle, _state) = fake(&[]);
         let mut app = commits_app(&handle);
+        // `2` opens the files section — a launch opens on the commit list,
+        // and a collapsed section is its header row and no rows at all.
+        app.press(Key::plain(Code::Char('2')));
         app.draw();
         assert!(files_of(&app).is_clean());
         assert!(files_of(&app).is_available());
@@ -11058,6 +11194,7 @@ diff --git a/tracked.txt b/tracked.txt
         let (handle, state) = fake(&[]);
         state.lock().unwrap().fail_status = Some("the status read failed".into());
         let mut app = commits_app(&handle);
+        app.press(Key::plain(Code::Char('2')));
         app.draw();
         assert!(!files_of(&app).is_clean());
         assert!(!files_of(&app).is_available());
@@ -11089,9 +11226,10 @@ diff --git a/tracked.txt b/tracked.txt
             app.screen.row_text(3)
         );
 
-        // Wide: the seven sidebar lists split the sidebar into canonical
-        // equal slices beside the diff, and no row crosses the divider
-        // column.
+        // Wide: the eight sidebar lists take turns in four sections beside
+        // the diff, and no row crosses the divider column. The files section
+        // is open — `2` put the keyboard there — so it takes every row the
+        // three collapsed headers leave.
         app.screen.resize(120, 24);
         app.draw();
         let files_rect = app.pane_rect("files").expect("files placed");
@@ -11100,10 +11238,12 @@ diff --git a/tracked.txt b/tracked.txt
         assert_eq!((files_rect.x, files_rect.width), (0, 40));
         assert_eq!((commits_rect.x, commits_rect.width), (0, 40));
         assert_eq!(files_rect.y, 1);
-        assert_eq!(commits_rect.y, files_rect.y + files_rect.height + 3);
-        // Eight slices over the sidebar: the odd rows go to the first.
-        assert_eq!(files_rect.height, 3, "the first slice takes the remainder");
-        assert_eq!(commits_rect.height, 3, "unequal slices");
+        assert_eq!(commits_rect.y, files_rect.y + files_rect.height + 1);
+        assert_eq!(
+            files_rect.height, 19,
+            "the open section did not take the column"
+        );
+        assert_eq!(commits_rect.height, 1, "a collapsed section grew rows");
         assert_eq!((diff_rect.x, diff_rect.width), (41, 79));
         for y in 1..24 {
             assert_eq!(
@@ -11112,15 +11252,20 @@ diff --git a/tracked.txt b/tracked.txt
                 "row {y} crossed the divider"
             );
         }
-        // The header names the pane, its live focus key, and the label; the
-        // title and the status line name it too.
+        // The section header names its tabs and its live focus key; the
+        // label is the title bar's, at the width of the whole window, and
+        // the status line names the pane too.
         app.dispatch("files.focus");
         app.draw();
         let header = app.screen.row_text(1);
         assert!(header.contains('2'), "{header:?}");
-        assert!(header.contains("files"), "{header:?}");
-        assert!(header.contains("· 1 changed"), "{header:?}");
+        assert!(header.contains("files - worktrees"), "{header:?}");
         assert!(app.screen.row_text(0).contains("files"));
+        assert!(
+            app.screen.row_text(0).contains("· 1 changed"),
+            "the title did not carry the live label: {:?}",
+            app.screen.row_text(0)
+        );
         assert!(
             app.screen.row_text(23).contains("files ·"),
             "{:?}",
@@ -11167,21 +11312,23 @@ diff --git a/tracked.txt b/tracked.txt
         );
         assert!(app.panes.get("files").is_some(), "no files tenant");
         assert_eq!(app.panes.names().count(), 9);
-        // The sidebar's canonical order: files (rank 1), branches (rank 2),
-        // commits (rank 3), stashes (rank 4) — then the unranked tail in
-        // registration order, remotes before tags before reflog before
-        // worktrees, with nothing in panes.rs the wiser.
+        // The sidebar's canonical order is `panes::SECTIONS` flattened, which
+        // is the order the column draws: the files section (files, then the
+        // worktrees behind it), the branches section (branches, remotes,
+        // tags), the commits section (commits, reflog), the stack on its own
+        // at the foot. Registration order — commits first, files eighth —
+        // does not show through, and nothing in panes.rs learned a name.
         assert_eq!(
             app.panes.list_order(),
             [
                 "files",
+                "worktrees",
                 "branches",
-                "commits",
-                "stashes",
                 "remotes",
                 "tags",
+                "commits",
                 "reflog",
-                "worktrees",
+                "stashes",
             ]
         );
 
@@ -11189,21 +11336,41 @@ diff --git a/tracked.txt b/tracked.txt
         app.press(Key::plain(Code::Char('2')));
         assert_eq!(app.panes.focused_name(), "files");
         assert_eq!(app.message, "", "focusing a registered pane said nothing");
-        // Ctrl-J/Ctrl-K cycle both directions through the canonical order:
-        // files, then the branches pane the branches registration put
-        // between them, then commits.
+        // Ctrl-J/Ctrl-K cycle both directions through the canonical order —
+        // every list in the column, section by section and tab by tab, so
+        // the worktrees tab behind `files` is the next stop and not the
+        // branches section.
+        app.press(Key::ctrl(Code::Char('j')));
+        assert_eq!(app.panes.focused_name(), "worktrees");
         app.press(Key::ctrl(Code::Char('j')));
         assert_eq!(app.panes.focused_name(), "branches");
-        app.press(Key::ctrl(Code::Char('j')));
-        assert_eq!(app.panes.focused_name(), "commits");
         app.press(Key::ctrl(Code::Char('k')));
-        assert_eq!(app.panes.focused_name(), "branches");
+        assert_eq!(app.panes.focused_name(), "worktrees");
         app.press(Key::ctrl(Code::Char('k')));
         assert_eq!(app.panes.focused_name(), "files");
-        // Headers derive live keys: files advertises `2` like any other pane.
+        // `]`/`[` are the *inner* move, and they stay in the section they
+        // started in: files and worktrees share a slot, so the pair walks
+        // between exactly those two and wraps rather than reaching branches.
+        app.press(Key::plain(Code::Char(']')));
+        assert_eq!(app.panes.focused_name(), "worktrees");
+        app.press(Key::plain(Code::Char(']')));
+        assert_eq!(app.panes.focused_name(), "files", "the tabs did not wrap");
+        app.press(Key::plain(Code::Char('[')));
+        assert_eq!(app.panes.focused_name(), "worktrees");
+        app.press(Key::plain(Code::Char('[')));
+        assert_eq!(app.panes.focused_name(), "files");
+        // A section of one says so rather than moving: the stack shares its
+        // slot with nothing.
+        app.press(Key::plain(Code::Char('5')));
+        app.press(Key::plain(Code::Char(']')));
+        assert_eq!(app.panes.focused_name(), "stashes");
+        assert_eq!(app.message, "no second tab in this section");
+        app.press(Key::plain(Code::Char('2')));
+        // Headers derive live keys: the files *section* advertises `2`,
+        // which is its first tab's, and names both tabs on the one row.
         app.draw();
         let header = app.screen.row_text(1);
-        assert!(header.contains("files"), "{header:?}");
+        assert!(header.contains("files - worktrees"), "{header:?}");
         assert!(header.contains('2'), "{header:?}");
 
         // A direct working-tree-diff launch registers it too, and keeps the
@@ -11578,8 +11745,11 @@ diff --git a/tracked.txt b/tracked.txt
         let (handle, state) = fake(&[]);
         state.lock().unwrap().status = four_section_status();
         let mut app = commits_app(&handle);
-        app.draw();
         app.dispatch("files.focus");
+        // Drawn *after* the focus, so the cached geometry is the one the
+        // mouse below hit-tests against: the files section is the open one
+        // and its rows start on screen row 2.
+        app.draw();
         let onto_work = |app: &mut App| {
             // One step down from the first staged file crosses the unstaged
             // heading onto work.rs.
@@ -11613,10 +11783,10 @@ diff --git a/tracked.txt b/tracked.txt
         onto_work(&mut app);
         disarm_check(&mut app, &state, "after the wheel");
 
-        // A mouse press on another row disarms too. The files slice is the
-        // first of the sidebar's five at 120 columns; its content starts on
-        // screen row 2, and the staged file — a selectable row that is not
-        // the armed one — sits on row 3.
+        // A mouse press on another row disarms too. The files section is the
+        // first of the sidebar's four and the open one, so its content
+        // starts on screen row 2, and the staged file — a selectable row
+        // that is not the armed one — sits on row 3.
         onto_work(&mut app);
         app.dispatch("files.discard");
         let armed_row = files_of(&app).cursor();
@@ -12427,10 +12597,10 @@ diff --git a/tracked.txt b/tracked.txt
         app.draw();
 
         // Down in the commits rectangle presses it, in its own coordinates.
-        // The sidebar splits eight ways now, so the commits slice is the
-        // third of them (its content rows are 8–9): local row 1 is one
-        // content row down.
-        app.mouse(click(MouseKind::Down, 5, 9));
+        // The commits section is the third of the sidebar's four and the
+        // open one, so its header is screen row 3 and its content starts on
+        // row 4: local row 1 is one content row down.
+        app.mouse(click(MouseKind::Down, 5, 5));
         app.pump_quiet();
         assert_eq!(app.panes.focused_name(), "commits");
         assert_eq!(
@@ -12475,19 +12645,20 @@ diff --git a/tracked.txt b/tracked.txt
 
         // Two quick clicks in the commits pane open the diff — the clock
         // counts, and the pane it counted in is part of what it counted.
-        // (The commits slice is the middle of the sidebar now.)
         app.dispatch("commits.focus");
+        app.draw();
         let reads = state.lock().unwrap().pairs_reads;
-        // Row 0, not the row the press above sat on: the first click has
-        // to move the keyboard for its preview read to exist, and the
-        // second meets a shown commit and deduplicates.
-        app.mouse(click(MouseKind::Down, 10, 8));
-        app.mouse(click(MouseKind::Up, 10, 8));
+        // Row 0 — screen row 4, the section's first content row — and not
+        // the row the press above sat on: the first click has to move the
+        // keyboard for its preview read to exist, and the second meets a
+        // shown commit and deduplicates.
+        app.mouse(click(MouseKind::Down, 10, 4));
+        app.mouse(click(MouseKind::Up, 10, 4));
         // The click's own preview is on the lane; let it land before the
         // second press, so the double click meets a shown commit and
         // deduplicates — the count below is the click's read, not the open's.
         app.pump_quiet();
-        app.mouse(click(MouseKind::Down, 10, 8));
+        app.mouse(click(MouseKind::Down, 10, 4));
         app.pump_quiet();
         assert_eq!(
             app.panes.focused_name(),
@@ -12529,11 +12700,11 @@ diff --git a/tracked.txt b/tracked.txt
         app.draw();
 
         // A drag in the commits pane: the Up queues exactly its selection,
-        // once, and the feedback counts lines. The commits slice is the
-        // third of the sidebar now, its content rows 9–10.
-        app.mouse(click(MouseKind::Down, 5, 9));
-        app.mouse(click(MouseKind::Drag, 5, 10));
-        app.mouse(click(MouseKind::Up, 5, 10));
+        // once, and the feedback counts lines. The commits section is the
+        // open one and its content starts on screen row 4.
+        app.mouse(click(MouseKind::Down, 5, 4));
+        app.mouse(click(MouseKind::Drag, 5, 5));
+        app.mouse(click(MouseKind::Up, 5, 5));
         let commits_text = commits_of(&app).selection();
         assert!(
             !commits_text.is_empty(),
@@ -13259,26 +13430,26 @@ diff --git a/tracked.txt b/tracked.txt
             app.panes.list_order(),
             [
                 "files",
+                "worktrees",
                 "branches",
-                "commits",
-                "stashes",
                 "remotes",
                 "tags",
+                "commits",
                 "reflog",
-                "worktrees",
+                "stashes",
             ]
         );
         assert_eq!(
             app.panes.reading_order(),
             [
                 "files",
+                "worktrees",
                 "branches",
-                "commits",
-                "stashes",
                 "remotes",
                 "tags",
+                "commits",
                 "reflog",
-                "worktrees",
+                "stashes",
                 "diff"
             ]
         );
@@ -13294,8 +13465,12 @@ diff --git a/tracked.txt b/tracked.txt
         );
         assert_eq!(
             app.panes.focused_placement(),
-            Some(panes::Placement::Sidebar { rank: 4 }),
-            "canonical rank 4, from the registry and not a layout edit"
+            Some(panes::Placement::Sidebar {
+                section: Some(4),
+                rank: 8
+            }),
+            "the stash section and canonical rank 8, from the registry and \
+             not a layout edit"
         );
 
         // A repository-backed diff launch registers it the same way, and
@@ -13341,30 +13516,35 @@ diff --git a/tracked.txt b/tracked.txt
         let mut app = commits_app(&handle);
         app.draw();
 
-        // Wide: the sidebar splits into eight canonical slices — files on
-        // top, branches under it, commits next, the stack, the remotes, the
-        // tags, the reflog, the worktrees at the foot — and the diff takes
-        // the rest, one divider column between. No geometry module changed
-        // to make room: this is the registry's equal-slice answer to the
-        // tenants there are.
+        // Wide: the sidebar is four *sections* — files, branches, commits,
+        // the stack — and eight lists take turns in them. Three collapse to
+        // exactly their header row and the one with the keyboard takes the
+        // nineteen rows left; the diff takes the rest of the body, one
+        // divider column between. No geometry module changed to make room:
+        // this is the registry's section answer to the tenants there are.
         assert_eq!(
             app.pane_rect("commits"),
             Some(crate::panes::Rect {
                 x: 0,
-                y: 7,
+                y: 3,
                 width: 40,
-                height: 3
+                height: 19
             })
         );
         assert_eq!(
             app.pane_rect("stashes"),
             Some(crate::panes::Rect {
                 x: 0,
-                y: 10,
+                y: 22,
                 width: 40,
-                height: 3
+                height: 1
             })
         );
+        // And the tabs behind the shown ones have no rectangle at all — the
+        // reflog shares the commits' slot and is hidden, not squeezed.
+        for behind in ["worktrees", "remotes", "tags", "reflog"] {
+            assert_eq!(app.pane_rect(behind), None, "{behind} kept a rectangle");
+        }
         assert_eq!(
             app.pane_rect("diff"),
             Some(crate::panes::Rect {
@@ -13376,18 +13556,27 @@ diff --git a/tracked.txt b/tracked.txt
         );
 
         // Headers name the live configured focus keys — 4 and 5, straight
-        // out of the shipped map — and the stack says whose repository it
-        // is and how much is parked.
-        let commits_header = app.screen.row_text(7).chars().take(40).collect::<String>();
+        // out of the shipped map — beside every tab in the section, and the
+        // open one says whose repository it is and how much is parked.
+        let commits_header = app.screen.row_text(3).chars().take(40).collect::<String>();
         assert!(
-            commits_header.contains('4') && commits_header.contains("commits"),
+            commits_header.contains('4') && commits_header.contains("commits - reflog"),
             "{commits_header:?}"
         );
-        let stashes_header = app.screen.row_text(10);
+        let files_header = app.screen.row_text(1);
+        assert!(files_header.contains('2'), "{files_header:?}");
+        assert!(
+            files_header.contains("files - worktrees"),
+            "{files_header:?}"
+        );
+        let stashes_header = app.screen.row_text(22);
         assert!(stashes_header.contains('5'), "{stashes_header:?}");
         assert!(stashes_header.contains("stashes"), "{stashes_header:?}");
+        // A section header is tabs and a key, never a label: three tabs do
+        // not leave room for one in a 40-column sidebar, and the title bar
+        // says the focused pane's in full.
         assert!(
-            stashes_header.contains("fake (main) · 2 parked"),
+            !stashes_header.contains("fake (main) · 2 parked"),
             "{stashes_header:?}"
         );
 
@@ -13400,10 +13589,29 @@ diff --git a/tracked.txt b/tracked.txt
             );
         }
 
-        // And the stack itself drew: both rows, address first.
-        let rows: Vec<String> = (11..13).map(|y| app.screen.row_text(y)).collect();
+        // `5` opens the stack, and *then* it says what it holds and draws
+        // its rows — address first.
+        app.press(Key::plain(Code::Char('5')));
+        app.draw();
+        // The section stays where it is in the column — the foot — and only
+        // its height changes: a header that moved on focus would be a column
+        // that reorders itself under the eye. What it holds is on the title
+        // bar, which follows the keyboard.
+        assert!(
+            app.screen.row_text(4).contains("stashes"),
+            "{:?}",
+            app.screen.row_text(4)
+        );
+        assert!(
+            app.screen.row_text(0).contains("fake (main) · 2 parked"),
+            "the title did not follow: {:?}",
+            app.screen.row_text(0)
+        );
+        let rows: Vec<String> = (5..7).map(|y| app.screen.row_text(y)).collect();
         assert!(rows.iter().any(|r| r.contains("stash@{0}")), "{rows:?}");
         assert!(rows.iter().any(|r| r.contains("stash@{1}")), "{rows:?}");
+        app.press(Key::plain(Code::Char('4')));
+        app.draw();
 
         // Narrow: only the focused pane, at the full body. `5` is what both
         // focuses the stack and reveals it.
@@ -13446,33 +13654,24 @@ diff --git a/tracked.txt b/tracked.txt
         // title, header and status all follow the keyboard.
         app.press(Key::plain(Code::Char('4')));
         assert_eq!(app.panes.focused_name(), "commits");
-        app.dispatch("pane.next");
-        assert_eq!(
-            app.panes.focused_name(),
-            "stashes",
-            "the cycle did not reach the second list"
-        );
-        // The remotes list sits between the stack and the foot now; the
-        // tags, the reflog and the worktrees sit behind it, and the wrap
-        // takes four more steps.
-        app.dispatch("pane.next");
-        assert_eq!(
-            app.panes.focused_name(),
-            "remotes",
-            "the cycle did not reach the new list"
-        );
-        app.dispatch("pane.next");
-        assert_eq!(
-            app.panes.focused_name(),
-            "tags",
-            "the cycle did not reach the tags"
-        );
+        // The cycle walks every list in the column, in the order the column
+        // draws them: the reflog shares the commits' slot and is the next
+        // stop, then the stack at the foot, and the wrap comes back to the
+        // top of the files section.
         app.dispatch("pane.next");
         assert_eq!(
             app.panes.focused_name(),
             "reflog",
-            "the cycle did not reach the reflog"
+            "the cycle did not reach the reflog behind the commits"
         );
+        app.dispatch("pane.next");
+        assert_eq!(
+            app.panes.focused_name(),
+            "stashes",
+            "the cycle did not reach the stack"
+        );
+        app.dispatch("pane.next");
+        assert_eq!(app.panes.focused_name(), "files", "the cycle did not wrap");
         app.dispatch("pane.next");
         assert_eq!(
             app.panes.focused_name(),
@@ -13480,7 +13679,23 @@ diff --git a/tracked.txt b/tracked.txt
             "the cycle did not reach the worktrees"
         );
         app.dispatch("pane.next");
-        assert_eq!(app.panes.focused_name(), "files", "the cycle did not wrap");
+        assert_eq!(
+            app.panes.focused_name(),
+            "branches",
+            "the cycle did not reach the branches section"
+        );
+        app.dispatch("pane.next");
+        assert_eq!(
+            app.panes.focused_name(),
+            "remotes",
+            "the cycle did not reach the remotes"
+        );
+        app.dispatch("pane.next");
+        assert_eq!(
+            app.panes.focused_name(),
+            "tags",
+            "the cycle did not reach the tags"
+        );
         app.press(Key::plain(Code::Char('5')));
         assert_eq!(app.panes.focused_name(), "stashes");
         app.draw();
@@ -13489,10 +13704,13 @@ diff --git a/tracked.txt b/tracked.txt
             "the title did not follow: {:?}",
             app.screen.row_text(0)
         );
+        // The stack's section is the foot of the column, so its header is
+        // the fourth row whether it is open or collapsed — three headers
+        // above it, and everything below it is its own.
         assert!(
-            app.screen.row_text(10).contains('5') && app.screen.row_text(10).contains("stashes"),
+            app.screen.row_text(4).contains('5') && app.screen.row_text(4).contains("stashes"),
             "the header did not advertise the stack: {:?}",
-            app.screen.row_text(14)
+            app.screen.row_text(4)
         );
         assert!(
             app.screen
@@ -13541,29 +13759,34 @@ diff --git a/tracked.txt b/tracked.txt
         );
 
         // Mouse capture: a drag in the commit list selects its rows and its
-        // release reads that pane; a press in the stack's slice moves the
-        // keyboard there, and a drag inside the stack builds no selection —
-        // a stack is acted on one entry at a time. The commits slice is the
-        // third of the sidebar's seven (rows 8–10); the stack the fourth
-        // (rows 11–13).
+        // release reads that pane; a press on the stack's collapsed header
+        // moves the keyboard there, and a drag inside the stack once it is
+        // open builds no selection — a stack is acted on one entry at a
+        // time. The commits section is the open one, so its header is the
+        // third row of the body and its rows run from the fourth; the stack
+        // is the foot of the column, collapsed to row 22.
         app.dispatch("commits.focus");
-        app.mouse(click(MouseKind::Down, 5, 9));
-        app.mouse(click(MouseKind::Drag, 5, 10));
-        app.mouse(click(MouseKind::Up, 5, 10));
+        app.draw();
+        app.mouse(click(MouseKind::Down, 5, 5));
+        app.mouse(click(MouseKind::Drag, 5, 6));
+        app.mouse(click(MouseKind::Up, 5, 6));
         assert!(
             !commits_of(&app).selection().is_empty(),
             "the drag in the list selected nothing"
         );
-        app.mouse(click(MouseKind::Down, 5, 12));
+        app.mouse(click(MouseKind::Down, 5, 22));
         assert_eq!(
             app.panes.focused_name(),
             "stashes",
             "the press did not move the keyboard to the stack"
         );
-        app.mouse(click(MouseKind::Up, 5, 12));
-        app.mouse(click(MouseKind::Down, 5, 12));
-        app.mouse(click(MouseKind::Drag, 5, 13));
-        app.mouse(click(MouseKind::Up, 5, 13));
+        app.mouse(click(MouseKind::Up, 5, 22));
+        // Open now, and where the column always kept it: header on row 4,
+        // rows of its own under it.
+        app.draw();
+        app.mouse(click(MouseKind::Down, 5, 5));
+        app.mouse(click(MouseKind::Drag, 5, 6));
+        app.mouse(click(MouseKind::Up, 5, 6));
         assert_eq!(
             app.panes.get("stashes").map(|pane| pane.selection()),
             Some(String::new()),
@@ -14002,13 +14225,17 @@ diff --git a/tracked.txt b/tracked.txt
 
         // The tenant is drawn and behaved as *unavailable* — the failure
         // line, never the empty-stack line that would assert a read that
-        // never succeeded, and no row for a verb to address.
+        // never succeeded, and no row for a verb to address. Read where it
+        // is legible: the stack's section is the foot of the column, and a
+        // collapsed section has no rows and no label, so `5` opens it.
+        app.press(Key::plain(Code::Char('5')));
+        app.draw();
         assert!(
-            app.screen.row_text(10).contains("unavailable"),
-            "the header did not say so: {:?}",
-            app.screen.row_text(14)
+            app.screen.row_text(0).contains("unavailable"),
+            "the title did not say so: {:?}",
+            app.screen.row_text(0)
         );
-        let rows: Vec<String> = (11..13).map(|y| app.screen.row_text(y)).collect();
+        let rows: Vec<String> = (5..7).map(|y| app.screen.row_text(y)).collect();
         assert!(
             rows.iter().any(|r| r.contains("stash list unavailable")),
             "{rows:?}"
@@ -14040,11 +14267,11 @@ diff --git a/tracked.txt b/tracked.txt
         );
         app.draw();
         assert!(
-            app.screen.row_text(10).contains("fake (main) · 2 parked"),
-            "the header did not recover: {:?}",
-            app.screen.row_text(14)
+            app.screen.row_text(0).contains("fake (main) · 2 parked"),
+            "the label did not recover: {:?}",
+            app.screen.row_text(0)
         );
-        let rows: Vec<String> = (11..13).map(|y| app.screen.row_text(y)).collect();
+        let rows: Vec<String> = (5..7).map(|y| app.screen.row_text(y)).collect();
         assert!(rows.iter().any(|r| r.contains("stash@{0}")), "{rows:?}");
         assert!(
             !app.screen.row_text(23).contains("fatal:"),
@@ -14119,26 +14346,26 @@ diff --git a/tracked.txt b/tracked.txt
             app.panes.list_order(),
             [
                 "files",
+                "worktrees",
                 "branches",
-                "commits",
-                "stashes",
                 "remotes",
                 "tags",
+                "commits",
                 "reflog",
-                "worktrees",
+                "stashes",
             ]
         );
         assert_eq!(
             app.panes.reading_order(),
             [
                 "files",
+                "worktrees",
                 "branches",
-                "commits",
-                "stashes",
                 "remotes",
                 "tags",
+                "commits",
                 "reflog",
-                "worktrees",
+                "stashes",
                 "diff"
             ]
         );
@@ -14153,17 +14380,27 @@ diff --git a/tracked.txt b/tracked.txt
         );
         assert_eq!(
             app.panes.focused_placement(),
-            Some(panes::Placement::Sidebar { rank: 2 }),
-            "canonical rank 2, from the registry and not a layout edit"
+            Some(panes::Placement::Sidebar {
+                section: Some(2),
+                rank: 3
+            }),
+            "the branches section and canonical rank 3, from the registry and \
+             not a layout edit"
         );
 
-        // Ctrl-J cycles the now-real sidebar ring from it: branches' next
-        // list is commits', and the walk h/l reaches it too.
+        // Ctrl-J cycles the now-real sidebar ring from it, list by list in
+        // the order the column draws them: branches' next is the remotes
+        // tab behind it in the same section, and the walk h/l reaches the
+        // worktrees tab above it the same way.
         app.dispatch("pane.next");
-        assert_eq!(app.panes.focused_name(), "commits");
+        assert_eq!(app.panes.focused_name(), "remotes");
         app.press(Key::plain(Code::Char('3')));
         app.dispatch("pane.left");
-        assert_eq!(app.panes.focused_name(), "files", "the walk skipped a list");
+        assert_eq!(
+            app.panes.focused_name(),
+            "worktrees",
+            "the walk skipped a list"
+        );
 
         // A repository-backed diff launch registers the tenant the same way —
         // `App::new` never assumed commits exists — and the diff keeps the
@@ -14226,9 +14463,10 @@ diff --git a/tracked.txt b/tracked.txt
         );
 
         // Wide: branches and diff occupy the foundation's disjoint
-        // rectangles — the sidebar's second slice and the main region. No
-        // layout branch learned the name; this is the registry's own answer
-        // to a sixth sidebar list.
+        // rectangles — the branches section, second in the column and open
+        // because the keyboard is in it, and the main region. No layout
+        // branch learned the name; this is the registry's own answer to a
+        // sixth sidebar list.
         app.screen.resize(96, 24);
         app.draw();
         let branches = app.pane_rect("branches").expect("branches is placed wide");
@@ -14237,9 +14475,9 @@ diff --git a/tracked.txt b/tracked.txt
             branches,
             crate::panes::Rect {
                 x: 0,
-                y: 5,
+                y: 2,
                 width: 40,
-                height: 3
+                height: 19
             }
         );
         assert_eq!(
@@ -14986,11 +15224,14 @@ diff --git a/tracked.txt b/tracked.txt
             "the first press did not arm"
         );
         {
+            // The row is found by its text rather than by an offset: an open
+            // section is nineteen rows tall now, so the branch is under the
+            // `local` heading and not on the first content row.
             let rect = app.pane_rect("branches").expect("placed");
-            let ink = app
-                .screen
-                .ink(rect.x + 2, rect.y + 1)
-                .expect("a drawn cell");
+            let row = (rect.y + 1..rect.y + rect.height)
+                .find(|y| app.screen.row_text(*y)[..rect.width].contains("main"))
+                .expect("the armed branch is drawn");
+            let ink = app.screen.ink(rect.x + 2, row).expect("a drawn cell");
             assert_eq!(
                 ink.fg, app.host.theme.chrome.error,
                 "the armed row is not error-tinted"
@@ -15143,13 +15384,25 @@ diff --git a/tracked.txt b/tracked.txt
             "the arm died on a digit round-trip"
         );
         app.dispatch("pane.next");
-        assert_eq!(app.panes.focused_name(), "commits");
+        assert_eq!(app.panes.focused_name(), "remotes");
         app.dispatch("pane.prev");
         assert_eq!(app.panes.focused_name(), "branches");
         assert_eq!(
             branches_of(&app).armed_row(),
             Some(Target::Local(RefName::from("main"))),
             "the arm died on a ring round-trip"
+        );
+        // And on a tab round-trip inside its own section, which is the move
+        // the ring round-trip above was standing in for before the tabs
+        // existed.
+        app.dispatch("tab.next");
+        assert_eq!(app.panes.focused_name(), "remotes");
+        app.dispatch("tab.prev");
+        assert_eq!(app.panes.focused_name(), "branches");
+        assert_eq!(
+            branches_of(&app).armed_row(),
+            Some(Target::Local(RefName::from("main"))),
+            "the arm died on a tab round-trip"
         );
 
         // The following identical press — the same raw target the question
@@ -15453,14 +15706,23 @@ diff --git a/tracked.txt b/tracked.txt
             .chars()
             .take(40)
             .collect::<String>();
-        assert!(header.contains("branches"), "{header:?}");
+        assert!(header.contains("branches - remotes - tags"), "{header:?}");
         assert!(header.contains('3'), "{header:?}");
-        assert!(header.contains("fake (main) · 2 local"), "{header:?}");
+        // A section header is tabs and a key: three tabs leave a 40-column
+        // sidebar ten cells, which is not a label, so it draws none rather
+        // than half of one and the title bar says it in full.
+        assert!(!header.contains("fake (ma"), "{header:?}");
 
-        // The title and the status line follow the keyboard.
+        // The title and the status line follow the keyboard, and the title
+        // is where the live label is legible.
         assert!(
             app.screen.row_text(0).contains("branches"),
             "the title did not follow: {:?}",
+            app.screen.row_text(0)
+        );
+        assert!(
+            app.screen.row_text(0).contains("fake (main) · 2 local"),
+            "the title did not carry the live label: {:?}",
             app.screen.row_text(0)
         );
         assert!(
@@ -15603,10 +15865,13 @@ diff --git a/tracked.txt b/tracked.txt
             "the title did not follow: {:?}",
             app.screen.row_text(0)
         );
+        // The branches section is the second of the sidebar's four, so its
+        // header is the second row of the body whether it is open or not.
         assert!(
-            app.screen.row_text(4).contains('3') && app.screen.row_text(4).contains("branches"),
-            "the header did not advertise the pane: {:?}",
-            app.screen.row_text(5)
+            app.screen.row_text(2).contains('3')
+                && app.screen.row_text(2).contains("branches - remotes - tags"),
+            "the header did not advertise the section: {:?}",
+            app.screen.row_text(2)
         );
         assert!(
             app.screen.row_text(23).contains("branches · 1/4 · main"),
@@ -15653,28 +15918,32 @@ diff --git a/tracked.txt b/tracked.txt
         );
 
         // Mouse capture: a drag in the commit list selects its rows and its
-        // release reads that pane; a press in the branches slice moves the
-        // keyboard there, and a drag inside it builds no selection — a ref
-        // list is acted on one row at a time. The commits slice is rows
-        // 8–10; the branches slice rows 5–7.
+        // release reads that pane; a press on the branches section's
+        // collapsed header moves the keyboard there, and a drag inside it
+        // once it is open builds no selection — a ref list is acted on one
+        // row at a time. The commits section is the open one, so its rows
+        // start on screen row 4; the branches section is collapsed to its
+        // header on row 2.
         app.dispatch("commits.focus");
-        app.mouse(click(MouseKind::Down, 5, 9));
-        app.mouse(click(MouseKind::Drag, 5, 10));
-        app.mouse(click(MouseKind::Up, 5, 10));
+        app.draw();
+        app.mouse(click(MouseKind::Down, 5, 5));
+        app.mouse(click(MouseKind::Drag, 5, 6));
+        app.mouse(click(MouseKind::Up, 5, 6));
         assert!(
             !commits_of(&app).selection().is_empty(),
             "the drag in the list selected nothing"
         );
-        app.mouse(click(MouseKind::Down, 5, 6));
+        app.mouse(click(MouseKind::Down, 5, 2));
         assert_eq!(
             app.panes.focused_name(),
             "branches",
             "the press did not move the keyboard to the branches"
         );
-        app.mouse(click(MouseKind::Up, 5, 6));
-        app.mouse(click(MouseKind::Down, 5, 6));
-        app.mouse(click(MouseKind::Drag, 5, 7));
-        app.mouse(click(MouseKind::Up, 5, 7));
+        app.mouse(click(MouseKind::Up, 5, 2));
+        app.draw();
+        app.mouse(click(MouseKind::Down, 5, 4));
+        app.mouse(click(MouseKind::Drag, 5, 5));
+        app.mouse(click(MouseKind::Up, 5, 5));
         assert_eq!(
             app.panes.get("branches").map(|pane| pane.selection()),
             Some(String::new()),
@@ -17982,10 +18251,12 @@ diff --git a/tracked.txt b/tracked.txt
         let mut app = commits_app(&handle);
         app.dispatch("remotes.focus");
         app.draw();
+        // The remotes share the branches' section, second in the column, so
+        // its header is the second row of the body and its rows follow.
         assert!(
-            app.screen.row_text(13).contains("remotes"),
+            app.screen.row_text(2).contains("remotes"),
             "the header did not follow: {:?}",
-            app.screen.row_text(13)
+            app.screen.row_text(2)
         );
         assert!(
             app.screen.row_text(0).contains("1 remote"),
@@ -17993,7 +18264,7 @@ diff --git a/tracked.txt b/tracked.txt
             app.screen.row_text(0)
         );
         assert_eq!(remotes_status(&app), "1/1 · origin");
-        let body = (14..16)
+        let body = (3..5)
             .map(|y| app.screen.row_text(y))
             .collect::<Vec<_>>()
             .join("\n");
@@ -18917,10 +19188,12 @@ diff --git a/tracked.txt b/tracked.txt
         let mut app = commits_app(&handle);
         app.dispatch("tags.focus");
         app.draw();
+        // The tags share the branches' section, second in the column, so its
+        // header is the second row of the body and its rows follow.
         assert!(
-            app.screen.row_text(16).contains("tags"),
+            app.screen.row_text(2).contains("tags"),
             "the header did not follow: {:?}",
-            app.screen.row_text(16)
+            app.screen.row_text(2)
         );
         assert!(
             app.screen.row_text(0).contains("2 tags"),
@@ -18928,7 +19201,7 @@ diff --git a/tracked.txt b/tracked.txt
             app.screen.row_text(0)
         );
         assert_eq!(tags_status(&app), "1/2 · v2.0");
-        let body = (17..19)
+        let body = (3..5)
             .map(|y| app.screen.row_text(y))
             .collect::<Vec<_>>()
             .join("\n");
@@ -18939,7 +19212,7 @@ diff --git a/tracked.txt b/tracked.txt
         // The lightweight tag says so rather than drawing a bare commit.
         app.dispatch("view.down");
         app.draw();
-        let bare = (18..20)
+        let bare = (3..6)
             .map(|y| app.screen.row_text(y))
             .collect::<Vec<_>>()
             .join("\n");
@@ -19206,10 +19479,12 @@ diff --git a/tracked.txt b/tracked.txt
         let mut app = commits_app(&handle);
         app.dispatch("reflog.focus");
         app.draw();
+        // The reflog shares the commits' section, third in the column, so
+        // its header is the third row of the body and its rows follow.
         assert!(
-            app.screen.row_text(19).contains("reflog"),
+            app.screen.row_text(3).contains("reflog"),
             "the header did not follow: {:?}",
-            app.screen.row_text(19)
+            app.screen.row_text(3)
         );
         assert!(
             app.screen.row_text(0).contains("2 entries"),
@@ -19217,7 +19492,7 @@ diff --git a/tracked.txt b/tracked.txt
             app.screen.row_text(0)
         );
         assert_eq!(reflog_status(&app), "1/2 · HEAD@{0}");
-        let body = (20..22)
+        let body = (4..6)
             .map(|y| app.screen.row_text(y))
             .collect::<Vec<_>>()
             .join("\n");

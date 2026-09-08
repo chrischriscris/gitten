@@ -947,6 +947,15 @@ impl Keymap {
 
         bind("panes", "ctrl-j", "pane.next");
         bind("panes", "ctrl-k", "pane.prev");
+        // lazygit's tab pair, in the same mode and for the same reason: the
+        // sidebar groups its lists into numbered sections and these walk the
+        // tabs *within* the focused one, while the numbers name a section and
+        // ctrl-j/ctrl-k walk every list in the column. Under the focused
+        // pane's own mode, so `[diff]`'s file jumps keep the keys where the
+        // main region has the keyboard — the sideways pair a diff needs is
+        // older and more urgent than a tab there is no section for.
+        bind("panes", "[", "tab.prev");
+        bind("panes", "]", "tab.next");
         k
     }
 
@@ -2197,6 +2206,8 @@ impl Commands {
             ("input.cancel", "discard the text", None),
             ("pane.next", "the next list in the column", None),
             ("pane.prev", "the previous list in the column", None),
+            ("tab.next", "the next tab in this section", None),
+            ("tab.prev", "the previous tab in this section", None),
             ("pane.left", "the pane on the left", None),
             ("pane.right", "the pane on the right", None),
             ("select.all", "select the whole view", None),
