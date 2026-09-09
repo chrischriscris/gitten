@@ -157,12 +157,10 @@ impl Input {
     /// Turns the field multiline — the Description's shape. Newlines survive
     /// paste, Enter (as `input.newline`, routed by the shell) breaks the
     /// line, and the render grows one row per visual line.
-    #[allow(dead_code)] // STUB(phase3-resume): the Description field's shape, unwired.
     pub fn set_multiline(&mut self, multiline: bool) {
         self.multiline = multiline;
     }
 
-    #[allow(dead_code)] // STUB(phase3-resume): read by the inspector's Description field.
     pub fn is_multiline(&self) -> bool {
         self.multiline
     }
@@ -170,7 +168,6 @@ impl Input {
     /// Replaces the whole text — a draft store refilling its field on a
     /// repository switch. The cursor parks at the end; no event fires,
     /// because the caller already wrote the draft this mirrors.
-    #[allow(dead_code)] // STUB(phase3-resume): draft store refilling fields on repo switch.
     pub fn set_text(&mut self, text: String, cx: &mut Context<Self>) {
         self.content = text;
         let end = self.content.len();
@@ -183,7 +180,6 @@ impl Input {
     /// The `input.newline` answer for a focused multiline field: a line
     /// break at the cursor. Single-line fields refuse it — their Enter is
     /// accept's, and a break inside one would be content no render shows.
-    #[allow(dead_code)] // STUB(phase3-resume): Enter breaking the Description line.
     pub fn insert_newline(&mut self, cx: &mut Context<Self>) {
         if !self.multiline {
             return;

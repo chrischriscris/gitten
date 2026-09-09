@@ -21,13 +21,11 @@ use std::rc::Rc;
 
 /// The shell's named dispatch, as the inspector's controls call it: one
 /// command name at a time, through the same path the keyboard resolves to.
-#[allow(dead_code)] // STUB(phase3-resume): the inspector's dispatch handle, unwired.
 pub(crate) type Dispatch = Rc<dyn Fn(&str, &mut App)>;
 
 /// Everything the inspector draws that it does not own. Counts and rows
 /// arrive spelled per refresh; the fields arrive as entities; the strings
 /// arrive spelled shell-side once per frame, not per row.
-#[allow(dead_code)] // STUB(phase3-resume): constructed by the workspace once wired.
 pub(crate) struct InspectorDeps {
     pub summary: Option<Entity<Input>>,
     pub description: Option<Entity<Input>>,
@@ -44,7 +42,6 @@ pub(crate) struct InspectorDeps {
 
 /// The whole rail, sized by its parent. Reads entities and refcounts once
 /// per frame; regrouping and side reads happen on refresh, never here.
-#[allow(dead_code)] // STUB(phase3-resume): called from the workspace's inspector slot.
 pub(crate) fn render_inspector(deps: &InspectorDeps, cx: &mut App) -> AnyElement {
     let host = crate::config::host(cx);
     let dim = rgb(host.theme.dim_on(Surface::Context));
@@ -222,11 +219,21 @@ pub(crate) fn render_inspector(deps: &InspectorDeps, cx: &mut App) -> AnyElement
         .child(
             div()
                 .flex_none()
+                .flex()
+                .flex_col()
+                .gap_y(px(4.0))
                 .px(px(chrome::ROW_PAD))
                 .py(px(8.0))
                 .border_t_1()
                 .border_color(rgb(host.theme.chrome.border))
-                .child(commit_row),
+                .child(commit_row)
+                // The gate's reason, said aloud under the button when it
+                // may not fire — a disabled control that names its missing
+                // half instead of swallowing the click.
+                .children(
+                    (!deps.can_commit && !deps.commit_note.is_empty())
+                        .then(|| div().text_color(dim).child(deps.commit_note.clone())),
+                ),
         )
         .into_any_element()
 }

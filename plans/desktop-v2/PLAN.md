@@ -159,3 +159,42 @@ Resume order for the next worker: wire inspector into workspace render
 `act::commit_message` (staged-only, keep draft on refusal) → status
 segments + job-finish timestamps → toolbar controls → visual QA via
 `./dev dump`. Do NOT launch any client.
+
+## Phase 3-resume-A (landed): inspector wired
+
+Commit `desktop-v2 phase3-resume-A: inspector wired`: shell 399 (incl. 2
+new `CommitDraft` gate/message tests), core 498, app 155; `cargo check`
+zero warnings; `cargo fmt --check` + `cargo clippy --workspace
+--all-targets -- -D warnings` clean.
+
+DONE:
+
+- `views/inspector.rs` renders in the workspace's 266px slot (heading,
+  staged-file summary from `files::staged_summary`, Summary single-line +
+  Description multiline `Input` entities, staged-hunk count, Commit
+  button, gate reason line under the button when disabled).
+- `ensure_inspector_fields` builds both fields once on first composition
+  and refills per repository key; `Edited` subscriptions mirror every
+  keystroke into `drafts`, with `sync_fields_to_draft` as the transition
+  backstop (dialog open/submit, leave, refill). `set_text` refill emits
+  nothing, so no feedback loop.
+- Gate: staged-hunk total > 0 AND draft `has_message`; disabled button
+  stays clickable and says why (button note + notice on the keyboard
+  door). Confirm dialog (`modal::centered`) shows branch (`head_info`),
+  draft message, files/hunks; confirm re-gates and submits through
+  `act::commit_message` (staged-only, unstaged retained). Draft clears
+  only on the `commit` job's clean finish, keyed by `pending_commit_key`
+  (exact repo, never current-by-accident); refusal keeps the draft with
+  git's verbatim error in the band and closes the dialog.
+- Keyboard: field focus bypasses the pane keymap (typing never fires
+  commands); Esc blurs to files; plain Enter advances Summary →
+  Description; Alt+Enter breaks the Description line (`input.newline`
+  convention); Cmd+Enter commits via the existing global door. Esc over
+  the dialog cancels with focus restored to files.
+- Remaining `STUB(phase3-resume)` markers are exactly the resume-B set:
+  `last_fetch`/`last_push` stamps + `files::counts()` for status
+  segments. Toolbar controls untouched.
+
+STILL STUBBED (resume-B): status-bar leading segments + job-finish
+timestamps; toolbar branch control, Push + `ahead`, Commands button;
+visual QA.

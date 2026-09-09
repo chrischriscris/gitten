@@ -535,13 +535,11 @@ enum Prompt {
 /// gate and the confirmation dialog, cleared only when a commit job
 /// finishes cleanly — a refused commit keeps its words standing.
 #[derive(Debug, Clone, Default)]
-#[allow(dead_code)] // STUB(phase3-resume): read by the inspector's gate once wired.
 struct CommitDraft {
     summary: String,
     description: String,
 }
 
-#[allow(dead_code)] // STUB(phase3-resume): called by the inspector's gate once wired.
 impl CommitDraft {
     /// The gate beside the button: staged content is the caller's to check
     /// (it knows the index); the draft answers whether it names the commit.
@@ -1582,7 +1580,6 @@ struct DevShell {
     /// refused commit, and dies only on a successful one. Keyed by the
     /// repository path, so switching repositories restores each one's
     /// unsent words rather than leaking them across.
-    #[allow(dead_code)] // STUB(phase3-resume): the inspector's draft store, unwired.
     drafts: std::collections::HashMap<String, CommitDraft>,
     /// The commit confirmation standing over the workspace, if
     /// `workspace.commit` opened it. Rendered from the draft and the staged
@@ -1590,8 +1587,13 @@ struct DevShell {
     /// — the write itself is [`gitten_app::act::commit_message`]'s, the same
     /// function the prompt path calls, so there is one commit implementation
     /// under both doors.
-    #[allow(dead_code)] // STUB(phase3-resume): set by the confirm dialog, unwired.
     commit_confirm: bool,
+    /// The repository key a submitted `commit` job belongs to, if one is
+    /// in flight. The finish line clears exactly that repository's draft —
+    /// the current key would be the wrong one if the window switched
+    /// repositories mid-commit — and a refusal clears nothing, so the
+    /// unsent words stand beside git's verbatim error.
+    pending_commit_key: Option<String>,
     /// When the last fetch and push finished cleanly — the status bar's
     /// recency, stamped in [`DevShell::drain_jobs`] by job name. `None` is
     /// "never this session", said as "never" rather than a blank, because
@@ -2091,27 +2093,86 @@ impl DevShell {
     /// The input owns the keyboard while it is open — [`input::MODE`] sits on
     /// top of the pane stack — and [`DevShell::close_input`] routes the text
     /// back here through the prompt slot.
-    /// `workspace.commit`: the inspector's commit door. STUB — the confirm
-    /// dialog arrives with the inspector (Phase 3); until then this names
-    /// the absence where the button lives rather than running a second
-    /// write path beside the prompt's. The write, when it lands, is always
-    /// `act::commit_message`'s.
-    fn open_commit_confirm(&mut self, _cx: &mut Context<Self>) {
-        // TODO(phase3-inspector): open the confirm dialog (branch, message,
-        // files/hunks preview) and route accept through `act::commit_message`.
-        self.set_notice("commit confirmation arrives with the inspector");
+    /// `workspace.commit`: the inspector's commit door — the Commit button,
+    /// the `CommitStaged` menu action and cmd-enter all arrive here. Opens
+    /// the confirmation dialog when the gate holds (staged content and a
+    /// non-whitespace summary); otherwise says which half is missing. The
+    /// write itself is [`gitten_app::act::commit_message`]'s — one commit
+    /// implementation under both this door and the prompt's.
+    fn open_commit_confirm(&mut self, cx: &mut Context<Self>) {
+        if !self.workspace.enabled {
+            self.enter_workspace(cx);
+        }
+        if self.repo.is_none() {
+            self.set_notice("a fixture has no repository to commit in");
+            return;
+        }
+        self.ensure_inspector_fields(cx);
+        self.sync_fields_to_draft(cx);
+        if self.files_staged(cx).1 == 0 {
+            self.set_notice("nothing staged to commit");
+            return;
+        }
+        let has = self
+            .draft_key()
+            .as_ref()
+            .and_then(|key| self.drafts.get(key))
+            .is_some_and(CommitDraft::has_message);
+        if !has {
+            self.set_notice("a commit needs a message");
+            return;
+        }
+        self.commit_confirm = true;
+        cx.notify();
     }
 
-    /// `workspace.commit-confirm` / `-cancel`: unreachable until the dialog
-    /// above exists; kept so the names stay registered and bindable.
-    fn confirm_commit(&mut self, _cx: &mut Context<Self>) {
-        // TODO(phase3-inspector): submit the confirmed commit.
-        self.set_notice("commit confirmation arrives with the inspector");
+    /// `workspace.commit-confirm`: the dialog's Commit button. Re-gates —
+    /// staging may have moved while the dialog stood — then submits the
+    /// draft's message through `act::commit_message`: staged-only, unstaged
+    /// retained, the refresh wave re-acquiring afterwards. The draft clears
+    /// only on the job's clean finish (see `drain_jobs`); a refusal keeps
+    /// its words standing beside git's verbatim error.
+    fn confirm_commit(&mut self, cx: &mut Context<Self>) {
+        if !self.commit_confirm {
+            return;
+        }
+        self.sync_fields_to_draft(cx);
+        let key = self.draft_key();
+        let (message, has) = match key.as_ref().and_then(|k| self.drafts.get(k)) {
+            Some(draft) => (draft.message(), draft.has_message()),
+            None => {
+                self.commit_confirm = false;
+                self.set_notice("a fixture has no repository to commit in");
+                self.focus_named("files", cx);
+                return;
+            }
+        };
+        if self.files_staged(cx).1 == 0 {
+            self.commit_confirm = false;
+            self.set_notice("nothing staged to commit");
+            self.focus_named("files", cx);
+            return;
+        }
+        if !has {
+            self.commit_confirm = false;
+            self.set_notice("a commit needs a message");
+            self.focus_named("files", cx);
+            return;
+        }
+        self.commit_confirm = false;
+        self.pending_commit_key = key;
+        let mut client = WindowActs { shell: self, cx };
+        gitten_app::act::commit_message(&mut client, message);
+        self.focus_named("files", cx);
     }
 
-    fn cancel_commit_confirm(&mut self, _cx: &mut Context<Self>) {
-        // TODO(phase3-inspector): dismiss the confirm dialog.
-        self.set_notice("commit confirmation arrives with the inspector");
+    /// `workspace.commit-cancel`, and Esc over the standing dialog: dismiss
+    /// with the draft untouched, and hand the keyboard back to the files
+    /// pane — the same focus restoration the prompt path keeps.
+    fn cancel_commit_confirm(&mut self, cx: &mut Context<Self>) {
+        self.commit_confirm = false;
+        self.focus_named("files", cx);
+        cx.notify();
     }
 
     fn begin_commit_message(&mut self, cx: &mut Context<Self>) {
@@ -3316,9 +3377,17 @@ impl DevShell {
                 JobEvent::Finished {
                     outcome: Err(error),
                     generation,
+                    name,
                     ..
                 } => {
                     self.running = None;
+                    // A refused commit keeps its draft standing: the words
+                    // stay filed for the retry beside git's verbatim error,
+                    // but the dialog must not stand over a finished job.
+                    if name == "commit" {
+                        self.pending_commit_key = None;
+                        self.commit_confirm = false;
+                    }
                     self.error = Some(GitError::new(error));
                     self.error_is_load = false;
                     // A refusal is not proof the repository stood still: git
@@ -3337,9 +3406,28 @@ impl DevShell {
                     outcome: Ok(()),
                     generation,
                     done,
+                    name,
                     ..
                 } => {
                     self.running = None;
+                    // A clean commit finish spends its draft: exactly the
+                    // repository the job ran for, never the current one by
+                    // accident. The fields refill empty — `set_text` emits
+                    // nothing, so the refill never writes back into the
+                    // store it just cleared.
+                    if name == "commit" {
+                        let key = self.pending_commit_key.take().or_else(|| self.draft_key());
+                        if let Some(key) = key {
+                            self.drafts.remove(&key);
+                        }
+                        self.commit_confirm = false;
+                        if let Some(field) = self.workspace.summary.clone() {
+                            field.update(cx, |field, cx| field.set_text(String::new(), cx));
+                        }
+                        if let Some(field) = self.workspace.description.clone() {
+                            field.update(cx, |field, cx| field.set_text(String::new(), cx));
+                        }
+                    }
                     if generation > self.generation {
                         self.generation = generation;
                         self.refresh_stale(cx);
@@ -4712,6 +4800,157 @@ impl DevShell {
         self.sync_modes(cx);
     }
 
+    /// The draft store's key for this window: the repository path, so
+    /// switching repositories restores each one's unsent words rather than
+    /// leaking them across. `None` over a fixture, which has no drafts.
+    fn draft_key(&self) -> Option<String> {
+        self.repo
+            .as_ref()
+            .map(|(path, _)| path.to_string_lossy().into_owned())
+    }
+
+    /// File the inspector fields' current words into the current
+    /// repository's draft. Called before every read that crosses a
+    /// boundary — opening the dialog, submitting, leaving the workspace,
+    /// refilling for another repository — so the store is current wherever
+    /// the fields themselves survive. The fields' own `Edited`
+    /// subscriptions keep it current between these points; this is the
+    /// backstop for transitions.
+    fn sync_fields_to_draft(&mut self, cx: &mut Context<Self>) {
+        let Some(key) = self.draft_key() else {
+            return;
+        };
+        let summary = self
+            .workspace
+            .summary
+            .as_ref()
+            .map(|field| field.read(cx).value().to_string());
+        let description = self
+            .workspace
+            .description
+            .as_ref()
+            .map(|field| field.read(cx).value().to_string());
+        if summary.is_none() && description.is_none() {
+            return;
+        }
+        let draft = self.drafts.entry(key).or_default();
+        if let Some(text) = summary {
+            draft.summary = text;
+        }
+        if let Some(text) = description {
+            draft.description = text;
+        }
+    }
+
+    /// The inspector's two fields, built once and refilled per repository:
+    /// Summary single-line, Description multiline, both mirrored into the
+    /// draft store on every edit. Called from the workspace composition, so
+    /// a repository switch refills rather than leaks — the leaving words
+    /// are filed first, then both fields take the new repository's draft.
+    fn ensure_inspector_fields(&mut self, cx: &mut Context<Self>) {
+        let key = self.draft_key();
+        if self.workspace.summary.is_some() && self.workspace.fields_key == key {
+            return;
+        }
+        self.sync_fields_to_draft(cx);
+        let draft = key
+            .as_ref()
+            .and_then(|key| self.drafts.get(key))
+            .cloned()
+            .unwrap_or_default();
+        if self.workspace.summary.is_none() {
+            let summary = cx.new(|cx| input::Input::new("", "Commit summary", "", cx));
+            let description = cx.new(|cx| {
+                let mut field = input::Input::new("", "Description (optional)", "", cx);
+                field.set_multiline(true);
+                field
+            });
+            let mut subs = Vec::new();
+            subs.push(
+                cx.subscribe(&summary, |this: &mut Self, _, event: &input::Event, cx| {
+                    if let input::Event::Edited(text) = event {
+                        if let Some(key) = this.draft_key() {
+                            this.drafts.entry(key).or_default().summary = text.clone();
+                            cx.notify();
+                        }
+                    }
+                }),
+            );
+            subs.push(cx.subscribe(
+                &description,
+                |this: &mut Self, _, event: &input::Event, cx| {
+                    if let input::Event::Edited(text) = event {
+                        if let Some(key) = this.draft_key() {
+                            this.drafts.entry(key).or_default().description = text.clone();
+                            cx.notify();
+                        }
+                    }
+                },
+            ));
+            self.workspace.field_subs = subs;
+            self.workspace.summary = Some(summary);
+            self.workspace.description = Some(description);
+        }
+        // `set_text` emits nothing — the draft already holds these words —
+        // so refilling never writes back into the store it just read.
+        if let Some(field) = self.workspace.summary.clone() {
+            field.update(cx, |field, cx| field.set_text(draft.summary.clone(), cx));
+        }
+        if let Some(field) = self.workspace.description.clone() {
+            field.update(cx, |field, cx| {
+                field.set_text(draft.description.clone(), cx)
+            });
+        }
+        self.workspace.fields_key = key;
+    }
+
+    /// The inspector's staged truth, straight off the files pane's refresh:
+    /// staged files with their `(staged, total)` hunk counts, plus the
+    /// staged-hunk total the Commit gate reads. No side is re-read here —
+    /// the composition calls this once per frame and the numbers arrive
+    /// spelled per refresh.
+    fn files_staged(&self, cx: &mut Context<Self>) -> (Vec<views::files::StagedFile>, u32) {
+        let Some(screen) = self.panes.get("files").cloned() else {
+            return (Vec::new(), 0);
+        };
+        let Screen::Files { view, .. } = screen else {
+            return (Vec::new(), 0);
+        };
+        let view = view.read(cx);
+        (view.staged_summary(), view.staged_hunks())
+    }
+
+    /// Who HEAD is, for the confirm dialog's branch line: the branches
+    /// pane's own spelling — a branch name or `detached · <sha>` — or an
+    /// honest absence when the pane never loaded, which the dialog says as
+    /// "no branch loaded" rather than inventing one.
+    fn head_label(&self, cx: &mut Context<Self>) -> Option<SharedString> {
+        let screen = self.panes.get("branches").cloned()?;
+        let Screen::Branches { view, .. } = screen else {
+            return None;
+        };
+        view.read(cx).head_info().map(|info| info.label)
+    }
+
+    /// Which inspector field holds the keyboard, if one does: `false` for
+    /// Summary, `true` for Description. The prompt path keeps its promise
+    /// about where the keyboard is by slot; the embedded fields keep it by
+    /// focus, compared here against the window's focused handle.
+    fn workspace_field_focused(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<bool> {
+        let focused = window.focused(cx)?;
+        for (entity, is_description) in [
+            (&self.workspace.summary, false),
+            (&self.workspace.description, true),
+        ] {
+            if let Some(field) = entity {
+                if field.read(cx).focus_handle() == focused {
+                    return Some(is_description);
+                }
+            }
+        }
+        None
+    }
+
     fn enter_workspace(&mut self, cx: &mut Context<Self>) {
         self.workspace.enabled = true;
         self.workspace.destination = views::workspace::Destination::Changes;
@@ -4725,6 +4964,9 @@ impl DevShell {
     /// `workspace.history`: back to the full stack — the History destination
     /// until the timeline moves into the workspace in a later phase.
     fn leave_workspace(&mut self, cx: &mut Context<Self>) {
+        // The words on screen belong to this repository: file them before
+        // the destination changes, so coming back restores them.
+        self.sync_fields_to_draft(cx);
         self.workspace.enabled = false;
         self.workspace.destination = views::workspace::Destination::History;
         if self.has_column {
@@ -5094,6 +5336,63 @@ impl DevShell {
         // rows; the key is still the keymap's.
         if self.context.take().is_some() {
             cx.notify();
+        }
+        // The commit dialog stands over the workspace: Esc cancels it from
+        // anywhere and hands the keyboard back to the files pane — the same
+        // focus restoration the prompt path keeps when its field closes.
+        if self.commit_confirm
+            && ev.keystroke.key.as_str() == "escape"
+            && !ev.keystroke.modifiers.control
+            && !ev.keystroke.modifiers.alt
+            && !ev.keystroke.modifiers.platform
+            && !ev.keystroke.modifiers.function
+        {
+            self.pending.clear();
+            cx.stop_propagation();
+            self.cancel_commit_confirm(cx);
+            return;
+        }
+        // An inspector field holds the keyboard: its own KEY_CONTEXT
+        // actions and the platform input own the press, so the pane keymap
+        // stays silent and typing never stages, discards or quits. Esc
+        // leaves the field for the files pane; plain Enter advances
+        // Summary to Description; Description breaks lines on Alt+Enter
+        // (the app's `input.newline` convention) and commits on Cmd+Enter
+        // (the global `workspace.commit` door) — plain Enter there is
+        // nothing, said by doing nothing rather than a bell. Anything else
+        // falls through to the field untouched.
+        if let Some(is_description) = self.workspace_field_focused(window, cx) {
+            let key = ev.keystroke.key.as_str();
+            let mods = &ev.keystroke.modifiers;
+            let clean = !mods.control && !mods.alt && !mods.platform && !mods.function;
+            if key == "escape" && clean {
+                self.pending.clear();
+                cx.stop_propagation();
+                self.focus_named("files", cx);
+                cx.notify();
+                return;
+            }
+            if key == "enter" && clean && !mods.shift && !is_description {
+                if let Some(field) = self.workspace.description.clone() {
+                    window.focus(&field.read(cx).focus_handle(), cx);
+                }
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+            if key == "enter" && mods.alt && !mods.control && !mods.platform && is_description {
+                if let Some(field) = self.workspace.description.clone() {
+                    field.update(cx, |input, cx| {
+                        if input.is_multiline() {
+                            input.insert_newline(cx);
+                        }
+                    });
+                }
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+            return;
         }
         let candidates = dispatch::translate(&ev.keystroke);
         if candidates.is_empty() {
@@ -5594,7 +5893,7 @@ impl DevShell {
 
 impl DevShell {
     /// The workspace middle region: 76px destination header over a
-    /// sidebar + center-diff + inspector-stub row. Widths are fixed px per
+    /// sidebar + center-diff + inspector row. Widths are fixed px per
     /// the spec (255/266, 280/295 past 1550px), read from the viewport once
     /// here at composition time — never from inside a view.
     fn workspace_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -5819,9 +6118,41 @@ impl DevShell {
                     .child(center.clone()),
             );
 
-        // The inspector's slot: content (staged summary, drafts, commit)
-        // is Phase 3. The width is reserved here so the center never lays
-        // out against a width Phase 3 will move.
+        // The inspector's rail: staged summary, drafts and commit, drawn
+        // from the files pane's refresh and the shell's draft store — never
+        // a second read of the repository. The fields exist from
+        // `ensure_inspector_fields` above; the gate reads the draft they
+        // mirror on every edit.
+        self.ensure_inspector_fields(cx);
+        let me_inspector = cx.entity().downgrade();
+        let inspect_dispatch: views::inspector::Dispatch = Rc::new(move |command, cx| {
+            if let Some(shell) = me_inspector.upgrade() {
+                shell.update(cx, |this, cx| this.run_command(command, cx));
+            }
+        });
+        let (staged_files, staged_total) = self.files_staged(cx);
+        let draft_has_message = self
+            .draft_key()
+            .as_ref()
+            .and_then(|key| self.drafts.get(key))
+            .is_some_and(CommitDraft::has_message);
+        let (can_commit, commit_note) = match (staged_total > 0, draft_has_message) {
+            (false, _) => (false, SharedString::from("Stage a hunk to enable commit")),
+            (true, false) => (
+                false,
+                SharedString::from("Write a summary to enable commit"),
+            ),
+            (true, true) => (true, SharedString::from("")),
+        };
+        let inspector_deps = views::inspector::InspectorDeps {
+            summary: self.workspace.summary.clone(),
+            description: self.workspace.description.clone(),
+            staged: staged_files,
+            staged_hunks: staged_total,
+            can_commit,
+            commit_note,
+            dispatch: inspect_dispatch,
+        };
         let inspector = div()
             .id("workspace-inspector")
             .debug_selector(|| "workspace-inspector".to_string())
@@ -5833,16 +6164,7 @@ impl DevShell {
             .overflow_hidden()
             .border_l_1()
             .border_color(rgb(c.border))
-            .bg(rgb(c.bg))
-            .px(px(12.0))
-            .py(px(10.0))
-            .gap_y(px(8.0))
-            .child(div().text_color(rgb(c.fg)).child("Commit"))
-            .child(
-                div()
-                    .text_color(rgb(host.theme.dim_on(theme::Surface::Context)))
-                    .child("Staged summary and commit arrive in Phase 3."),
-            );
+            .child(views::inspector::render_inspector(&inspector_deps, cx));
 
         let (destination_title, header_sub) = match self.workspace.destination {
             views::workspace::Destination::Changes => {
@@ -5868,7 +6190,112 @@ impl DevShell {
                     .child(SharedString::from(header_sub)),
             );
 
-        div()
+        // The confirmation standing over the workspace: branch, message and
+        // staged counts as they stand now — the submit re-gates, so a dialog
+        // left standing across a staging change cannot commit what it
+        // previewed. Rendered through the shared centered panel; Esc and
+        // Cancel dismiss with the draft untouched (see `on_key`).
+        let staged_len = inspector_deps.staged.len();
+        let dialog = self.commit_confirm.then(|| {
+            let key = self.draft_key();
+            let draft = key
+                .as_ref()
+                .and_then(|key| self.drafts.get(key))
+                .cloned()
+                .unwrap_or_default();
+            let branch = self
+                .head_label(cx)
+                .unwrap_or_else(|| SharedString::from("no branch loaded"));
+            let dim = rgb(host.theme.dim_on(theme::Surface::Context));
+            let weak = cx.entity().downgrade();
+            let cancel = weak.clone();
+            let button = |id: &'static str, label: &'static str, lit: bool| {
+                div()
+                    .id(id)
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .h(px(28.0))
+                    .px(chrome::gap_l(&host.font))
+                    .rounded(px(chrome::RADIUS))
+                    .cursor_pointer()
+                    .bg(rgb(match lit {
+                        true => c.accent,
+                        false => c.raised,
+                    }))
+                    .text_color(rgb(match lit {
+                        true => c.status_bg,
+                        false => c.fg,
+                    }))
+                    .child(label)
+            };
+            let mut message: Vec<AnyElement> = vec![div()
+                .text_color(rgb(c.fg))
+                .child(SharedString::from(draft.summary.clone()))
+                .into_any_element()];
+            if !draft.description.trim().is_empty() {
+                message.push(
+                    div()
+                        .text_color(dim)
+                        .child(SharedString::from(draft.description.clone()))
+                        .into_any_element(),
+                );
+            }
+            modal::centered(
+                &host,
+                modal::Width::Max(560.0),
+                vec![
+                    div()
+                        .text_color(rgb(c.fg))
+                        .child("Commit staged changes")
+                        .into_any_element(),
+                    div()
+                        .flex()
+                        .gap(chrome::gap_s(&host.font))
+                        .text_color(dim)
+                        .child("Branch:")
+                        .child(div().text_color(rgb(c.fg)).child(branch))
+                        .into_any_element(),
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_y(px(4.0))
+                        .children(message)
+                        .into_any_element(),
+                    div()
+                        .text_color(dim)
+                        .child(SharedString::from(format!(
+                            "{staged_len} {} \u{00b7} {staged_total} {} staged",
+                            match staged_len {
+                                1 => "file",
+                                _ => "files",
+                            },
+                            match staged_total {
+                                1 => "hunk",
+                                _ => "hunks",
+                            },
+                        )))
+                        .into_any_element(),
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap(chrome::gap_m(&host.font))
+                        .child(button("ws-commit-cancel", "Cancel", false).on_click(
+                            move |_, _, cx| {
+                                _ = cancel.update(cx, |this, cx| this.cancel_commit_confirm(cx));
+                            },
+                        ))
+                        .child(button("ws-commit-confirm", "Commit", true).on_click(
+                            move |_, _, cx| {
+                                _ = weak.update(cx, |this, cx| this.confirm_commit(cx));
+                            },
+                        ))
+                        .into_any_element(),
+                ],
+            )
+        });
+        let body = div()
             .min_h_0()
             .flex_grow(1.0)
             .flex()
@@ -5885,8 +6312,15 @@ impl DevShell {
                     .child(sidebar)
                     .child(center_pane)
                     .child(inspector),
-            )
-            .into_any_element()
+            );
+        match dialog {
+            Some(dialog) => div()
+                .size_full()
+                .child(body)
+                .child(dialog)
+                .into_any_element(),
+            None => body.into_any_element(),
+        }
     }
 }
 
@@ -7548,6 +7982,7 @@ fn open_main_window(launch: Launch, cx: &mut App) {
                 workspace: views::workspace::Workspace::default(),
                 drafts: std::collections::HashMap::new(),
                 commit_confirm: false,
+                pending_commit_key: None,
                 last_fetch: None,
                 last_push: None,
                 modes: Modes::new(),
@@ -7892,6 +8327,50 @@ mod tests {
     }
 
     #[test]
+    fn the_commit_gate_ignores_a_whitespace_summary() {
+        // The inspector's Commit button and the confirm door share this
+        // gate with the prompt path's refusal: blank is blank, whatever
+        // the draft's description holds.
+        use super::CommitDraft;
+        assert!(!CommitDraft::default().has_message());
+        assert!(!CommitDraft {
+            summary: "   \n  ".into(),
+            description: "real words".into(),
+        }
+        .has_message());
+        assert!(CommitDraft {
+            summary: "name the change".into(),
+            ..Default::default()
+        }
+        .has_message());
+    }
+
+    #[test]
+    fn the_commit_message_shapes_git_two_paragraphs() {
+        // What `git commit` receives: the subject alone when no
+        // description was written — an empty second paragraph would be
+        // content, not absence — and git's own blank line between them
+        // when one was.
+        use super::CommitDraft;
+        assert_eq!(
+            CommitDraft {
+                summary: "name the change".into(),
+                ..Default::default()
+            }
+            .message(),
+            "name the change"
+        );
+        assert_eq!(
+            CommitDraft {
+                summary: "name the change".into(),
+                description: "  why it reads this way  ".into(),
+            }
+            .message(),
+            "name the change\n\n  why it reads this way  "
+        );
+    }
+
+    #[test]
     fn a_bare_launch_names_its_view_and_nothing_else() {
         // What `open /Applications/gitten.app` arrives as: no arguments, and no
         // source beyond the default. Only this shape gets the recent-then-picker
@@ -8194,6 +8673,7 @@ mod tests {
                 last_fetch: None,
                 last_push: None,
                 modes: Modes::new(),
+                pending_commit_key: None,
                 pending: vec![vec![Key::char('g')]],
                 help: false,
                 help_scroll: ScrollHandle::default(),
@@ -8335,6 +8815,7 @@ mod tests {
                 last_fetch: None,
                 last_push: None,
                 modes: Modes::new(),
+                pending_commit_key: None,
                 pending: Vec::new(),
                 help: false,
                 help_scroll: ScrollHandle::default(),

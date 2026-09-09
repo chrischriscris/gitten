@@ -79,7 +79,6 @@ pub(crate) struct FileEntry {
 /// counted. `(0, 0)` is a skipped side read, not an empty stage — the row
 /// still lists, because the status read said the file is staged.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // STUB(phase3-resume): read by the inspector's staged summary.
 pub(crate) struct StagedFile {
     pub(crate) dir: SharedString,
     pub(crate) name: SharedString,
@@ -644,7 +643,6 @@ impl Files {
     /// order: the inspector's staged summary, sharing the rows' own numbers
     /// rather than re-deriving them. A staged path the side reads skipped
     /// keeps its file-level truth — `(0, 0)` — so the row still lists.
-    #[allow(dead_code)] // STUB(phase3-resume): read by the inspector's staged summary.
     pub(crate) fn staged_summary(&self) -> Vec<StagedFile> {
         self.data
             .iter()
@@ -667,7 +665,6 @@ impl Files {
     /// Staged hunks across every staged path — the status bar's count and
     /// the inspector's total. A sum over the refresh's map, so one frame
     /// reads one cached number per path and no side twice.
-    #[allow(dead_code)] // STUB(phase3-resume): read by the inspector's Commit gate.
     pub(crate) fn staged_hunks(&self) -> u32 {
         self.counts.values().map(|(staged, _)| staged).sum()
     }

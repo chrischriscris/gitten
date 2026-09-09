@@ -2,7 +2,7 @@
 //!
 //! Beside the numbered stack, not instead of it yet: when
 //! [`Workspace::enabled`] the window's middle region is this workspace — a
-//! 76px destination header over a sidebar + center-diff + inspector-stub row
+//! 76px destination header over a sidebar + center-diff + inspector row
 //! — and the old stack is hidden but fully alive underneath (its panes keep
 //! their cursors, its refresh wave keeps landing, its commands keep their
 //! names). `"workspace.changes"` enters, `"workspace.history"` leaves for the
@@ -19,7 +19,7 @@ use super::diff::Diff;
 use super::files::Section;
 use crate::input::Input;
 use gitten_core::status::PathBytes;
-use gpui::{Entity, UniformListScrollHandle};
+use gpui::{Entity, Subscription, UniformListScrollHandle};
 
 /// The destination header's height: title, real counts, working-copy status.
 pub const HEADER_H: f32 = 76.0;
@@ -40,9 +40,9 @@ pub fn sidebar_width(viewport_w: f32) -> f32 {
     }
 }
 
-/// [`sidebar_width`]'s twin for the right rail. The inspector's content is
-/// Phase 3; the slot is reserved here so the center never lays out against
-/// a width Phase 3 will move.
+/// [`sidebar_width`]'s twin for the right rail. Sized here — beside the
+/// sidebar's own width — so the center never lays out against a width the
+/// inspector will move.
 pub fn inspector_width(viewport_w: f32) -> f32 {
     match viewport_w > WIDE_PX {
         true => INSPECTOR_WIDE_W,
@@ -91,17 +91,17 @@ pub struct Workspace {
     /// from the draft store whenever the repository changes. Owned here —
     /// beside the center view they serve — rather than in the modal prompt
     /// slot, which spends its field on accept while these survive it.
-    #[allow(dead_code)]
-    // STUB(phase3-resume): built on first workspace entry, refilled from drafts.
     pub summary: Option<Entity<Input>>,
-    #[allow(dead_code)]
-    // STUB(phase3-resume): built on first workspace entry, refilled from drafts.
     pub description: Option<Entity<Input>>,
     /// Which repository key the fields were last filled for. A switch
     /// refills them from that repository's draft instead of leaking the
     /// previous one's unsent words across.
-    #[allow(dead_code)] // STUB(phase3-resume): tracks which repo the fields were filled for.
     pub fields_key: Option<String>,
+    /// The draft-mirroring subscriptions on the two fields above. Stored —
+    /// not detached — so rebuilding the fields (which only a repository
+    /// switch does) drops the old pair instead of leaking a writer per
+    /// switch onto entities nobody reads again.
+    pub field_subs: Vec<Subscription>,
 }
 
 impl Default for Workspace {
@@ -116,6 +116,7 @@ impl Default for Workspace {
             summary: None,
             description: None,
             fields_key: None,
+            field_subs: Vec::new(),
         }
     }
 }
