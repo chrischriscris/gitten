@@ -454,10 +454,6 @@ pub struct Branches {
     /// ask the shell during render — so the shell writes it here when focus
     /// moves, and render reads a flag.
     focused: bool,
-    /// The row a right-click landed on, published for the shell — which opens
-    /// the pane's context menu over it. Taken once by whoever opens it: one
-    /// right-click, one open.
-    menu_row: Cell<Option<usize>>,
 }
 
 /// Where the cursor comes to rest after a move that landed it on `at`.
@@ -584,7 +580,6 @@ impl Branches {
             rendered: Rc::new(Cell::new(0)),
             armed: None,
             focused: false,
-            menu_row: Cell::new(None),
             head,
         }
     }
@@ -600,25 +595,6 @@ impl Branches {
     pub(crate) fn row_slice(&self) -> &[Row] {
         &self.data
     }
-    /// How many rows the list draws — the shown ones, a query having
-    /// narrowed the loaded set without replacing it. What sizes this
-    /// pane's sidebar section.
-    pub fn rows(&self) -> usize {
-        self.visible.len()
-    }
-
-    /// What the BRANCHES header counts: the loaded rows minus the group
-    /// headings — locals plus remotes, and detached HEAD's own row, which is
-    /// a ref the pane holds however it is named. A query narrows what is
-    /// *shown*; this stays what the repository holds — see [`filter_note`]
-    /// for the shown count while one stands.
-    pub fn count(&self) -> usize {
-        self.data
-            .iter()
-            .filter(|row| !matches!(row, Row::Heading { .. }))
-            .count()
-    }
-
     /// The live query, for pre-filling an edit of it. Empty means none.
     pub fn query(&self) -> Option<&str> {
         self.filter.as_deref()
@@ -746,10 +722,9 @@ impl Branches {
             self.defer_show(view);
         }
     }
-    /// What the pane's label appends while filtered: shown over loaded —
-    /// `"1/3"`, counting the refs and not the group headings, which are
-    /// furniture the query did not ask about. `None` unfiltered — the
-    /// header then stays exactly what acquisition named it.
+    /// Spelled for tests only (see [`Screen::label`]): the workspace reads
+    /// only the files pane's note.
+    #[cfg(test)]
     pub fn filter_note(&self) -> Option<String> {
         let refs = |rows: &[Row]| {
             rows.iter()
@@ -772,60 +747,6 @@ impl Branches {
     /// readers sit across an entity boundary; it is one small struct.
     pub fn head_info(&self) -> Option<HeadInfo> {
         self.head.clone()
-    }
-
-    // -------------------------------------------------------------- commands
-
-    /// The box the list is drawn in, for hit-testing a wheel event.
-    pub fn list_bounds(&self) -> Bounds<Pixels> {
-        self.scroll.0.borrow().base_handle.bounds()
-    }
-
-    /// Nothing off the left edge to reach — names truncate rather than pan.
-    /// Present so the wheel routing can offer the axis to every screen alike.
-    pub fn pan_pixels(&self, _dx: f32) -> bool {
-        false
-    }
-
-    /// Moves the list by `dy` pixels — the wheel. A glance, not a
-    /// commitment: the viewport pans and the keyboard selection stays where
-    /// it was, like the terminal. Same dance as every list, for the same
-    /// reasons.
-    pub fn scroll_pixels(&mut self, dy: f32, host: &Host) -> bool {
-        let deferred = self.scroll.0.borrow().deferred_scroll_to_item;
-        if let Some(request) = deferred {
-            if self.pending_scroll.is_awaiting() {
-                let pixels = self.pending_scroll.wheel(dy);
-                let mut v = self.live_view(host);
-                let y = -(request.item_index as f32 * ROW_H) + pixels;
-                v.pan_to((-y / ROW_H).round().max(0.0) as usize);
-                self.view.set(v);
-                // The wheel is also a move of attention — same rule the
-                // arrow keys keep.
-                self.armed = None;
-                return true;
-            }
-            self.scroll.0.borrow_mut().deferred_scroll_to_item = None;
-        }
-        let (offset, max) = {
-            let s = self.scroll.0.borrow();
-            (s.base_handle.offset(), s.base_handle.max_offset())
-        };
-        let y = (f32::from(offset.y) + dy).clamp(-f32::from(max.y), 0.0);
-        if y == f32::from(offset.y) {
-            return false;
-        }
-        self.scroll
-            .0
-            .borrow()
-            .base_handle
-            .set_offset(point(offset.x, px(y)));
-        let mut v = self.live_view(host);
-        v.pan_to((-y / ROW_H).round().max(0.0) as usize);
-        self.view.set(v);
-        self.synced.set(y);
-        self.armed = None;
-        true
     }
 
     /// Meets the list where it actually is after a scrollbar drag. Pans:
@@ -914,14 +835,6 @@ impl Branches {
     /// exactly the side effects a key move has — see [`Self::run_view`]. The
     /// row clamps like [`Viewport::go_to`] does, and a heading snaps forward —
     /// the nearest selectable row below, the way a key steps off one.
-    /// The row a right-click landed on, published by the row's own handler
-    /// beside the left-click one, and taken once by the shell — which opens
-    /// the pane's context menu over it. Taken, not read: one right-click,
-    /// one open.
-    pub fn take_menu_row(&self) -> Option<usize> {
-        self.menu_row.take()
-    }
-
     pub fn select_row(&mut self, index: usize, host: &Host) {
         self.reconcile(host);
         let mut v = self.live_view(host);
@@ -1101,7 +1014,6 @@ impl Render for Branches {
                                     let host = crate::config::host(cx);
                                     this.update(cx, |b, cx| {
                                         b.select_row(i, &host);
-                                        b.menu_row.set(Some(i));
                                         cx.notify();
                                     });
                                 }
@@ -1894,9 +1806,12 @@ mod tests {
             "the two matches plus the two headings of their groups"
         );
         assert_eq!(b.filter_note().as_deref(), Some("2/3"));
-        assert_eq!(b.rows(), 4);
+        assert_eq!(b.visible.len(), 4);
         assert_eq!(
-            b.count(),
+            b.row_slice()
+                .iter()
+                .filter(|row| !matches!(row, Row::Heading { .. }))
+                .count(),
             3,
             "the filter narrows what is shown, never what is loaded"
         );
@@ -1927,7 +1842,7 @@ mod tests {
 
         // Clearing puts every row back under the same branch.
         b.apply_query("");
-        assert_eq!(b.rows(), 5);
+        assert_eq!(b.visible.len(), 5);
         assert_eq!(b.query(), None);
         assert_eq!(b.filter_note(), None);
         assert_eq!(

@@ -1,12 +1,7 @@
-//! The guide-v2 workspace shell (Phase 2 strangler).
-//!
-//! Beside the numbered stack, not instead of it yet: when
-//! [`Workspace::enabled`] the window's middle region is this workspace — a
-//! full-height sidebar beside a 76px destination header and diff/inspector row
-//! — and the old stack is hidden but fully alive underneath (its panes keep
-//! their cursors, its refresh wave keeps landing, its commands keep their
-//! names). `"workspace.changes"` enters, `"workspace.history"` leaves for the
-//! full stack, which is the History destination until it moves in here.
+//! The guide-v2 workspace shell: the window's middle region — a full-height
+//! sidebar beside a 76px destination header and diff/inspector row.
+//! `"workspace.changes"` shows Changes, `"workspace.history"` shows the
+//! in-workspace History timeline beside the selected commit's diff.
 //!
 //! What lives here is geometry and state only: the sidebar's rows come from
 //! [`super::files::Files`]' grouped projection (one selection state, shared),
@@ -101,9 +96,8 @@ pub fn reconcile_top(
 }
 
 /// Which destination the workspace shows. Changes is the default per the
-/// interaction contract; History leaves the workspace for the full stack
-/// (commits column included) until the timeline moves in here in a later
-/// phase.
+/// interaction contract; History is the branch timeline beside the selected
+/// commit's diff, in the same workspace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Destination {
     #[default]
@@ -111,16 +105,10 @@ pub enum Destination {
     History,
 }
 
-/// The workspace's shell-side state: the toggle, the center view and the
-/// preview guard. The sidebar holds no state of its own — it draws the
-/// files pane's grouped projection under the files pane's cursor.
+/// The workspace's shell-side state: destination, center view and preview
+/// guard. The sidebar holds no state of its own — it draws the files pane's
+/// grouped projection under the files pane's cursor.
 pub struct Workspace {
-    /// The window's middle region is this workspace — the Changes
-    /// destination on launch per the interaction contract. The old
-    /// stacked panes survive only as the History destination
-    /// (`workspace.history` lowers the workspace onto them) until the
-    /// timeline moves into the workspace.
-    pub enabled: bool,
     /// The destination the header names and the sidebar follows.
     pub destination: Destination,
     /// The center diff: built once on first entry, re-aimed per selection —
@@ -180,7 +168,6 @@ pub struct Workspace {
 impl Default for Workspace {
     fn default() -> Self {
         Self {
-            enabled: true,
             destination: Destination::Changes,
             center: None,
             request: 0,
@@ -203,12 +190,11 @@ mod tests {
     use super::*;
     use gpui::{point, px, ScrollStrategy};
 
-    /// The launch destination per the interaction contract: the workspace
-    /// is up on Changes before any command runs — no toggle to reach it.
+    /// The launch destination per the interaction contract: Changes before
+    /// any command runs — no toggle to reach it.
     #[test]
     fn the_workspace_is_the_launch_destination() {
         let ws = Workspace::default();
-        assert!(ws.enabled);
         assert_eq!(ws.destination, Destination::Changes);
     }
 

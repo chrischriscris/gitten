@@ -107,10 +107,6 @@ pub struct Commits {
     /// ask the shell during render — so the shell writes it here when focus
     /// moves, and render reads a flag.
     focused: bool,
-    /// The row a right-click landed on, published for the shell — which opens
-    /// the pane's context menu over it. Taken once by whoever opens it: one
-    /// right-click, one open.
-    menu_row: Cell<Option<usize>>,
 }
 
 impl Commits {
@@ -209,71 +205,13 @@ impl Commits {
 
     /// What the pane's label appends while filtered: shown over loaded,
     /// `"12/4173"`. `None` unfiltered — the label then stays exactly what
-    /// acquisition named it.
+    /// acquisition named it. Test-only: the workspace reads the files pane's
+    /// note; the old stack's headers were the last production reader.
+    #[cfg(test)]
     pub fn filter_note(&self) -> Option<String> {
         self.query
             .is_some()
             .then(|| format!("{}/{}", self.visible.len(), self.data.commits.len()))
-    }
-
-    // -------------------------------------------------------------- commands
-
-    /// The box the list is drawn in, for hit-testing a wheel event.
-    pub fn list_bounds(&self) -> Bounds<Pixels> {
-        self.scroll.0.borrow().base_handle.bounds()
-    }
-
-    /// A commit list has nothing off the left edge to reach; the terminal says
-    /// the same by ignoring `view.left` and `view.right`. Present so the shell's
-    /// wheel routing can offer the axis to every screen alike.
-    pub fn pan_pixels(&self, _dx: f32) -> bool {
-        false
-    }
-
-    /// Moves the list by `dy` pixels — the wheel, whose command resolves through
-    /// `[keys]` but whose delta is pixels. A glance, not a commitment: the
-    /// viewport pans and the keyboard selection stays where it was, exactly
-    /// as the terminal's `pan_by` does — the selected row is not necessarily
-    /// in view.
-    pub fn scroll_pixels(&mut self, dy: f32, host: &Host) -> bool {
-        let deferred = self.scroll.0.borrow().deferred_scroll_to_item;
-        if let Some(request) = deferred {
-            if self.pending_scroll.is_awaiting() {
-                let pixels = self.pending_scroll.wheel(dy);
-                let mut v = self.live_view(host);
-                let y = -(request.item_index as f32 * graph::ROW_H) + pixels;
-                v.pan_to((-y / graph::ROW_H).round().max(0.0) as usize);
-                self.view.set(v);
-                self.top.set(v.top());
-                // The wheel is also a move of attention — same rule the
-                // arrow keys keep.
-                self.armed = None;
-                return true;
-            }
-            // A request not paired with our marker belongs to another
-            // interaction. The newer wheel wins rather than donating pixels to
-            // a request `accept_deferred_scroll` will deliberately ignore.
-            self.scroll.0.borrow_mut().deferred_scroll_to_item = None;
-        }
-        let (offset, max) = {
-            let s = self.scroll.0.borrow();
-            (s.base_handle.offset(), s.base_handle.max_offset())
-        };
-        let y = (f32::from(offset.y) + dy).clamp(-f32::from(max.y), 0.0);
-        if y == f32::from(offset.y) {
-            return false;
-        }
-        self.scroll
-            .0
-            .borrow()
-            .base_handle
-            .set_offset(point(offset.x, px(y)));
-        let mut v = self.live_view(host);
-        v.pan_to((-y / graph::ROW_H).round().max(0.0) as usize);
-        self.view.set(v);
-        self.synced.set(y);
-        self.armed = None;
-        true
     }
 
     /// Meets the list where it actually is: a scrollbar drag moves the offset
@@ -333,14 +271,6 @@ impl Commits {
     /// Where a click lands the keyboard: onto the row the mouse hit, with
     /// exactly the side effects a key move has — see [`Self::run_view`]. The
     /// row clamps like [`Viewport::go_to`] does; this list has no headings.
-    /// The row a right-click landed on, published by the row's own handler
-    /// beside the left-click one, and taken once by the shell — which opens
-    /// the pane's context menu over it. Taken, not read: one right-click,
-    /// one open.
-    pub fn take_menu_row(&self) -> Option<usize> {
-        self.menu_row.take()
-    }
-
     pub fn select_row(&mut self, index: usize, host: &Host) {
         self.reconcile(host);
         let mut v = self.live_view(host);
@@ -541,7 +471,6 @@ impl Commits {
             load,
             armed: None,
             focused: false,
-            menu_row: Cell::new(None),
         }
     }
 
@@ -776,7 +705,6 @@ impl Render for Commits {
                             let host = crate::config::host(cx);
                             this.update(cx, |v, cx| {
                                 v.select_row(i, &host);
-                                v.menu_row.set(Some(i));
                                 cx.notify();
                             });
                         }
@@ -1051,7 +979,6 @@ fn row(
 mod tests {
     // By name, not a glob: `use gpui::*` in the parent shadows `#[test]` with
     // GPUI's own attribute macro and every test in here fails to expand.
-    use super::graph;
     use super::Commits;
     use super::{band, rel_time};
     use gitten_core::host::Host;
@@ -1140,7 +1067,6 @@ mod tests {
         with_height(&mut c, 5);
         assert!(c.run_view("view.left", &Host::new()));
         assert!(c.run_view("view.right", &Host::new()));
-        assert!(!c.pan_pixels(40.0));
     }
 
     #[test]
@@ -1222,53 +1148,6 @@ mod tests {
     }
 
     #[test]
-    fn a_restored_row_inside_the_first_screen_still_moves_the_list() {
-        // The non-strict strategy skips any row already inside the initial
-        // viewport — which is where a saved row near the top of the graph
-        // lands — so GPUI would open at row zero while everything else claimed
-        // the restore worked. The parked request has to be strict.
-        let host = Rc::new(Host::new());
-        let mut c = Commits::new(commits(100), host.clone());
-        c.scroll_to(5, &host);
-
-        let request = c
-            .scroll
-            .0
-            .borrow()
-            .deferred_scroll_to_item
-            .expect("no request was parked");
-        assert_eq!(request.item_index, 5);
-        assert_eq!(request.strategy, gpui::ScrollStrategy::Top);
-        assert!(request.scroll_strict, "visible-in-range is exactly the bug");
-        assert_eq!(c.view.get().top(), 5, "and the model says so too");
-
-        // A command before layout replaces the target. Writing immediately
-        // would clamp against geometry that still describes the empty list.
-        assert!(c.run_view("view.down", &host));
-        let request = c
-            .scroll
-            .0
-            .borrow()
-            .deferred_scroll_to_item
-            .expect("the updated target was not deferred");
-        assert_eq!(request.item_index, c.view.get().top());
-        assert!(request.scroll_strict);
-        assert_eq!(f32::from(c.scroll.0.borrow().base_handle.offset().y), 0.0);
-
-        let before = request.item_index;
-        assert!(c.scroll_pixels(-0.25, &host));
-        let request = c
-            .scroll
-            .0
-            .borrow()
-            .deferred_scroll_to_item
-            .expect("the wheel discarded the deferred target");
-        assert_eq!(request.item_index, before, "the strict baseline moved");
-        assert_eq!(c.pending_scroll.0.wheel.get(), -0.25);
-        assert_eq!(f32::from(c.scroll.0.borrow().base_handle.offset().y), 0.0);
-    }
-
-    #[test]
     fn a_restore_this_view_accepted_is_not_reconciled_as_a_drag() {
         // `accept_deferred_scroll` and what it means are `views::tests`'; what
         // is this view's is that its own `synced` is the one the acceptance
@@ -1293,25 +1172,6 @@ mod tests {
         c.rendered.set(20);
         assert!(c.run_view("view.down", &host));
         assert_eq!(c.view.get().cursor(), 41);
-    }
-
-    #[test]
-    fn a_thumb_drag_cancels_a_parked_strict_position() {
-        let host = Rc::new(Host::new());
-        let mut c = Commits::new(commits(100), host.clone());
-        c.scroll_to(40, &host);
-        assert!(c.scroll_pixels(-0.25, &host));
-
-        let bar = crate::views::DeferredScrollbar::new(&c.scroll, &c.pending_scroll);
-        gpui_component::scroll::ScrollbarHandle::set_offset(
-            &bar,
-            gpui::point(gpui::px(0.0), gpui::px(-9.5)),
-        );
-
-        assert!(c.scroll.0.borrow().deferred_scroll_to_item.is_none());
-        assert!(!c.pending_scroll.0.awaiting.get());
-        assert_eq!(c.pending_scroll.0.wheel.get(), 0.0);
-        assert_eq!(f32::from(c.scroll.0.borrow().base_handle.offset().y), -9.5);
     }
 
     #[test]
@@ -1670,7 +1530,6 @@ mod tests {
         // neither gesture spends what is armed.
         assert!(!c.confirm_or_arm_reset(&sha0));
         c.run_view("view.right", &host);
-        c.scroll_pixels(-3.0 * graph::ROW_H, &host);
         assert!(
             armed(&c),
             "gestures that moved nothing must not spend the question"

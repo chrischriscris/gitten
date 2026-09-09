@@ -23,7 +23,6 @@
 //! definition, so there is no disabled row to draw.
 
 use crate::chrome::RADIUS;
-use gitten_core::command::{Commands, HelpRow};
 use gitten_core::font::Font;
 use gitten_core::theme::Theme;
 use gpui::*;
@@ -47,29 +46,6 @@ pub struct Row {
     pub(crate) name: String,
     keys: String,
     label: String,
-}
-
-/// The pane's own rows, out of the projection: every `HelpRow::Command` bound
-/// in `mode`, and nothing from any other mode — no globals section in a
-/// context menu, because a menu that answers "what may I do *here*" has one
-/// subject. Reusing `help` rather than asking `core` for a narrower walk,
-/// because the projection's row shape is already exactly what a menu row is.
-pub fn rows(help: &[HelpRow], mode: &str, commands: &Commands) -> Vec<Row> {
-    let mut out = Vec::new();
-    let mut mine = false;
-    for row in help {
-        match row {
-            // A heading: everything under it belongs to the mode it names.
-            HelpRow::Mode(name) => mine = name == mode,
-            HelpRow::Command { name, keys, doc } if mine => out.push(Row {
-                name: name.clone(),
-                keys: keys.clone(),
-                label: commands.hint(name).unwrap_or(doc).into(),
-            }),
-            _ => {}
-        }
-    }
-    out
 }
 
 /// How wide the menu draws: the longest key and the longest label, measured
@@ -202,73 +178,7 @@ pub fn backdrop() -> AnyElement {
 mod tests {
     // By name, not a glob: `use gpui::*` in the parent shadows `#[test]` with
     // GPUI's own attribute macro and every test in here fails to expand.
-    use super::{height, rows, width};
-    use gitten_core::command::Modes;
-
-    #[test]
-    fn a_context_menus_rows_are_the_keymaps_own() {
-        // The files pane's stack, as the shell builds it — globals under
-        // everything, then the pane's own mode.
-        let host = gitten_core::host::Host::new();
-        let mut modes = Modes::new();
-        modes.push("files");
-        let menu = rows(
-            &host.keys.help(&host.commands, &modes),
-            "files",
-            &host.commands,
-        );
-
-        // The menu is the keymap's own: every row is a command bound in the
-        // pane's mode — none from any other, nothing hardcoded — and each row
-        // says exactly what the registry says about its command. The test
-        // walks the map rather than quoting it, which is also the seam held:
-        // a command an extension registers in the pane's mode is on the menu
-        // the day it appears, without an edit to the menu.
-        assert!(!menu.is_empty(), "the shipped files mode has verbs");
-        for row in &menu {
-            assert!(
-                host.keys
-                    .bindings()
-                    .iter()
-                    .any(|b| b.mode == "files" && b.command == row.name),
-                "{} is bound in the pane's own mode",
-                row.name
-            );
-            let registered = host.commands.get(&row.name).unwrap_or_else(|| {
-                panic!("{} came out of the registry, not out of the menu", row.name)
-            });
-            assert_eq!(
-                row.label,
-                registered.hint.as_deref().unwrap_or(&registered.doc),
-                "the label is the registry's own sentence"
-            );
-        }
-        let no_globals = menu.iter().all(|r| r.name != "quit");
-        assert!(
-            no_globals,
-            "no globals section: quit is bound in global, not here"
-        );
-
-        // The seam, said outright: register in the pane's mode at test time.
-        let mut host = gitten_core::host::Host::new();
-        host.commands.register("ext.verb", "does the thing");
-        host.keys.bind("files", "e", "ext.verb").unwrap();
-        let mut modes = Modes::new();
-        modes.push("files");
-        let menu = rows(
-            &host.keys.help(&host.commands, &modes),
-            "files",
-            &host.commands,
-        );
-        assert!(
-            menu.iter().any(|r| r.name == "ext.verb"),
-            "a registered-at-test-time command appears without an edit here"
-        );
-        assert!(
-            !menu.iter().any(|r| r.name == "quit"),
-            "still no globals section"
-        );
-    }
+    use super::{height, width};
 
     #[test]
     fn the_menu_is_as_wide_as_its_widest_columns_and_tall_as_its_rows() {

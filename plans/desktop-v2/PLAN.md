@@ -129,6 +129,31 @@ REMOVED vs KEPT (deliberate, each with its reason):
   dwarfed by virtualized-row work; lazily branching them is a
   follow-up, not a blocker.
 
+## Old-stack deletion (landed on top of 7bfab6c)
+
+Precondition met by the user's History-timeline commit: `workspace.history`
+now renders the in-workspace timeline, so the numbered-stack composition
+had no production reader — the only `enabled = false` write was the
+`#[cfg(test)] leave_workspace`. Net: ~2880 lines removed, ~240 added.
+shell 393 · app 155 · core 498 green; fmt + workspace clippy `-D warnings`
+clean.
+
+- Removed: `leave_workspace` + the `false` render branch (old sidebar +
+  main_region + divider), STACK_TOP/STACK_FOOT, old sidebar-stack
+  builders, divider drag, `chrome::pane_header(_with)`, the status-bar
+  hint projection (`hints`, `hints_budget`, `version`, badge consts,
+  `hint_air`) + its 4 projection tests — the workspace bar was already
+  designed without them (leading segments + Commands door, per the mock).
+  Stack-only tests migrated to `workspace.history` or deleted with reason.
+- Scoped to `#[cfg(test)]` (branches.rs precedent): commits/stashes
+  `filter_note`, `active_view_name` — tests still pin real logic through
+  them; the workspace reads only the files pane's note.
+- Kept: all view panes (workspace reuses them), `files.commit` prompt
+  behind `c`, `panes.rs`, safeguards, registry-level hint test, `?` help.
+- Muscle checked, not cut: the pane-trait impls the workspace still uses
+  (`any`, `list_bounds`, scroll verbs) are intact — `cargo check` passes
+  and the History timeline test renders timeline beside commit diff.
+
 ACCEPTANCE (headless-verifiable subset; window-only items need eyes):
 
 - Startup default / selection→diff-only / partial+full staging +

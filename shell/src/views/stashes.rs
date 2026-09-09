@@ -138,10 +138,6 @@ pub struct Stashes {
     /// ask the shell during render — so the shell writes it here when focus
     /// moves, and render reads a flag.
     focused: bool,
-    /// The row a right-click landed on, published for the shell — which opens
-    /// the pane's context menu over it. Taken once by whoever opens it: one
-    /// right-click, one open.
-    menu_row: Cell<Option<usize>>,
 }
 
 impl Stashes {
@@ -180,15 +176,7 @@ impl Stashes {
             rendered: Rc::new(Cell::new(0)),
             armed: None,
             focused: false,
-            menu_row: Cell::new(None),
         }
-    }
-
-    /// How many rows the list draws — the shown ones, a query having
-    /// narrowed the stack without replacing it. What sizes this pane's
-    /// sidebar section.
-    pub fn rows(&self) -> usize {
-        self.visible.len()
     }
 
     /// The live query, for pre-filling an edit of it. Empty means none.
@@ -198,7 +186,9 @@ impl Stashes {
 
     /// What the pane's label appends while filtered: shown over loaded —
     /// `"1/3"`. `None` unfiltered — the header then stays exactly what
-    /// acquisition named it.
+    /// acquisition named it. Test-only: the old stack's headers were the
+    /// last production reader.
+    #[cfg(test)]
     pub fn filter_note(&self) -> Option<String> {
         self.filter
             .is_some()
@@ -325,61 +315,6 @@ impl Stashes {
         }
     }
 
-    // -------------------------------------------------------------- commands
-
-    /// The box the list is drawn in, for hit-testing a wheel event.
-    pub fn list_bounds(&self) -> Bounds<Pixels> {
-        self.scroll.0.borrow().base_handle.bounds()
-    }
-
-    /// Nothing off the left edge to reach — a squeezed message ends in an
-    /// ellipsis rather than pan. Present so the wheel routing can offer the
-    /// axis to every screen alike.
-    pub fn pan_pixels(&self, _dx: f32) -> bool {
-        false
-    }
-
-    /// Moves the list by `dy` pixels — the wheel, whose command resolves
-    /// through `[keys]` but whose delta is pixels. A glance, not a
-    /// commitment: the viewport pans and the keyboard selection stays where
-    /// it was, like the terminal. Same dance as every list.
-    pub fn scroll_pixels(&mut self, dy: f32, host: &Host) -> bool {
-        let deferred = self.scroll.0.borrow().deferred_scroll_to_item;
-        if let Some(request) = deferred {
-            if self.pending_scroll.is_awaiting() {
-                let pixels = self.pending_scroll.wheel(dy);
-                let mut v = self.live_view(host);
-                let y = -(request.item_index as f32 * ROW_H) + pixels;
-                v.pan_to((-y / ROW_H).round().max(0.0) as usize);
-                self.view.set(v);
-                // The wheel is also a move of attention — same rule the
-                // arrow keys keep.
-                self.armed = None;
-                return true;
-            }
-            self.scroll.0.borrow_mut().deferred_scroll_to_item = None;
-        }
-        let (offset, max) = {
-            let s = self.scroll.0.borrow();
-            (s.base_handle.offset(), s.base_handle.max_offset())
-        };
-        let y = (f32::from(offset.y) + dy).clamp(-f32::from(max.y), 0.0);
-        if y == f32::from(offset.y) {
-            return false;
-        }
-        self.scroll
-            .0
-            .borrow()
-            .base_handle
-            .set_offset(point(offset.x, px(y)));
-        let mut v = self.live_view(host);
-        v.pan_to((-y / ROW_H).round().max(0.0) as usize);
-        self.view.set(v);
-        self.synced.set(y);
-        self.armed = None;
-        true
-    }
-
     /// Meets the list where it actually is after a scrollbar drag — see
     /// [`super::files::Files::reconcile`]. Pans: the selection stays where
     /// the keyboard left it.
@@ -430,14 +365,6 @@ impl Stashes {
     /// Where a click lands the keyboard: onto the row the mouse hit, with
     /// exactly the side effects a key move has — see [`Self::run_view`]. The
     /// row clamps like [`Viewport::go_to`] does; this list has no headings.
-    /// The row a right-click landed on, published by the row's own handler
-    /// beside the left-click one, and taken once by the shell — which opens
-    /// the pane's context menu over it. Taken, not read: one right-click,
-    /// one open.
-    pub fn take_menu_row(&self) -> Option<usize> {
-        self.menu_row.take()
-    }
-
     pub fn select_row(&mut self, index: usize, host: &Host) {
         self.reconcile(host);
         let mut v = self.live_view(host);
@@ -585,7 +512,6 @@ impl Render for Stashes {
                             let host = crate::config::host(cx);
                             this.update(cx, |s, cx| {
                                 s.select_row(i, &host);
-                                s.menu_row.set(Some(i));
                                 cx.notify();
                             });
                         }
@@ -682,7 +608,7 @@ mod tests {
         let v = f.view.get();
         assert_eq!(v.len(), 1, "one message matches, folded");
         assert_eq!(f.filter_note().as_deref(), Some("1/2"));
-        assert_eq!(f.rows(), 1);
+        assert_eq!(f.visible.len(), 1);
         // Through the indirection: `current` is the anchored entry, not
         // whatever now happens to sit at row 0 of a shorter list — and the
         // stack's addresses stay git's, so the match is still stash@{0}.
@@ -714,7 +640,7 @@ mod tests {
 
         // Clearing puts every entry back under the same commit.
         f.apply_query("");
-        assert_eq!(f.rows(), 2);
+        assert_eq!(f.visible.len(), 2);
         assert_eq!(f.query(), None);
         assert_eq!(f.filter_note(), None);
         assert_eq!(

@@ -1,4 +1,3 @@
-use gpui::prelude::FluentBuilder as _;
 mod assets;
 mod chrome;
 mod config;
@@ -117,243 +116,15 @@ const LIGHTS_X: f32 = 10.0;
 const LIGHTS_W: f32 = 78.0;
 /// The branch chip follows the title-bar controls' larger target height.
 const CHIP_H: f32 = 28.0;
-/// The shortest a sidebar section may be squeezed to: its header and two rows
-/// — the selected one and a neighbour, which is the least a list can show and
+/// The shortest a list may be squeezed to: a header and two rows — the
+/// selected one and a neighbour, which is the least a list can show and
 /// still be seen to scroll.
 const SECTION_MIN_H: f32 = chrome::HEADER_H + 2.0 * graph::ROW_H;
-/// The most rows an *unfocused* list section spends its pixels on. Eight:
-/// nobody reads sixteen branches while committing — the focused pane is the
-/// one being read, and it stays uncapped. The slack a cap frees goes to the
-/// commit list.
-const SECTION_MAX_ROWS: usize = 8;
 
-/// Four stacked sections at their floor, bracketed by the title and status
-/// strips. Below this height one of the panes would silently lose its promised
-/// two visible rows.
+/// Four such floors, bracketed by the title and status strips. Below this
+/// height one of the lists would silently lose its promised two visible
+/// rows.
 const WINDOW_MIN_H: f32 = 4.0 * SECTION_MIN_H + TITLE_H + chrome::STATUS_H;
-
-/// A sidebar section's natural height: its header plus one row per line it
-/// draws, with a floor of one row for the empty state's line ("working tree
-/// clean", "nothing stashed"). Arithmetic and not measurement, because a view
-/// cannot know its own size during `render` — and a list row is a fixed
-/// [`graph::ROW_H`] precisely so that sums like this one are exact.
-fn section_height(rows: usize) -> f32 {
-    chrome::HEADER_H + rows.max(1) as f32 * graph::ROW_H
-}
-
-/// The height a section asks for before any boundary has moved: its natural
-/// height when focused, otherwise capped at [`SECTION_MAX_ROWS`]. The fitter
-/// preserves each pane's floor and gives the remaining pixels to commits.
-fn section_basis(rows: usize, focused: bool) -> f32 {
-    section_height(if focused {
-        rows
-    } else {
-        rows.min(SECTION_MAX_ROWS)
-    })
-}
-
-/// The whole-row cut of a squeezed section's content height: rounded down to
-/// a whole multiple of [`graph::ROW_H`]. Flex may squeeze a section to three
-/// and a half rows, and the half is a line of text cut mid-glyph — so what a
-/// section shows is quantized and the remainder is padded below in the
-/// background colour, and the boundary always lands between rows. Arithmetic
-/// on a measurement, one frame late — the house rule; see
-/// [`DevShell::section_content`].
-fn quantized(content_h: f32) -> f32 {
-    (content_h / graph::ROW_H).floor() * graph::ROW_H
-}
-
-/// How many of a pane's rows its section's height leaves undrawn. Every drawn
-/// row is one [`graph::ROW_H`] and the content is quantized to whole rows, so
-/// the subtraction against the pane's own row count is exact — the same rows
-/// counted on both sides, headings included.
-fn hidden_rows(rows: usize, height: f32) -> usize {
-    let visible = ((height - chrome::HEADER_H) / graph::ROW_H).floor() as usize;
-    rows.saturating_sub(visible)
-}
-
-/// The count a section header draws: the pane's own number and — when its
-/// height leaves rows off — a `+N` beside it saying how many. A count that
-/// sits beside eight visible rows while the pane holds fifty-six reads as a
-/// claim that everything is on screen; `56 · +48` does not make that claim.
-/// The suffix stays off a filter note: `1/3` already says the pane is
-/// narrowed, and two sentences in one corner is one too many.
-fn with_hidden(count: SharedString, hidden: usize) -> SharedString {
-    match hidden {
-        0 => count,
-        n => SharedString::from(format!("{count} · +{n}")),
-    }
-}
-/// The share a session copy of the sidebar's width is written inside: the
-/// band the config parser promises ([`gitten_core::host::SIDEBAR_MIN`]..
-/// [`gitten_core::host::SIDEBAR_MAX`]) and the drag's rails. The parser
-/// clamps what the file says; this clamps what a drag does — a gesture can
-/// ask for anything, and a boundary dragged off the window is a boundary
-/// nobody can find again.
-fn clamped_share(share: f32) -> f32 {
-    share.clamp(
-        gitten_core::host::SIDEBAR_MIN,
-        gitten_core::host::SIDEBAR_MAX,
-    )
-}
-
-/// The divider drag's payload: nothing but a type for GPUI to name, so the
-/// drag-move listener can tell this gesture from any other. The ghost it
-/// renders is gpui's `EmptyView` — a divider says nothing while dragged.
-#[derive(Clone, Copy)]
-struct SidebarDrag;
-
-/// A horizontal boundary in the sidebar stack. The index names the split
-/// above it; the drag ghost stays empty because the boundary itself remains
-/// visible in place.
-#[derive(Clone, Copy)]
-struct StackDrag(usize);
-
-const STACK_SECTIONS: usize = 4;
-const STACK_DIVIDERS: usize = STACK_SECTIONS - 1;
-
-/// Fit preferred pane heights into the available stack. Every pane keeps its
-/// two-row floor while the designated flexible pane receives spare space;
-/// oversized preferences give space back evenly until every pane fits.
-fn fitted_stack_heights(
-    total: f32,
-    mut heights: [f32; STACK_SECTIONS],
-    count: usize,
-    flexible: usize,
-) -> [f32; STACK_SECTIONS] {
-    if count == 0 || total <= 0.0 {
-        return [0.0; STACK_SECTIONS];
-    }
-    let floor = SECTION_MIN_H.min(total / count as f32);
-    for height in heights.iter_mut().take(count) {
-        *height = height.max(floor);
-    }
-    let mut overflow = heights.iter().take(count).sum::<f32>() - total;
-    for _ in 0..STACK_SECTIONS {
-        if overflow <= f32::EPSILON {
-            break;
-        }
-        let adjustable = heights
-            .iter()
-            .take(count)
-            .filter(|height| **height > floor)
-            .count();
-        if adjustable == 0 {
-            break;
-        }
-        let share = overflow / adjustable as f32;
-        let mut removed = 0.0;
-        for height in heights.iter_mut().take(count) {
-            let cut = (*height - floor).max(0.0).min(share);
-            *height -= cut;
-            removed += cut;
-        }
-        overflow -= removed;
-    }
-    let used = heights.iter().take(count).sum::<f32>();
-    heights[flexible.min(count - 1)] += (total - used).max(0.0);
-    heights
-}
-
-fn splits_from_heights(
-    heights: [f32; STACK_SECTIONS],
-    total: f32,
-    count: usize,
-) -> [f32; STACK_DIVIDERS] {
-    let mut splits = [0.0; STACK_DIVIDERS];
-    let mut used = 0.0;
-    for i in 0..count.saturating_sub(1) {
-        used += heights[i];
-        splits[i] = used / total.max(1.0);
-    }
-    splits
-}
-
-/// Keep every draggable boundary inside its neighbours and leave each pane
-/// enough room for the same floor the initial layout promises.
-fn clamped_stack_splits(
-    mut splits: [f32; STACK_DIVIDERS],
-    total: f32,
-    count: usize,
-) -> [f32; STACK_DIVIDERS] {
-    if count < 2 || total <= 0.0 {
-        return splits;
-    }
-    let floor = (SECTION_MIN_H / total).min(1.0 / count as f32);
-    for i in 0..count - 1 {
-        let low = if i == 0 { floor } else { splits[i - 1] + floor };
-        let high = 1.0 - (count - i - 1) as f32 * floor;
-        splits[i] = splits[i].clamp(low, high);
-    }
-    splits
-}
-
-fn heights_from_splits(
-    splits: [f32; STACK_DIVIDERS],
-    total: f32,
-    count: usize,
-) -> [f32; STACK_SECTIONS] {
-    let mut heights = [0.0; STACK_SECTIONS];
-    let mut previous = 0.0;
-    for i in 0..count {
-        let edge = if i + 1 == count {
-            total
-        } else {
-            splits[i] * total
-        };
-        heights[i] = edge - previous;
-        previous = edge;
-    }
-    heights
-}
-
-/// The FILES header's count: the working tree's distinct changed paths, as
-/// the header's only right-edge furniture. `None` on a clean tree — a zero
-/// count is the empty state said twice, the rows below it already saying so,
-/// and no other pane prints one.
-fn files_header_count(
-    view: &gpui::Entity<crate::views::files::Files>,
-    cx: &App,
-) -> Option<SharedString> {
-    let changed = view.read(cx).changed();
-    (changed > 0).then(|| SharedString::from(changed.to_string()))
-}
-
-/// The diff header's text, spelled once per change of what it says — see
-/// [`DevShell::header_memo`]. The path is already cut where
-/// [`chrome::path_spans`] wants it.
-#[derive(Clone)]
-struct HeaderText {
-    dir: SharedString,
-    name: SharedString,
-    adds: SharedString,
-    dels: SharedString,
-    hunk: Option<SharedString>,
-}
-
-impl HeaderText {
-    fn of(s: &views::diff::FileSummary) -> Self {
-        let (dir, name) = gitten_core::path::split_dir_name(&s.path);
-        Self {
-            dir: dir.to_string().into(),
-            name: name.to_string().into(),
-            adds: format!("+{}", s.adds).into(),
-            dels: format!("−{}", s.dels).into(),
-            hunk: (s.hunks > 0).then(|| format!("hunk {}/{}", s.hunk, s.hunks).into()),
-        }
-    }
-}
-
-/// The stack's content-sized panes above the commit list, in reading order:
-/// mode name, focus key, header label and element id. Static, so a frame spells
-/// none of them. The commit list and stash draw after these.
-const STACK_TOP: [(&str, &str, &str, &str); 2] = [
-    ("files", "2", "FILES", "side-files"),
-    ("branches", "3", "BRANCHES", "side-branches"),
-];
-
-/// The content-sized pane under the commit list.
-const STACK_FOOT: [(&str, &str, &str, &str); 1] = [("stashes", "5", "STASH", "side-stashes")];
 
 /// The repository as the title strip spells it: `(parent, name)` with the
 /// parent under `~` when it is under home and ending in `/`, so the two halves
@@ -660,12 +431,12 @@ impl Refresh {
 /// seam. Only drawing, local command behavior and optional repository refresh
 /// live here; stable naming, placement and focus belong to [`panes::Panes`].
 trait Pane {
-    fn any(&self) -> AnyView;
     fn mode(&self) -> &'static str;
 
-    /// What this pane says in the title strip. Takes the app so a pane whose
-    /// label depends on live view state — a filtered commit list counts its
-    /// rows — can read itself before answering.
+    /// Spelled for tests and out-of-tree panes: no in-tree caller since the
+    /// stack deletion, but an extension pane implements this seam in a
+    /// production build, so it must exist outside `cfg(test)`.
+    #[allow(dead_code)]
     fn label(&self, cx: &App) -> String;
 
     /// A tenant-owned repository refresh. The load half must contain every
@@ -681,23 +452,11 @@ trait Pane {
         None
     }
 
-    fn list_bounds(&self, _cx: &App) -> Bounds<Pixels> {
-        Bounds::default()
-    }
-
-    fn pan_pixels(&self, _dx: f32, _cx: &App) -> bool {
-        false
-    }
-
     /// Runs one of this pane's commands. `writes` is [`Writes`] when the
     /// window sits on a repository — the same handle and queue a built-in
     /// verb uses — and the pane answers for itself whether it can act on
     /// them. False is "not one of mine", and the caller says so.
     fn run(&self, _command: &str, _host: &Host, _writes: Option<&Writes>, _cx: &mut App) -> bool {
-        false
-    }
-
-    fn scroll_pixels(&self, _dy: f32, _host: &Host, _cx: &mut App) -> bool {
         false
     }
 
@@ -848,17 +607,6 @@ impl Screen {
         }
     }
 
-    fn any(&self) -> AnyView {
-        match self {
-            Screen::Commits { view, .. } => view.clone().into(),
-            Screen::Diff { view, .. } => view.clone().into(),
-            Screen::Files { view, .. } => view.clone().into(),
-            Screen::Stashes { view, .. } => view.clone().into(),
-            Screen::Branches { view, .. } => view.clone().into(),
-            Screen::Custom(pane) => pane.any(),
-        }
-    }
-
     /// Which mode's bindings are live. The name the keymap and `gitten.toml` use.
     fn mode(&self) -> &'static str {
         match self {
@@ -871,6 +619,11 @@ impl Screen {
         }
     }
 
+    /// Spelled for tests only: the old stack's pane headers read this, and
+    /// nothing in the workspace does — the destinations name themselves.
+    /// Kept (not deleted) because the filter-count and extension-label tests
+    /// pin real pane logic through it.
+    #[cfg(test)]
     fn label(&self, cx: &App) -> String {
         match self {
             Screen::Commits { view, label, .. } => {
@@ -1220,45 +973,6 @@ impl Screen {
         }
     }
 
-    /// The box this screen's row list occupies, for hit-testing a wheel event.
-    fn list_bounds(&self, cx: &App) -> Bounds<Pixels> {
-        match self {
-            Screen::Commits { view, .. } => view.read(cx).list_bounds(),
-            Screen::Diff { view, .. } => view.read(cx).list_bounds(),
-            Screen::Files { view, .. } => view.read(cx).list_bounds(),
-            Screen::Stashes { view, .. } => view.read(cx).list_bounds(),
-            Screen::Branches { view, .. } => view.read(cx).list_bounds(),
-            Screen::Custom(pane) => pane.list_bounds(cx),
-        }
-    }
-
-    /// The row a right-click landed on, from the pane the click came over —
-    /// the sidebar views' own publish, taken once so one right-click opens
-    /// one menu. A pane without rows of its own publishes nothing.
-    fn menu_row(&self, cx: &App) -> Option<usize> {
-        match self {
-            Screen::Commits { view, .. } => view.read(cx).take_menu_row(),
-            Screen::Files { view, .. } => view.read(cx).take_menu_row(),
-            Screen::Stashes { view, .. } => view.read(cx).take_menu_row(),
-            Screen::Branches { view, .. } => view.read(cx).take_menu_row(),
-            Screen::Diff { .. } | Screen::Custom(_) => None,
-        }
-    }
-
-    /// Moves this screen's text sideways, where it has any — a commit graph has
-    /// nothing off the left edge to reach, and says so by not moving. Whether
-    /// anything moved decides a redraw.
-    fn pan_pixels(&self, dx: f32, cx: &App) -> bool {
-        match self {
-            Screen::Commits { view, .. } => view.read(cx).pan_pixels(dx),
-            Screen::Diff { view, .. } => view.read(cx).pan_pixels(dx),
-            Screen::Files { view, .. } => view.read(cx).pan_pixels(dx),
-            Screen::Stashes { view, .. } => view.read(cx).pan_pixels(dx),
-            Screen::Branches { view, .. } => view.read(cx).pan_pixels(dx),
-            Screen::Custom(pane) => pane.pan_pixels(dx, cx),
-        }
-    }
-
     /// Runs one of the commands a screen owns: the `view.*` family both share
     /// and each screen's own additions. False is "not one of mine", and the
     /// caller says so — an unknown command that resolved is worth naming rather
@@ -1301,20 +1015,6 @@ impl Screen {
                 known
             }),
             Screen::Custom(pane) => pane.run(command, host, writes, cx),
-        }
-    }
-
-    /// The wheel's smooth path: pixels into the list, in the direction the
-    /// resolved command says and at whatever `[view] scroll` multiplies them
-    /// by. The host rides along because the viewport's margin is live.
-    fn scroll_pixels(&self, dy: f32, host: &Host, cx: &mut App) -> bool {
-        match self {
-            Screen::Commits { view, .. } => view.update(cx, |v, _| v.scroll_pixels(dy, host)),
-            Screen::Diff { view, .. } => view.update(cx, |v, _| v.scroll_pixels(dy, host)),
-            Screen::Files { view, .. } => view.update(cx, |v, _| v.scroll_pixels(dy, host)),
-            Screen::Stashes { view, .. } => view.update(cx, |v, _| v.scroll_pixels(dy, host)),
-            Screen::Branches { view, .. } => view.update(cx, |b, _| b.scroll_pixels(dy, host)),
-            Screen::Custom(pane) => pane.scroll_pixels(dy, host, cx),
         }
     }
 
@@ -1552,23 +1252,6 @@ struct DevShell {
     /// reload a save does — see [`config::reload`] for why there is only one
     /// path.
     config: std::path::PathBuf,
-    /// The sidebar's slice of the window's width, for the session: taken
-    /// from the config knob when the window opens (the same band the parser
-    /// clamps, see [`clamped_share`]) and moved by the divider drag. Never
-    /// written back to `gitten.toml` — the file is read-only by design; the
-    /// knob sets the opening share, the drag adjusts the session. Not a
-    /// watcher of reloads either: a saved file changes the *next* window,
-    /// never the boundary somebody is sitting behind.
-    share: Cell<f32>,
-    /// Relative positions of the horizontal boundaries between the four
-    /// sidebar panes. Fractions survive a window resize without storing pixels.
-    stack_splits: Cell<[f32; STACK_DIVIDERS]>,
-    /// False until the first boundary drag. Before that, content-sized panes
-    /// keep following their rows and the commit pane absorbs the remainder.
-    stack_resized: Cell<bool>,
-    /// Number of sidebar sections drawn this frame. Repository diff launches
-    /// omit commits, so a drag clamps against the actual stack, not four.
-    stack_count: Cell<usize>,
     /// The guide-v2 workspace shell: destination, center view and preview
     /// guard. The sidebar holds no state of its own — it draws the files
     /// pane's grouped projection under the files pane's cursor, or the
@@ -1616,18 +1299,6 @@ struct DevShell {
     /// repository and read per frame. Keyed on the path, because the tests
     /// swap `repo` in place and a memo that trusted construction would lie.
     title_memo: RefCell<Option<(std::path::PathBuf, SharedString, SharedString)>>,
-    /// The diff header's spelled-out strings, kept beside the summary they
-    /// were spelled from: a cursor sitting still is the common frame, and it
-    /// must not re-split the path and re-format three numbers to say the
-    /// same thing again.
-    header_memo: RefCell<Option<(views::diff::FileSummary, HeaderText)>>,
-    /// Each sidebar section's content height, as its canvas probe reported it
-    /// during the last paint — keyed by the section's element id, because the
-    /// wrappers are built fresh every frame and the probe has to write into
-    /// something that survives them. Read by the next frame's build, which is
-    /// what makes the whole-row quantization one frame late; see
-    /// [`DevShell::section_content`] and [`quantized`].
-    quant: RefCell<std::collections::HashMap<&'static str, Rc<Cell<f32>>>>,
     /// Which modes' bindings are live, innermost last: the pane container, the
     /// focused tenant, then input or help over it. Rebuilt by
     /// [`DevShell::sync_modes`] whenever any of those changes.
@@ -1972,12 +1643,10 @@ impl DevShell {
         }
         // The workspace center is not a pane, so it is not in the loop:
         // its bar is accent exactly when the keyboard sits in the diff
-        // region while the workspace is up.
-        if self.workspace.enabled {
-            if let Some(center) = self.workspace.center.clone() {
-                let focused = self.spot == Spot::Main;
-                center.update(cx, |v, _| v.set_focused(focused));
-            }
+        // region.
+        if let Some(center) = self.workspace.center.clone() {
+            let focused = self.spot == Spot::Main;
+            center.update(cx, |v, _| v.set_focused(focused));
         }
     }
 
@@ -1985,6 +1654,8 @@ impl DevShell {
     /// is also the name `[keys]` groups its bindings under. Falls back to what
     /// launched the window only if there were no screens at all, which does
     /// not happen; the fallback keeps the type honest rather than the UI.
+    /// Test-only: the workspace destinations name themselves.
+    #[cfg(test)]
     fn active_view_name(&self) -> &'static str {
         self.active().map_or(self.which, Screen::mode)
     }
@@ -2188,9 +1859,6 @@ impl DevShell {
     /// write itself is [`gitten_app::act::commit_message`]'s — one commit
     /// implementation under both this door and the prompt's.
     fn open_commit_confirm(&mut self, cx: &mut Context<Self>) {
-        if !self.workspace.enabled {
-            self.enter_workspace(cx);
-        }
         if self.repo.is_none() {
             self.set_notice("a fixture has no repository to commit in");
             return;
@@ -4050,10 +3718,9 @@ impl DevShell {
                 self.save_live("view", "sidebar", format!("{next}"), cx, |live| {
                     live.sidebar_share = next;
                 });
-                // The drag adjusts a session copy the file never sees; the
-                // panel moves both, so the window follows now and the next
-                // window opens here.
-                self.share.set(next);
+                // The workspace lays out at fixed px widths, so this takes
+                // effect on the next window, not the one sitting behind
+                // the panel.
             }
             S::CopyOnSelect => {
                 let next = !host.mouse.copy_on_select;
@@ -4348,7 +4015,6 @@ impl DevShell {
         self.error = None;
         self.error_is_load = false;
         self.title_memo.borrow_mut().take();
-        self.header_memo.borrow_mut().take();
         // The scroll the new repository file remembers, applied once the
         // wave lands — scrolling an empty list first would clamp it away.
         let view = View::parse(self.which).unwrap_or(View::Commits);
@@ -4700,9 +4366,7 @@ impl DevShell {
             "view.down" | "view.up" | "view.page-down" | "view.page-up" | "view.scroll-down"
             | "view.scroll-up" | "view.top" | "view.bottom" | "view.left" | "view.right"
             | "diff.next-file" | "diff.prev-file" | "diff.cycle-layout" | "diff.cycle-wrap"
-                if self.workspace.enabled
-                    && self.workspace.center.is_some()
-                    && self.spot == Spot::Main =>
+                if self.workspace.center.is_some() && self.spot == Spot::Main =>
             {
                 if let Some(center) = self.workspace.center.clone() {
                     let host = config::host(cx);
@@ -5178,7 +4842,6 @@ impl DevShell {
     }
 
     fn enter_workspace(&mut self, cx: &mut Context<Self>) {
-        self.workspace.enabled = true;
         self.workspace.destination = views::workspace::Destination::Changes;
         self.workspace_center(cx);
         if self.panes.position("files").is_some() {
@@ -5193,29 +4856,12 @@ impl DevShell {
     /// the commit under its cursor, so the timeline and the detail cannot
     /// disagree about which commit is selected.
     fn enter_history(&mut self, cx: &mut Context<Self>) {
-        self.workspace.enabled = true;
         self.workspace.destination = views::workspace::Destination::History;
         if self.panes.position("commits").is_some() {
             self.focus_named("commits", cx);
         }
         self.sync_main_diff(cx);
         cx.notify();
-    }
-
-    /// Lowers the workspace onto the numbered stack — the test-only door to
-    /// the composition History used before the timeline moved in. Kept
-    /// because the stack's own behaviour (hit-testing, wheel ownership,
-    /// pane cycling) is still pinned through it.
-    #[cfg(test)]
-    fn leave_workspace(&mut self, cx: &mut Context<Self>) {
-        // The words on screen belong to this repository: file them before
-        // the destination changes, so coming back restores them.
-        self.sync_fields_to_draft(cx);
-        self.workspace.enabled = false;
-        self.workspace.destination = views::workspace::Destination::History;
-        if self.has_column {
-            self.focus_named("commits", cx);
-        }
     }
 
     /// The workspace's center diff, built once on first entry and re-aimed
@@ -5263,9 +4909,7 @@ impl DevShell {
         // Only Changes has a preview to aim; History reads the commits pane
         // and the one diff view instead, and re-aiming the hidden file
         // center there would be a load nobody sees.
-        if !self.workspace.enabled
-            || self.workspace.destination != views::workspace::Destination::Changes
-        {
+        if self.workspace.destination != views::workspace::Destination::Changes {
             return;
         }
         let Some(Screen::Files {
@@ -5686,7 +5330,6 @@ impl DevShell {
                 cx.stop_propagation();
                 cx.notify();
                 self.run_command(&name, cx);
-                return;
             }
             Resolve::None => {
                 if self.input.is_some() {
@@ -5725,44 +5368,6 @@ impl DevShell {
             "view.scroll-down" => Some(-px),
             _ => None,
         }
-    }
-
-    /// A right-click asked for the pane's context menu: the keymap's own
-    /// answer to "what may I do here", projected over the one pane the click
-    /// landed in and drawn at the pointer. Plan 045's select-row verb has
-    /// already run — the row's own handler, beside the left-click one,
-    /// published it before this listener saw the event — so the verbs the
-    /// menu offers are the row's, wherever the keyboard was.
-    ///
-    /// A pane whose mode the keymap gives nothing refuses the menu rather
-    /// than drawing an empty box: a menu with no rows says nothing and
-    /// takes space.
-    fn open_context_menu(&mut self, pane: &str, at: Point<Pixels>, cx: &mut Context<Self>) {
-        let Some(screen) = self.panes.get(pane).cloned() else {
-            return;
-        };
-        let host = self.fresh_host(cx);
-        let modes = self.stack_for(Some(&screen), cx);
-        let rows = menu::rows(
-            &host.keys.help(&host.commands, &modes),
-            screen.mode(),
-            &host.commands,
-        );
-        if rows.is_empty() {
-            return;
-        }
-        // A right-click is an intervening event wherever it lands, the same
-        // rule the wheel runs: a chord half-typed when the finger lands is
-        // not half-typed any more.
-        self.pending.clear();
-        let row = screen.menu_row(cx);
-        self.context = Some(ContextMenu {
-            pane: pane.into(),
-            row,
-            at,
-            rows,
-        });
-        cx.notify();
     }
 
     /// The menu's pick: named dispatch over the pane the menu was opened on —
@@ -5809,92 +5414,27 @@ impl DevShell {
         if self.help || self.open.is_some() || self.context.is_some() {
             return;
         }
-        // The workspace owns the whole middle while it is up, so the
-        // capture handler meets its three regions before the stack/main
-        // hit test below — whose bounds are stale (hidden lists), and
-        // would otherwise eat the gesture and scroll what nobody sees.
-        // The locked delta pans/scrolls the region directly; the gesture
-        // lock (`OngoingScroll`) lives for the whole gesture, never
-        // per-event, so a diagonal flick cannot drift the rows.
-        if self.workspace.enabled {
-            let mut ongoing = self.ongoing.get();
-            let delta = views::diff::locked(
-                ev.delta.pixel_delta(window.line_height()),
-                ev.modifiers.shift,
-                &mut ongoing,
-                ev.touch_phase,
-            );
-            self.ongoing.set(ongoing);
-            if let Some(center) = self.workspace.center.clone() {
-                if center.read(cx).list_bounds().contains(&ev.position) {
-                    let mut moved = false;
-                    if !delta.x.is_zero() {
-                        moved |= center.read(cx).pan_pixels(-f32::from(delta.x));
-                    }
-                    if !delta.y.is_zero() {
-                        let host = self.fresh_host(cx);
-                        let key = Key::new(
-                            match f32::from(delta.y) > 0.0 {
-                                true => Code::WheelUp,
-                                false => Code::WheelDown,
-                            },
-                            ev.modifiers.control,
-                            ev.modifiers.alt,
-                            false,
-                        );
-                        let modes = self.stack_for(Some(&self.main), cx);
-                        if let Resolve::Run(name) = host.keys.resolve(&modes, &[key]) {
-                            let name = name.to_string();
-                            // The view.* names land on the center through
-                            // the workspace door in `run_command_from`.
-                            match Self::smooth_pixels(&name, f32::from(delta.y), host.view.rows) {
-                                Some(px) => {
-                                    moved |= center.update(cx, |v, _| v.scroll_pixels(px, &host));
-                                }
-                                _ => {
-                                    self.notice = None;
-                                    self.run_command_from(&name, None, cx);
-                                }
-                            }
-                        }
-                    }
-                    cx.stop_propagation();
-                    if moved {
-                        cx.notify();
-                    }
-                    return;
-                }
-            }
-            // The sidebar rail: the wheel pans the grouped list on its own
-            // handle (`workspace.sidebar_scroll`) — the stack list's handle
-            // addresses hidden rows, so the glance must never fall through
-            // to it. Pixels accumulate to whole rail rows (uniform ROW_H
-            // items, so a trackpad's small deltas add up instead of dying
-            // to rounding); the keyboard stays where it was. Any resolved
-            // name that is not a smooth scroll is a cursor verb, ignored on
-            // a glance the way an unbound key is.
-            //
-            // The rect mirrors `workspace_body`'s geometry — title bar and
-            // destination header above, status bar below, the spec width
-            // rule on the left — the one place besides composition that
-            // names those numbers.
-            let vp = window.viewport_size();
-            let rail = views::workspace::sidebar_width(f32::from(vp.width));
-            let in_sidebar = f32::from(ev.position.x) >= 0.0
-                && f32::from(ev.position.x) < rail
-                && f32::from(ev.position.y) >= TITLE_H
-                && f32::from(ev.position.y) < f32::from(vp.height) - chrome::STATUS_H;
-            if in_sidebar {
+        // The workspace owns the whole middle, so the capture handler
+        // meets its three regions directly — center, sidebar rail, then
+        // the natively-scrolling chrome. The locked delta pans/scrolls
+        // the region directly; the gesture lock (`OngoingScroll`) lives
+        // for the whole gesture, never per-event, so a diagonal flick
+        // cannot drift the rows.
+        let mut ongoing = self.ongoing.get();
+        let delta = views::diff::locked(
+            ev.delta.pixel_delta(window.line_height()),
+            ev.modifiers.shift,
+            &mut ongoing,
+            ev.touch_phase,
+        );
+        self.ongoing.set(ongoing);
+        if let Some(center) = self.workspace.center.clone() {
+            if center.read(cx).list_bounds().contains(&ev.position) {
                 let mut moved = false;
+                if !delta.x.is_zero() {
+                    moved |= center.read(cx).pan_pixels(-f32::from(delta.x));
+                }
                 if !delta.y.is_zero() {
-                    let modes = match self.panes.get("files") {
-                        Some(files) => self.stack_for(Some(files), cx),
-                        None => Modes::new(),
-                    };
-                    let grouped_len = match self.panes.get("files") {
-                        Some(Screen::Files { view, .. }) => view.read(cx).grouped().rows.len(),
-                        _ => 0,
-                    };
                     let host = self.fresh_host(cx);
                     let key = Key::new(
                         match f32::from(delta.y) > 0.0 {
@@ -5905,48 +5445,18 @@ impl DevShell {
                         ev.modifiers.alt,
                         false,
                     );
+                    let modes = self.stack_for(Some(&self.main), cx);
                     if let Resolve::Run(name) = host.keys.resolve(&modes, &[key]) {
                         let name = name.to_string();
-                        if let Some(px) =
-                            Self::smooth_pixels(&name, f32::from(delta.y), host.view.rows)
-                        {
-                            // The mirror against the rail's actual position
-                            // first: the keyboard-follow scroll moves the list
-                            // without stepping it, and stepping from a stale
-                            // top jumps.
-                            let max = grouped_len.saturating_sub(1);
-                            let mirror = self.workspace.sidebar_top.get();
-                            let top = views::workspace::reconcile_top(
-                                &self.workspace.sidebar_scroll,
-                                mirror,
-                                crate::graph::ROW_H,
-                                max,
-                            );
-                            let acc = match top == mirror {
-                                // Another path moved the list: the banked
-                                // remainder belongs to the old position, so
-                                // this flick starts fresh.
-                                true => self.workspace.sidebar_px.get() + px,
-                                false => {
-                                    self.workspace.sidebar_top.set(top);
-                                    px
-                                }
-                            };
-                            match views::workspace::wheel_step(top, acc, crate::graph::ROW_H, max) {
-                                Some((next, rest)) => {
-                                    // Strict: the step already spent its
-                                    // pixels, so the row lands on top even
-                                    // when it is already visible. Non-strict
-                                    // would sit still while the mirror walks
-                                    // away from the window it claims to name.
-                                    self.workspace
-                                        .sidebar_scroll
-                                        .scroll_to_item_strict(next, ScrollStrategy::Top);
-                                    self.workspace.sidebar_top.set(next);
-                                    self.workspace.sidebar_px.set(rest);
-                                    moved |= next != top;
-                                }
-                                None => self.workspace.sidebar_px.set(acc),
+                        // The view.* names land on the center through
+                        // the workspace door in `run_command_from`.
+                        match Self::smooth_pixels(&name, f32::from(delta.y), host.view.rows) {
+                            Some(px) => {
+                                moved |= center.update(cx, |v, _| v.scroll_pixels(px, &host));
+                            }
+                            _ => {
+                                self.notice = None;
+                                self.run_command_from(&name, None, cx);
                             }
                         }
                     }
@@ -5957,300 +5467,101 @@ impl DevShell {
                 }
                 return;
             }
-            // The inspector, the destination header and the chrome scroll
-            // natively or not at all: the stack underneath is hidden, and
-            // falling through would scroll a list nobody sees. Returning
-            // unconsumed leaves text inputs their own pan.
-            return;
         }
-        // Over one region's rows or the other's, and not over the title bar
-        // or a dropdown above them. The wheel is a glance, not a commitment:
-        // it scrolls the pane under it and the keyboard stays where it was —
-        // focus is the click's job. So the hit region is the event's target
-        // *only*: resolved against here, dispatched to below, and nothing on
-        // this path reads the focused pane — the badge, the hints and the
-        // accent bar sit still through the gesture. What the old focusing
-        // protected still holds: this capture handler remains the wheel's
-        // only consumer, so it never stands aside to an unfocused pane's
-        // native list scroller becoming a second, unconfigured input path,
-        // and the keymap still owns both halves of the motion.
-        let in_stack = self.has_column.then(|| {
-            self.panes
-                .iter()
-                .position(|screen| screen.list_bounds(cx).contains(&ev.position))
-        });
-        let over_main = self.main.list_bounds(cx).contains(&ev.position);
-        let screen = match (in_stack.flatten(), over_main) {
-            // The stack keeps its per-list hit test: whichever list is
-            // showing owns its own box.
-            (Some(at), _) => self
-                .panes
-                .iter()
-                .nth(at)
-                .expect("the position was just found in this registry")
-                .clone(),
-            (None, true) => self.main.clone(),
-            (None, false) => return,
-        };
-        let mut ongoing = self.ongoing.get();
-        let delta = views::diff::locked(
-            ev.delta.pixel_delta(window.line_height()),
-            ev.modifiers.shift,
-            &mut ongoing,
-            ev.touch_phase,
-        );
-        self.ongoing.set(ongoing);
-
-        // The horizontal axis is the text's, where the screen has text to move.
-        let mut moved = false;
-        if !delta.x.is_zero() {
-            moved |= screen.pan_pixels(-f32::from(delta.x), cx);
-        }
-
-        // The vertical axis belongs to the keymap, resolved against the pane
-        // under the wheel: a binding written under another pane's mode stays
-        // quiet over this one, and one this pane carries answers here. What
-        // resolved decides *both* halves of the motion: which way the list
-        // moves comes from the command — `wheelup = "view.scroll-down"` really
-        // does scroll down — and how far is the event's own pixels at
-        // `[view] scroll`'s multiplier, which is what keeps a trackpad smooth.
-        // Any other command still dispatches by name through the one path,
-        // aimed at the hovered pane for this event; an unbound or half-typed
-        // chord does nothing, exactly like a key.
-        if !delta.y.is_zero() {
-            let host = self.fresh_host(cx);
-            let key = Key::new(
-                match f32::from(delta.y) > 0.0 {
-                    true => Code::WheelUp,
-                    false => Code::WheelDown,
-                },
-                ev.modifiers.control,
-                ev.modifiers.alt,
-                false,
-            );
-            // Unbound or half-typed: the wheel does nothing, which is what an
-            // unbound key does too.
-            let modes = self.stack_for(Some(&screen), cx);
-            if let Resolve::Run(name) = host.keys.resolve(&modes, &[key]) {
-                let name = name.to_string();
-                match Self::smooth_pixels(&name, f32::from(delta.y), host.view.rows) {
-                    // The smooth path: the command came from `[keys]`, the
-                    // distance from the finger.
-                    Some(px) => moved |= screen.scroll_pixels(px, &host, cx),
-                    _ => {
-                        self.notice = None;
-                        self.run_command_from(&name, Some(&screen), cx);
+        // The sidebar rail: the wheel pans the grouped list on its own
+        // handle (`workspace.sidebar_scroll`) — the stack list's handle
+        // addresses hidden rows, so the glance must never fall through
+        // to it. Pixels accumulate to whole rail rows (uniform ROW_H
+        // items, so a trackpad's small deltas add up instead of dying
+        // to rounding); the keyboard stays where it was. Any resolved
+        // name that is not a smooth scroll is a cursor verb, ignored on
+        // a glance the way an unbound key is.
+        //
+        // The rect mirrors `workspace_body`'s geometry — title bar and
+        // destination header above, status bar below, the spec width
+        // rule on the left — the one place besides composition that
+        // names those numbers.
+        let vp = window.viewport_size();
+        let rail = views::workspace::sidebar_width(f32::from(vp.width));
+        let in_sidebar = f32::from(ev.position.x) >= 0.0
+            && f32::from(ev.position.x) < rail
+            && f32::from(ev.position.y) >= TITLE_H
+            && f32::from(ev.position.y) < f32::from(vp.height) - chrome::STATUS_H;
+        if in_sidebar {
+            let mut moved = false;
+            if !delta.y.is_zero() {
+                let modes = match self.panes.get("files") {
+                    Some(files) => self.stack_for(Some(files), cx),
+                    None => Modes::new(),
+                };
+                let grouped_len = match self.panes.get("files") {
+                    Some(Screen::Files { view, .. }) => view.read(cx).grouped().rows.len(),
+                    _ => 0,
+                };
+                let host = self.fresh_host(cx);
+                let key = Key::new(
+                    match f32::from(delta.y) > 0.0 {
+                        true => Code::WheelUp,
+                        false => Code::WheelDown,
+                    },
+                    ev.modifiers.control,
+                    ev.modifiers.alt,
+                    false,
+                );
+                if let Resolve::Run(name) = host.keys.resolve(&modes, &[key]) {
+                    let name = name.to_string();
+                    if let Some(px) = Self::smooth_pixels(&name, f32::from(delta.y), host.view.rows)
+                    {
+                        // The mirror against the rail's actual position
+                        // first: the keyboard-follow scroll moves the list
+                        // without stepping it, and stepping from a stale
+                        // top jumps.
+                        let max = grouped_len.saturating_sub(1);
+                        let mirror = self.workspace.sidebar_top.get();
+                        let top = views::workspace::reconcile_top(
+                            &self.workspace.sidebar_scroll,
+                            mirror,
+                            crate::graph::ROW_H,
+                            max,
+                        );
+                        let acc = match top == mirror {
+                            // Another path moved the list: the banked
+                            // remainder belongs to the old position, so
+                            // this flick starts fresh.
+                            true => self.workspace.sidebar_px.get() + px,
+                            false => {
+                                self.workspace.sidebar_top.set(top);
+                                px
+                            }
+                        };
+                        match views::workspace::wheel_step(top, acc, crate::graph::ROW_H, max) {
+                            Some((next, rest)) => {
+                                // Strict: the step already spent its
+                                // pixels, so the row lands on top even
+                                // when it is already visible. Non-strict
+                                // would sit still while the mirror walks
+                                // away from the window it claims to name.
+                                self.workspace
+                                    .sidebar_scroll
+                                    .scroll_to_item_strict(next, ScrollStrategy::Top);
+                                self.workspace.sidebar_top.set(next);
+                                self.workspace.sidebar_px.set(rest);
+                                moved |= next != top;
+                            }
+                            None => self.workspace.sidebar_px.set(acc),
+                        }
                     }
                 }
             }
-        }
-        // Ours either way. A gesture that unlocked mid-flick carries both axes
-        // for the rest of its life, and letting one through would scroll the
-        // list twice — once here, once natively.
-        cx.stop_propagation();
-        if moved {
-            cx.notify();
-        }
-    }
-
-    /// The probe cell a section's content wrapper reports its height into —
-    /// keyed by the section's element id, because the wrappers are built
-    /// fresh every frame and the probe has to write into something that
-    /// survives them. The probe paints after this frame's build has read the
-    /// cell, so what it writes is the *next* frame's input: correct, and one
-    /// frame late, the house rule for measured layout.
-    fn probed(&self, id: &'static str) -> Rc<Cell<f32>> {
-        self.quant
-            .borrow_mut()
-            .entry(id)
-            .or_insert_with(|| Rc::new(Cell::new(0.0)))
-            .clone()
-    }
-
-    /// A section's content wrapper — the pane's rows under its header —
-    /// sized to whole rows. The zero-height canvas pinned across it is the
-    /// probe: paint reports the wrapper's box, [`DevShell::quant`] carries
-    /// it to the next frame, and that frame rounds the height **down** to a
-    /// whole multiple of [`graph::ROW_H`] ([`quantized`]) and pads the
-    /// remainder below the last full row in the background colour, so the
-    /// boundary always lands between rows and never through a line of
-    /// text. Before the first report the rows take the wrapper as they
-    /// find it; every frame after, squeezed or not, is quantized.
-    fn section_content(
-        &self,
-        id: &'static str,
-        view: AnyView,
-        bg: theme::Rgb,
-        cx: &mut Context<Self>,
-    ) -> Div {
-        let probed = self.probed(id);
-        let measured = probed.get();
-        let me = cx.entity().downgrade();
-        let wrapper = div()
-            .min_h_0()
-            .flex_grow(1.0)
-            .overflow_hidden()
-            .flex()
-            .flex_col()
-            .child({
-                let probed = probed.clone();
-                canvas(
-                    move |bounds, _, cx| {
-                        let h = f32::from(bounds.size.height);
-                        if (h - probed.get()).abs() >= 0.5 {
-                            probed.set(h);
-                            _ = me.update(cx, |_, cx| cx.notify());
-                        }
-                    },
-                    |_, _, _, _| {},
-                )
-                .absolute()
-                .top_0()
-                .left_0()
-                .right_0()
-                .h(px(0.))
-            });
-        if measured > 0.0 {
-            wrapper
-                .child(
-                    div()
-                        .debug_selector(move || format!("{id}-rows"))
-                        .flex_none()
-                        .w_full()
-                        .h(px(quantized(measured)))
-                        .overflow_hidden()
-                        .child(view),
-                )
-                // The remainder the rows do not spend: background, not a
-                // half row. Growing into exactly the difference is what
-                // flex_grow does here.
-                .child(div().flex_grow(1.0).bg(rgb(bg)))
-        } else {
-            wrapper.child(div().min_h_0().flex_grow(1.0).overflow_hidden().child(view))
-        }
-    }
-
-    /// The commit list, or whichever extension pane took its region over.
-    /// Focused-and-not-a-sidebar-name is exactly "a custom pane stands here",
-    /// so the header follows it without a third state to check.
-    fn commits_section(
-        &self,
-        host: &Rc<Host>,
-        focused_name: &str,
-        height: f32,
-        cx: &mut Context<Self>,
-        out: &mut Vec<AnyElement>,
-    ) {
-        if !self.has_column {
-            return;
-        }
-        let c = host.theme.chrome;
-        let custom = matches!(self.panes.focused(), Screen::Custom(_));
-        let screen = match custom {
-            true => self.panes.focused(),
-            false => self
-                .panes
-                .get("commits")
-                .unwrap_or_else(|| self.panes.focused()),
-        };
-        let focused = self.spot == Spot::List && (custom || focused_name == "commits");
-        // Right-edge furniture: the HEAD state the list is of — the design pins
-        // it here, where a checkout rewrites it in place — and a live filter's
-        // count when there is one, because the filter is the thing that changed
-        // most recently and the thing a count is about. Both read from state the
-        // refresh wave already paid for.
-        let right = match screen {
-            Screen::Commits { view, .. } => {
-                let note = view.read(cx).filter_note();
-                let head = (!note.is_some())
-                    .then(|| {
-                        self.panes.get("branches").and_then(|s| match s {
-                            Screen::Branches { view, .. } => view.read(cx).head_info(),
-                            _ => None,
-                        })
-                    })
-                    .flatten()
-                    .map(|info| info.label);
-                note.map(|note| {
-                    div()
-                        .flex_none()
-                        // The filter is the thing that changed most recently
-                        // and the thing the count is about — read, not glanced
-                        // at, so it clears the furniture floor.
-                        .text_color(rgb(host.theme.quiet_on(c.title_bg)))
-                        .child(SharedString::from(note))
-                        .into_any_element()
-                })
-                .or_else(|| {
-                    // Dim, not accent: the accent is the keyboard's mark, and
-                    // HEAD is a fact about the strip it sits on — raw dim is
-                    // under the text floor there, so it resolves.
-                    head.map(|label| {
-                        div()
-                            .flex_none()
-                            .text_color(rgb(host.theme.dim_on(theme::Surface::Title)))
-                            .child(label)
-                            .into_any_element()
-                    })
-                })
+            cx.stop_propagation();
+            if moved {
+                cx.notify();
             }
-            _ => None,
-        };
-        let name: SharedString = match custom {
-            true => screen.label(cx).into(),
-            false => "COMMITS".into(),
-        };
-        // The context menu's pane: the takeover pane's own registration name
-        // when an extension pane stands here, the commit list's otherwise.
-        let pane = match custom {
-            true => self.panes.focused_name().to_string(),
-            false => "commits".to_string(),
-        };
-        out.push(
-            div()
-                .id("side-commits")
-                .debug_selector(|| "side-commits".to_string())
-                .flex_none()
-                .h(px(height))
-                .flex()
-                .flex_col()
-                .overflow_hidden()
-                .capture_any_mouse_down(cx.listener(move |this, _, _, cx| {
-                    // A click always means "the keyboard comes back here" —
-                    // including from the diff. Focusing first keeps a
-                    // takeover standing; the spot follows either way, which
-                    // `focus_named` alone would not do when the pane was
-                    // already the focused one.
-                    if !custom {
-                        this.focus_named("commits", cx);
-                    }
-                    this.set_spot(Spot::List, cx);
-                }))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| {
-                        // The row's own click handler (deeper, so earlier in
-                        // bubble) already moved the keyboard via `select_row`;
-                        // the preview follows it here, like every key move
-                        // does through `run_command`'s tail, like the
-                        // terminal.
-                        this.sync_main_diff(cx);
-                    }),
-                )
-                .on_mouse_down(
-                    MouseButton::Right,
-                    cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
-                        this.open_context_menu(&pane, ev.position, cx);
-                        // A right-click also moves the keyboard (the row's
-                        // handler ran first), so the preview follows that
-                        // row too.
-                        this.sync_main_diff(cx);
-                    }),
-                )
-                .child(chrome::pane_header(host, "4", name, None, focused, right))
-                .child(self.section_content("side-commits", screen.any(), c.bg, cx))
-                .into_any_element(),
-        );
+        }
+        // The inspector, the destination header and the chrome scroll
+        // natively or not at all: falling through would scroll rows
+        // nobody sees. Returning unconsumed leaves text inputs their
+        // own pan.
     }
 }
 
@@ -6493,7 +5804,6 @@ impl DevShell {
                 .unwrap_or_else(|| SharedString::from("repository")),
             None => SharedString::from("no repository"),
         };
-
         // Every sidebar control resolves through the named dispatch — the
         // same names the keyboard resolves to, so a button is an adapter
         // and not a second path.
@@ -6966,433 +6276,9 @@ impl Render for DevShell {
         // of shearing the grid). Read here at composition, never in a view.
         let narrow = f32::from(window.viewport_size().width) < 1150.0;
 
-        // **The two regions**: a vertically resizable stack on the left and
-        // the diff filling the rest. Until a divider moves, files, branches
-        // and stash follow their content while commits receives the remainder.
-        // A moved divider stores relative boundaries, so resizing the window
-        // preserves the session's proportions. Five-pixel invisible hit strips
-        // straddle the boundaries; the visible edge remains the pane header.
-        let sidebar = {
-            let focused_name = self.panes.focused_name().to_string();
-            let stack_total =
-                (f32::from(window.viewport_size().height) - TITLE_H - chrome::STATUS_H).max(0.0);
-            let mut preferred = [SECTION_MIN_H; STACK_SECTIONS];
-            let mut pane_count = 0;
-            for (name, _, _, _) in STACK_TOP {
-                let Some(screen) = self.panes.get(name) else {
-                    continue;
-                };
-                let rows = match screen {
-                    Screen::Files { view, .. } => view.read(cx).rows(),
-                    Screen::Branches { view, .. } => view.read(cx).rows(),
-                    _ => 0,
-                };
-                let focused = self.spot == Spot::List && focused_name == name;
-                preferred[pane_count] = section_basis(rows, focused);
-                pane_count += 1;
-            }
-            let mut flexible = pane_count.saturating_sub(1);
-            if self.has_column {
-                flexible = pane_count;
-                pane_count += 1;
-            }
-            for (name, _, _, _) in STACK_FOOT {
-                let Some(screen) = self.panes.get(name) else {
-                    continue;
-                };
-                let rows = match screen {
-                    Screen::Stashes { view, .. } => view.read(cx).rows(),
-                    _ => 0,
-                };
-                let focused = self.spot == Spot::List && focused_name == name;
-                preferred[pane_count] = section_basis(rows, focused);
-                pane_count += 1;
-            }
-            if !self.has_column {
-                flexible = pane_count.saturating_sub(1);
-            }
-            self.stack_count.set(pane_count);
-
-            let splits = if self.stack_resized.get() {
-                clamped_stack_splits(self.stack_splits.get(), stack_total, pane_count)
-            } else {
-                let heights = fitted_stack_heights(stack_total, preferred, pane_count, flexible);
-                splits_from_heights(heights, stack_total, pane_count)
-            };
-            self.stack_splits.set(splits);
-            let heights = heights_from_splits(splits, stack_total, pane_count);
-
-            let mut sections: Vec<AnyElement> = Vec::new();
-            let mut height_at = 0;
-            for (name, number, label, id) in STACK_TOP {
-                let Some(screen) = self.panes.get(name) else {
-                    continue;
-                };
-                let focused = self.spot == Spot::List && focused_name == name;
-                // The height first: the count below it is what the height
-                // leaves visible, and the two must be read in that order.
-                let height = heights[height_at];
-                height_at += 1;
-                let count = match screen {
-                    Screen::Files { view, .. } => {
-                        let v = view.read(cx);
-                        v.filter_note().map(SharedString::from).or_else(|| {
-                            files_header_count(view, cx)
-                                .map(|c| with_hidden(c, hidden_rows(v.rows(), height)))
-                        })
-                    }
-                    Screen::Branches { view, .. } => {
-                        let v = view.read(cx);
-                        v.filter_note().map(SharedString::from).or_else(|| {
-                            let n = v.count();
-                            (n > 0).then(|| {
-                                with_hidden(
-                                    SharedString::from(n.to_string()),
-                                    hidden_rows(v.rows(), height),
-                                )
-                            })
-                        })
-                    }
-                    _ => None,
-                };
-                sections.push(
-                    div()
-                        .id(id)
-                        .debug_selector(move || id.to_string())
-                        .flex_none()
-                        .h(px(height))
-                        .flex()
-                        .flex_col()
-                        .overflow_hidden()
-                        .capture_any_mouse_down(cx.listener(move |this, _, _, cx| {
-                            this.focus_named(name, cx);
-                        }))
-                        .on_mouse_down(
-                            MouseButton::Right,
-                            cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
-                                this.open_context_menu(name, ev.position, cx);
-                            }),
-                        )
-                        .child(chrome::pane_header(
-                            &host,
-                            number,
-                            label.into(),
-                            count,
-                            focused,
-                            None,
-                        ))
-                        .child(self.section_content(id, screen.any(), c.bg, cx))
-                        .into_any_element(),
-                );
-            }
-            if self.has_column {
-                self.commits_section(&host, &focused_name, heights[height_at], cx, &mut sections);
-                height_at += 1;
-            }
-            for (name, number, label, id) in STACK_FOOT {
-                let Some(screen) = self.panes.get(name) else {
-                    continue;
-                };
-                let focused = self.spot == Spot::List && focused_name == name;
-                // The height first: the count below it is what the height
-                // leaves visible, and the two must be read in that order.
-                let height = heights[height_at];
-                let count: Option<SharedString> = match screen {
-                    Screen::Stashes { view, .. } => {
-                        let v = view.read(cx);
-                        v.filter_note().map(SharedString::from).or_else(|| {
-                            let n = v.rows();
-                            (n > 0).then(|| {
-                                with_hidden(
-                                    SharedString::from(n.to_string()),
-                                    hidden_rows(n, height),
-                                )
-                            })
-                        })
-                    }
-                    _ => None,
-                };
-                sections.push(
-                    div()
-                        .id(id)
-                        .debug_selector(move || id.to_string())
-                        .flex_none()
-                        .h(px(height))
-                        .flex()
-                        .flex_col()
-                        .overflow_hidden()
-                        .capture_any_mouse_down(cx.listener(move |this, _, _, cx| {
-                            this.focus_named(name, cx);
-                        }))
-                        .on_mouse_down(
-                            MouseButton::Right,
-                            cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
-                                this.open_context_menu(name, ev.position, cx);
-                            }),
-                        )
-                        .child(chrome::pane_header(
-                            &host,
-                            number,
-                            label.into(),
-                            count,
-                            focused,
-                            None,
-                        ))
-                        .child(self.section_content(id, screen.any(), c.bg, cx))
-                        .into_any_element(),
-                );
-            }
-            for (boundary, split) in splits
-                .iter()
-                .copied()
-                .enumerate()
-                .take(pane_count.saturating_sub(1))
-            {
-                sections.push(
-                    div()
-                        .id(("stack-divider", boundary))
-                        .debug_selector(move || format!("stack-divider-{boundary}"))
-                        .absolute()
-                        .left_0()
-                        .w_full()
-                        .top(relative(split))
-                        .mt(px(-2.0))
-                        .h(px(5.0))
-                        .cursor_row_resize()
-                        .occlude()
-                        .on_drag(StackDrag(boundary), |_, _, _, cx| {
-                            cx.stop_propagation();
-                            cx.new(|_| gpui::EmptyView)
-                        })
-                        .on_drag_move(cx.listener(
-                            |this, e: &DragMoveEvent<StackDrag>, window, cx| {
-                                let total = (f32::from(window.viewport_size().height)
-                                    - TITLE_H
-                                    - chrome::STATUS_H)
-                                    .max(0.0);
-                                let count = this.stack_count.get();
-                                let boundary = e.drag(cx).0;
-                                if boundary >= count.saturating_sub(1) || total <= 0.0 {
-                                    return;
-                                }
-                                let mut next = this.stack_splits.get();
-                                next[boundary] = (f32::from(e.event.position.y) - TITLE_H) / total;
-                                next = clamped_stack_splits(next, total, count);
-                                if next != this.stack_splits.get() {
-                                    this.stack_splits.set(next);
-                                    this.stack_resized.set(true);
-                                    cx.notify();
-                                }
-                            },
-                        ))
-                        .into_any_element(),
-                );
-            }
-            (!sections.is_empty()).then(|| {
-                div()
-                    .id("sidebar")
-                    .flex_none()
-                    .relative()
-                    .w(relative(self.share.get()))
-                    .min_h_0()
-                    .flex()
-                    .flex_col()
-                    .overflow_hidden()
-                    .debug_selector(|| "sidebar".to_string())
-                    .children(sections)
-            })
-        };
-        // Owned by the divider's gating: a fixture has no stack, so it has no
-        // border for a strip to straddle either.
-        let has_stack = sidebar.is_some();
-        let Screen::Diff {
-            view: main_view, ..
-        } = &self.main
-        else {
-            unreachable!("the main view is always a diff");
-        };
-        let head = self.head.borrow().clone();
-        // The band's "loading diff" is the one home for the word: an accent
-        // here competed with it and said the same thing twice at once.
-        // The header names the file the keyboard is in, with that file's
-        // change counts and the hunk's place among its siblings — the same
-        // three facts the design's fifth pane carries. The commit's subject
-        // rides along dim and shrinking: a revspec launch (`HEAD~2..HEAD`)
-        // has no row in any list to name it, and a diff that cannot say what
-        // it is of is a diff nobody trusts after a scroll.
-        let main_focused = self.spot == Spot::Main;
-        let main_region = div()
-            .id("main")
-            .flex_grow(1.0)
-            .min_w_0()
-            .relative()
-            .min_h_0()
-            .flex()
-            .flex_col()
-            .overflow_hidden()
-            .border_l_1()
-            .border_color(rgb(c.border))
-            .debug_selector(|| "main".to_string())
-            .capture_any_mouse_down(cx.listener(|this, _, _, cx| this.set_spot(Spot::Main, cx)))
-            .child({
-                let summary = main_view.read(cx).file_summary();
-                // Spelled once per change of summary, not per frame: the
-                // memo answers while the keyboard sits still, which is the
-                // frame that happens most.
-                let text = summary.as_ref().map(|s| {
-                    let mut memo = self.header_memo.borrow_mut();
-                    match memo.as_ref() {
-                        Some((key, text)) if key == s => text.clone(),
-                        _ => {
-                            let text = HeaderText::of(s);
-                            *memo = Some((s.clone(), text.clone()));
-                            text
-                        }
-                    }
-                });
-                let (adds, dels, hunk) = match &text {
-                    Some(t) => (Some(t.adds.clone()), Some(t.dels.clone()), t.hunk.clone()),
-                    None => (None, None, None),
-                };
-                // File path, then the counts, then the subject last and
-                // shrinking: the counts are `flex_none` and the eye finds
-                // them at the right edge, the subject gives whole, and the
-                // path — [`chrome::path_spans`] — gives only its directory's
-                // head. The filename is the one part of this strip that
-                // never truncates.
-                let right = div()
-                    .min_w_0()
-                    .flex()
-                    .items_center()
-                    .gap(chrome::gap_l(&host.font))
-                    .children(head.map(|commit| {
-                        div()
-                            .flex_shrink(1.0)
-                            .min_w_0()
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_ellipsis_start()
-                            // Read when it is there — the commit the list is
-                            // sitting on — so it clears the furniture floor.
-                            .text_color(rgb(host.theme.quiet_on(c.title_bg)))
-                            .child(commit.subject.clone())
-                    }))
-                    .children(adds.map(|adds| {
-                        div()
-                            .flex_none()
-                            .text_color(rgb(host.theme.diff.adds_fg))
-                            .child(adds)
-                    }))
-                    .children(dels.map(|dels| {
-                        div()
-                            .flex_none()
-                            .text_color(rgb(host.theme.diff.dels_fg))
-                            .child(dels)
-                    }))
-                    .children(hunk.map(|h| {
-                        div()
-                            .flex_none()
-                            // A count is read, so through `quiet_on` — raw
-                            // `faint` is under the floor on this strip.
-                            .text_color(rgb(host.theme.quiet_on(c.title_bg)))
-                            .child(h)
-                    }));
-                // The name is a path, so it is drawn as one: directory dim,
-                // filename in the header's own ink — the same cut the files
-                // rows make, so the eye lands on the same word in both.
-                let name_ink = match main_focused {
-                    true => c.fg,
-                    false => c.dim,
-                };
-                let name = match &text {
-                    Some(t) => chrome::path_spans(
-                        &host,
-                        t.dir.clone(),
-                        t.name.clone(),
-                        name_ink,
-                        theme::Surface::Title,
-                        false,
-                    ),
-                    None => div().text_color(rgb(name_ink)).child("DIFF"),
-                };
-                chrome::pane_header_with(
-                    &host,
-                    "0",
-                    name.into_any_element(),
-                    None,
-                    main_focused,
-                    Some(right.into_any_element()),
-                )
-            })
-            // A flexed box for the view itself: every view roots at
-            // `size_full`, which under this region would read the *container*
-            // height and slide the last rows behind the header without it.
-            .child(
-                div()
-                    .min_h_0()
-                    .flex_grow(1.0)
-                    .overflow_hidden()
-                    .child(main_view.clone()),
-            );
-
-        let which = self.active_view_name();
-
         let ch = host.font.char_width();
 
-        // The title is the repository and where HEAD is, and nothing else.
-        // The app's name is the icon's job, the view's name is the status
-        // badge's and the version is the bar's; a strip that said all three
-        // again was chrome reading its own labels aloud. A launch with no
-        // repository behind it (a fixture, a patch) keeps the acquisition
-        // label, which is the only name it has.
-        let title: AnyElement;
         let me = cx.entity().downgrade();
-        match &self.repo {
-            Some((path, _)) => {
-                // Cut once per repository — see [`DevShell::title_memo`].
-                let mut memo = self.title_memo.borrow_mut();
-                let (dir, name) = match memo.as_ref() {
-                    Some((at, dir, name)) if at == path => (dir.clone(), name.clone()),
-                    _ => {
-                        let (dir, name) = repo_title(path, home());
-                        let (dir, name) = (SharedString::from(dir), SharedString::from(name));
-                        *memo = Some((path.clone(), dir.clone(), name.clone()));
-                        (dir, name)
-                    }
-                };
-                let spans = chrome::path_spans(&host, dir, name, c.fg, theme::Surface::Title, true);
-                // The repository title is the project switcher's trigger: the
-                // recent menu hangs below the strip. A fixture's label opens
-                // nothing and stays plain.
-                // Inline, like every other click handler: a pre-bound
-                // variable pins the event's lifetime and no longer
-                // implements the handler type.
-                title = div()
-                    .id("trigger")
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgb(c.keycap)))
-                    .rounded(px(chrome::RADIUS))
-                    .on_click({
-                        let me = me.clone();
-                        move |_, _, cx| {
-                            _ = me.update(cx, |this, cx| this.toggle_project_menu(cx));
-                        }
-                    })
-                    .child(spans)
-                    .into_any_element();
-            }
-            None => {
-                let label = self.active_label(cx);
-                title = div()
-                    .whitespace_nowrap()
-                    // From the *start*: the label is a path and a revspec, and
-                    // `…/git HEAD~2..HEAD` is the half worth keeping.
-                    .text_ellipsis_start()
-                    .child(label)
-                    .into_any_element();
-            }
-        }
-
         // The branch chip. One small struct per frame, no second git call
         // anywhere. Filled with `raised`, the quiet chip surface — the status
         // badge keeps the accent fill to itself, so the two never compete.
@@ -7575,11 +6461,9 @@ impl Render for DevShell {
                     // The window has no titlebar of its own any more, so the
                     // traffic lights are drawn *into* this strip and the title
                     // has to start after them.
-                    .pl(px(if self.workspace.enabled {
-                        views::workspace::sidebar_width(f32::from(window.viewport_size().width))
-                    } else {
-                        LIGHTS_W
-                    }))
+                    .pl(px(views::workspace::sidebar_width(f32::from(
+                        window.viewport_size().width,
+                    ))))
                     .pr(px((ch * 1.7).round()))
                     .bg(rgb(c.title_bg))
                     .border_b_1()
@@ -7607,8 +6491,7 @@ impl Render for DevShell {
                             // last segment, is the part being scanned; the
                             // parent is the part to sacrifice.
                             .whitespace_nowrap()
-                            .text_ellipsis_start()
-                            .when(!self.workspace.enabled, |d| d.child(title)),
+                            .text_ellipsis_start(),
                     )
                     // The branch control: HEAD's branch glyph, then the name
                     // the head read above the strip spelled. The reference
@@ -7697,57 +6580,10 @@ impl Render for DevShell {
                     .child(commands_button)
                     .children(push_button),
             )
-            // The two regions in one row: the left stack, the diff. A fixture
-            // has no stack — no repository to list — and the diff fills the
-            // window; a repository has both. With the workspace up, the
-            // whole middle is the workspace instead — header, grouped
-            // sidebar, file diff, inspector slot — composed once here at
-            // the viewport the window handed over.
-            .child(match self.workspace.enabled {
-                true => self.workspace_body(window, cx),
-                false => div()
-                    .min_h_0()
-                    .flex_grow(1.0)
-                    .flex()
-                    .children(sidebar)
-                    .child(main_region)
-                    // The divider: a 5px hit strip straddling the border the
-                    // sidebar and the diff are parted by — the border itself
-                    // stays the hairline it is, and the strip is invisible
-                    // (no ink of its own) but occludes, so the hand finds it
-                    // and a click on it does not fall through to either
-                    // region. Dragging it moves the session's share, inside
-                    // the band the config parser clamps; the hairline follows
-                    // on the next frame, which is a relative-width write and
-                    .children(has_stack.then(|| {
-                        div()
-                            .id("divider")
-                            .debug_selector(|| "divider".to_string())
-                            .absolute()
-                            .top_0()
-                            .h_full()
-                            .left(relative(self.share.get()))
-                            .ml(px(-2.0))
-                            .w(px(5.0))
-                            .cursor_col_resize()
-                            .occlude()
-                            .on_drag(SidebarDrag, |_, _, _, cx| {
-                                cx.stop_propagation();
-                                cx.new(|_| gpui::EmptyView)
-                            })
-                            .on_drag_move(cx.listener(
-                                |this, e: &DragMoveEvent<SidebarDrag>, window, cx| {
-                                    let width = f32::from(window.viewport_size().width);
-                                    let next = clamped_share(f32::from(e.event.position.x) / width);
-                                    if (next - this.share.get()).abs() > f32::EPSILON {
-                                        this.share.set(next);
-                                        cx.notify();
-                                    }
-                                },
-                            ))
-                    }))
-                    .into_any_element(),
-            })
+            // The middle is the workspace — header, grouped sidebar,
+            // file diff, inspector slot — composed once here at the viewport
+            // the window handed over.
+            .child(self.workspace_body(window, cx))
             .children(input)
             // The menu itself is deferred at priority 1. Its transparent
             // priority-0 backdrop blocks the rest of the window without
@@ -7815,28 +6651,12 @@ impl Render for DevShell {
                         })
                     })
                     .or_else(|| running.map(|n| (n, host.theme.dim_on(theme::Surface::Status))));
-                let badge: SharedString = match self.input.is_some() {
-                    true => "PROMPT".into(),
-                    false => which.to_uppercase().into(),
-                };
                 // The bar's fixed left-half segments, spelled from loaded
                 // state and memoized on their inputs: the hints shrink by
                 // exactly what they spend, and the bar reads the same
                 // spelling. Computed for both branches — the memo makes an
                 // unneeded spelling a key comparison and three refcounts.
                 let leading = self.status_leading(cx);
-                let (hints, truncated) = match (&message, self.input.is_some()) {
-                    (Some(_), _) | (None, true) => (Vec::new(), false),
-                    (None, false) => {
-                        let width = f32::from(window.viewport_size().width);
-                        chrome::hints(
-                            &host,
-                            &self.modes,
-                            which,
-                            chrome::hints_budget(&host, width, &badge, &leading),
-                        )
-                    }
-                };
                 // An error says how to leave, where it stands: `esc` dismisses,
                 // the message key opens the full text. Live keys only — a hint
                 // naming a dead key is the one lie a panel of keys must never
@@ -7876,7 +6696,7 @@ impl Render for DevShell {
                                 .child(e)
                         }))
                         .into_any_element(),
-                    None if self.workspace.enabled => div()
+                    None => div()
                         .id("statusbar")
                         .debug_selector(|| "statusbar".to_string())
                         .flex_none()
@@ -7907,15 +6727,6 @@ impl Render for DevShell {
                                 ),
                         )
                         .into_any_element(),
-                    None => chrome::status_bar(
-                        &host,
-                        badge,
-                        &leading,
-                        &hints,
-                        truncated,
-                        chrome::version(),
-                    )
-                    .into_any_element(),
                 }
             })
             .children(overlay.map(|(frames, rows, heap, load)| {
@@ -8680,12 +7491,6 @@ fn open_main_window(launch: Launch, cx: &mut App) {
                 config: shell_config_path,
                 first_render: Cell::new(false),
                 title_memo: RefCell::new(None),
-                header_memo: RefCell::new(None),
-                quant: RefCell::default(),
-                share: Cell::new(clamped_share(host.sidebar_share)),
-                stack_splits: Cell::new([0.0; STACK_DIVIDERS]),
-                stack_resized: Cell::new(false),
-                stack_count: Cell::new(0),
                 workspace: views::workspace::Workspace::default(),
                 drafts: std::collections::HashMap::new(),
                 commit_confirm: false,
@@ -8964,6 +7769,8 @@ fn offer_repo_then_open(view: View, cx: &mut App) {
 impl DevShell {
     /// What the title's dimmest third says: the repository and revision, or the
     /// commit whose diff is on top.
+    /// Spelled for tests only (see [`Screen::label`]).
+    #[cfg(test)]
     fn active_label(&self, cx: &App) -> SharedString {
         SharedString::from(
             self.active()
@@ -9018,8 +7825,8 @@ fn window_options(title: SharedString) -> WindowOptions {
 #[cfg(test)]
 mod tests {
     use super::{
-        bare_launch_view, config, files_header_count, input, open_recent, panes, settings_window,
-        ContextMenu, DevShell, GitError, Notice, Open, Pane, Refresh, Screen, Writes,
+        bare_launch_view, config, input, open_recent, panes, settings_window, ContextMenu,
+        DevShell, GitError, Notice, Open, Pane, Refresh, Screen, Writes,
     };
     use crate::views::commits::Commits;
     use gitten_app::cli::{Source, View};
@@ -9251,7 +8058,6 @@ mod tests {
     }
 
     struct ExtensionPane {
-        view: gpui::Entity<Commits>,
         ran: Rc<Cell<bool>>,
         generation: Rc<Cell<Generation>>,
     }
@@ -9271,10 +8077,6 @@ mod tests {
     }
 
     impl Pane for ExtensionPane {
-        fn any(&self) -> gpui::AnyView {
-            self.view.clone().into()
-        }
-
         fn mode(&self) -> &'static str {
             "extension"
         }
@@ -9433,12 +8235,6 @@ mod tests {
                 config: std::path::PathBuf::new(),
                 first_render: Cell::new(false),
                 title_memo: RefCell::new(None),
-                header_memo: RefCell::new(None),
-                quant: RefCell::default(),
-                share: Cell::new(super::clamped_share(host.sidebar_share)),
-                stack_splits: Cell::new([0.0; super::STACK_DIVIDERS]),
-                stack_resized: Cell::new(false),
-                stack_count: Cell::new(0),
                 workspace: crate::views::workspace::Workspace::default(),
                 drafts: std::collections::HashMap::new(),
                 commit_confirm: false,
@@ -9460,257 +8256,6 @@ mod tests {
                 pending_restore: None,
             }
         })
-    }
-
-    /// A pane tenant that answers the wheel: a fake painted box for the hit
-    /// test — real bounds stay zero until a paint, and these tests do not
-    /// paint the shell — with a real commits view behind it, so a dispatched
-    /// movement verb has somewhere to land and an armed question has a pane
-    /// to belong to. Its mode is its own, so a binding written under it
-    /// resolves only when this pane is the one under the wheel.
-    struct WheelPane {
-        view: gpui::Entity<Commits>,
-        bounds: gpui::Bounds<gpui::Pixels>,
-    }
-
-    impl Pane for WheelPane {
-        fn any(&self) -> gpui::AnyView {
-            self.view.clone().into()
-        }
-
-        fn mode(&self) -> &'static str {
-            "wheeled"
-        }
-
-        fn label(&self, _: &gpui::App) -> String {
-            "wheeled pane".into()
-        }
-
-        fn list_bounds(&self, _: &gpui::App) -> gpui::Bounds<gpui::Pixels> {
-            self.bounds
-        }
-
-        fn run(&self, command: &str, host: &Host, _: Option<&Writes>, cx: &mut gpui::App) -> bool {
-            self.view.update(cx, |v, _| v.run_view(command, host))
-        }
-
-        fn scroll_pixels(&self, dy: f32, host: &Host, cx: &mut gpui::App) -> bool {
-            self.view.update(cx, |v, _| v.scroll_pixels(dy, host))
-        }
-    }
-
-    fn wheel_commits(n: usize) -> Vec<Commit> {
-        (0..n)
-            .map(|i| Commit {
-                sha: format!("c{i}"),
-                short: format!("c{i}"),
-                parents: Box::from(&[][..]),
-                author: "test".into(),
-                timestamp: 0,
-                subject: format!("commit {i}"),
-            })
-            .collect()
-    }
-
-    /// A two-pane shell: the keyboard on `commits`, and a `wheeled` pane
-    /// beside it with its own commits view and its own painted box
-    /// (x 0..200, y 100..300). The host's keymap carries
-    /// `wheeldown = "view.down"` under the `wheeled` mode, so a wheel over
-    /// that pane only resolves if the *hovered* pane's mode was consulted —
-    /// the shipped global `wheeldown` would have resolved either way.
-    fn wheel_shell(cx: &mut TestAppContext) -> (gpui::Entity<DevShell>, gpui::Entity<Commits>) {
-        let mut host = Host::new();
-        host.keys.bind("wheeled", "wheeldown", "view.down").unwrap();
-        let host = Rc::new(host);
-        let commits = cx.new(|_| Commits::new(wheel_commits(4), host.clone()));
-        let wheeled = cx.new(|_| Commits::new(wheel_commits(4), Rc::clone(&host)));
-        let diff = cx.new(|cx| crate::views::diff::Diff::new(Vec::new(), host.clone(), cx));
-        let jobs = Runner::new();
-        let shell = cx.new(|cx| {
-            cx.set_global(config::Active(Rc::clone(&host)));
-            let mut panes = panes::Panes::new(
-                "commits",
-                Screen::commits(commits, Source::Fixtures, Generation::default(), "repo"),
-            );
-            panes.register(
-                "wheeled",
-                Screen::Custom(Rc::new(WheelPane {
-                    view: wheeled.clone(),
-                    bounds: gpui::Bounds::new(
-                        gpui::point(gpui::px(0.), gpui::px(100.)),
-                        gpui::size(gpui::px(200.), gpui::px(200.)),
-                    ),
-                })),
-            );
-            // `register` focuses the new tenant; the keyboard stays put.
-            panes.focus(0);
-            DevShell {
-                which: "commits",
-                panes,
-                main: Screen::diff(diff, None, Generation::default(), ""),
-                has_column: true,
-                spot: super::Spot::List,
-                head: RefCell::new(None),
-                request: Cell::new(0),
-                loading: Cell::new(false),
-                stats: None,
-                rediff: None,
-                repo: None,
-                submitter: jobs.submitter(),
-                jobs,
-                generation: Generation::default(),
-                refresh_id: 0,
-                refresh_pending: 0,
-                refresh_error: None,
-                running: None,
-                show_message: false,
-                input: None,
-                prompt: None,
-                search_live: None,
-                over: Default::default(),
-                open: None,
-                context: None,
-                error: None,
-                error_is_load: false,
-                notice: None,
-                config: std::path::PathBuf::new(),
-                first_render: Cell::new(false),
-                title_memo: RefCell::new(None),
-                header_memo: RefCell::new(None),
-                quant: RefCell::default(),
-                share: Cell::new(super::clamped_share(host.sidebar_share)),
-                stack_splits: Cell::new([0.0; super::STACK_DIVIDERS]),
-                stack_resized: Cell::new(false),
-                stack_count: Cell::new(0),
-                workspace: crate::views::workspace::Workspace::default(),
-                drafts: std::collections::HashMap::new(),
-                commit_confirm: false,
-                last_fetch: None,
-                last_push: None,
-                status_memo: RefCell::new(None),
-                modes: Modes::new(),
-                pending_commit_key: None,
-                pending: Vec::new(),
-                help: false,
-                help_scroll: ScrollHandle::default(),
-                focus: cx.focus_handle(),
-                focused: None,
-                seen_host: None,
-                ongoing: Cell::default(),
-                projects: Vec::new(),
-                session_key: String::new(),
-                session_path: std::path::PathBuf::new(),
-                pending_restore: None,
-            }
-        });
-        (shell, wheeled)
-    }
-
-    /// The commits view that holds the keyboard in the [`DevShell::wheel_shell`]
-    /// fixture — the pane the wheel must not disturb.
-    fn wheel_focused(shell: &gpui::Entity<DevShell>, cx: &TestAppContext) -> gpui::Entity<Commits> {
-        shell.read_with(cx, |shell, _| match shell.panes.get("commits") {
-            Some(Screen::Commits { view, .. }) => view.clone(),
-            _ => panic!("the fixture has a commits pane"),
-        })
-    }
-
-    /// One wheel notch over the fixture's wheeled pane, shaped the way the
-    /// capture handler sees one.
-    fn wheeled_notch() -> gpui::ScrollWheelEvent {
-        wheeled_notch_at(gpui::point(gpui::px(100.), gpui::px(150.)))
-    }
-
-    fn wheeled_notch_at(at: gpui::Point<gpui::Pixels>) -> gpui::ScrollWheelEvent {
-        gpui::ScrollWheelEvent {
-            position: at,
-            delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(-40.))),
-            modifiers: gpui::Modifiers::default(),
-            touch_phase: gpui::TouchPhase::Moved,
-        }
-    }
-
-    #[gpui::test]
-    async fn a_wheel_over_an_unfocused_pane_scrolls_it_and_focus_stays_put(
-        cx: &mut TestAppContext,
-    ) {
-        let (shell, wheeled) = wheel_shell(cx);
-        // This pins the stack hit-testing — the History destination; the
-        // workspace owns the wheel while it is up.
-        shell.update(cx, |shell, cx| shell.leave_workspace(cx));
-        let focused = wheel_focused(&shell, cx);
-
-        // An empty window is only the `&mut Window` the capture handler
-        // needs; nothing paints, which is why the fixture pane carries its
-        // own hit box.
-        let window = cx.add_empty_window();
-        window.update(|window, cx| {
-            shell.update(cx, |shell, cx| shell.on_wheel(&wheeled_notch(), window, cx));
-        });
-        window.update(|_, cx| {
-            // The pane under the wheel scrolled a row; the pane that holds
-            // the keyboard did not move, and the keyboard itself never
-            // moved — no spot change, no focused-tenant change, so the
-            // badge and the accent bar sit still through the gesture.
-            assert_eq!(shell.read(cx).panes.focused_name(), "commits");
-            assert_eq!(
-                wheeled.read(cx).current().map(|c| c.sha.to_string()),
-                Some("c1".into()),
-                "the wheeled pane's list moved"
-            );
-            assert_eq!(
-                focused.read(cx).current().map(|c| c.sha.to_string()),
-                Some("c0".into()),
-                "the keyboard's pane did not"
-            );
-        });
-    }
-
-    #[gpui::test]
-    async fn a_wheel_over_the_hovered_pane_disarms_only_that_panes_question(
-        cx: &mut TestAppContext,
-    ) {
-        let (shell, wheeled) = wheel_shell(cx);
-        // This pins the stack hit-testing — the History destination; the
-        // workspace owns the wheel while it is up.
-        shell.update(cx, |shell, cx| shell.leave_workspace(cx));
-        let focused = wheel_focused(&shell, cx);
-        let window = cx.add_empty_window();
-
-        // Arm in the pane under the wheel, then wheel. The disarm rule is
-        // the pane's own — a view's question dies when that view's cursor
-        // moves (`Commits::run_view`), and the wheel here moves only the
-        // hovered pane's cursor.
-        window.update(|_, cx| {
-            wheeled.update(cx, |v, _| assert!(!v.confirm_or_arm_reset("c0")));
-        });
-        window.update(|window, cx| {
-            shell.update(cx, |shell, cx| shell.on_wheel(&wheeled_notch(), window, cx));
-        });
-        window.update(|_, cx| {
-            assert_eq!(
-                wheeled.read(cx).armed_sha(),
-                None,
-                "the wheel disarmed the pane it scrolled"
-            );
-        });
-
-        // Arm in the pane that *holds* the keyboard, wheel over the other
-        // one again: the hovered pane's state moves, this question is not
-        // the wheel's to spend.
-        window.update(|_, cx| {
-            focused.update(cx, |v, _| assert!(!v.confirm_or_arm_reset("c0")));
-        });
-        window.update(|window, cx| {
-            shell.update(cx, |shell, cx| shell.on_wheel(&wheeled_notch(), window, cx));
-        });
-        window.update(|_, cx| {
-            assert_eq!(
-                focused.read(cx).armed_sha().as_deref(),
-                Some("c0"),
-                "a wheel over another pane does not spend the question"
-            );
-        });
     }
 
     #[gpui::test]
@@ -9838,38 +8383,6 @@ mod tests {
             vec!["stage notes.md"],
             "the press resolved behind the dismissed menu"
         );
-    }
-
-    #[gpui::test]
-    fn a_wheel_over_an_open_context_menu_stands_aside(cx: &mut TestAppContext) {
-        // The menu's occluding surface owns the wheel while it is open,
-        // exactly as a picker's does — and only while it is open: the same
-        // wheel over the same pane, menu closed, scrolls it.
-        let (shell, wheeled) = wheel_shell(cx);
-        // This pins the stack hit-testing — the History destination; the
-        // workspace owns the wheel while it is up.
-        shell.update(cx, |shell, cx| shell.leave_workspace(cx));
-        let current = |v: &Commits| v.current().map(|c| c.sha.to_string());
-        shell.update(cx, |s, _| {
-            s.context = Some(ContextMenu {
-                pane: "wheeled".into(),
-                row: None,
-                at: gpui::point(gpui::px(100.), gpui::px(150.)),
-                rows: Vec::new(),
-            });
-        });
-        let before = wheeled.read_with(cx, |v, _| current(v));
-        let window = cx.add_empty_window();
-        window.update(|window, cx| {
-            shell.update(cx, |s, cx| s.on_wheel(&wheeled_notch(), window, cx));
-            // The wheel stands aside while the menu is open...
-            assert_eq!(current(wheeled.read(cx)), before);
-            // ...and only while it is open: the same wheel, menu closed,
-            // is the keymap's again.
-            shell.update(cx, |s, _| s.context = None);
-            shell.update(cx, |s, cx| s.on_wheel(&wheeled_notch(), window, cx));
-            assert_ne!(current(wheeled.read(cx)), before);
-        });
     }
 
     #[gpui::test]
@@ -10093,7 +8606,6 @@ mod tests {
     #[gpui::test]
     fn a_compiled_in_extension_registers_a_pane_without_a_screen_variant(cx: &mut TestAppContext) {
         let shell = shell(None, cx);
-        let view = cx.new(|_| Commits::new(Vec::new(), Rc::new(Host::new())));
         let ran = Rc::new(Cell::new(false));
         let refreshed = Rc::new(Cell::new(Generation::default()));
         let target = successful_generation();
@@ -10102,7 +8614,6 @@ mod tests {
             shell.register_pane(
                 "extension",
                 ExtensionPane {
-                    view,
                     ran: ran.clone(),
                     generation: refreshed.clone(),
                 },
@@ -10190,114 +8701,6 @@ mod tests {
         assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 
-    #[gpui::test]
-    fn the_stack_and_the_main_view_sit_side_by_side(cx: &mut TestAppContext) {
-        let shell = shell(None, cx);
-        // The stack composition is the History destination now.
-        shell.update(cx, |shell, cx| shell.leave_workspace(cx));
-        let observed = shell.clone();
-        let handle = cx.update(|cx| {
-            gpui_component::init(cx);
-            cx.set_global(config::Active(Rc::new(Host::new())));
-            cx.open_window(
-                gpui::WindowOptions {
-                    window_bounds: Some(gpui::WindowBounds::Windowed(gpui::Bounds {
-                        origin: Default::default(),
-                        size: gpui::size(gpui::px(800.0), gpui::px(600.0)),
-                    })),
-                    ..Default::default()
-                },
-                move |_, _| shell,
-            )
-            .unwrap()
-        });
-        let mut cx = gpui::VisualTestContext::from_window(handle.into(), cx);
-        cx.run_until_parked();
-        // Commands is the toolbar's entry point; settings lives in its palette.
-        let commands = cx
-            .debug_bounds("commands-button")
-            .expect("the commands button was not drawn");
-        assert!(commands.size.width > gpui::px(0.0));
-        assert!(commands.right() <= gpui::px(800.0));
-        let statusbar = cx
-            .debug_bounds("statusbar")
-            .expect("the bottom bar was not drawn");
-        assert_eq!(f32::from(statusbar.size.height), 29.0); // STATUS_H per the workspace spec
-        assert_eq!(statusbar.bottom(), gpui::px(600.0));
-        let stack = cx.debug_bounds("sidebar").expect("the stack was not drawn");
-        let main = cx
-            .debug_bounds("main")
-            .expect("the main view was not drawn");
-
-        // Side by side, both full height, the stack in its slice of the
-        // width — the config's default share against the main view's rest.
-        assert!(stack.size.height > gpui::px(0.0));
-        assert!(main.size.height > gpui::px(0.0));
-        assert_eq!(stack.origin.y, main.origin.y);
-        assert_eq!(f32::from(main.origin.y), super::TITLE_H);
-        let width = f32::from(stack.size.width) + f32::from(main.size.width);
-        let share = f32::from(stack.size.width) / width;
-        // The default, read through the config path — the same door a saved
-        // `gitten.toml` value arrives by.
-        let expected = observed.read_with(&cx, |_, cx| config::host(cx).sidebar_share);
-        assert!(
-            (share - expected).abs() < 0.01,
-            "the stack took {share} of the width, not the config's {expected}"
-        );
-        // And the default is the one `gitten_core` spells: the same number
-        // the parser clamps around.
-        assert_eq!(expected, gitten_core::host::SIDEBAR_SHARE);
-        assert_eq!(stack.right(), main.origin.x);
-        // The divider straddles the border it owns: an invisible 5px strip,
-        // centred where the stack hands the window to the diff.
-        let divider = cx
-            .debug_bounds("divider")
-            .expect("the divider was not drawn");
-        assert!(
-            (f32::from(divider.center().x) - f32::from(main.origin.x)).abs() < 3.0,
-            "the divider did not straddle the border"
-        );
-
-        // A click moves the keyboard between exactly the two regions. The
-        // commit section answers for the whole stack: focusing it puts the
-        // keyboard back in the list region.
-        cx.simulate_click(main.center(), gpui::Modifiers::default());
-        assert_eq!(
-            observed.read_with(&cx, |shell, _| shell.spot),
-            super::Spot::Main
-        );
-        let commits_section = cx
-            .debug_bounds("side-commits")
-            .expect("the commit section was not drawn");
-        cx.simulate_click(commits_section.center(), gpui::Modifiers::default());
-        assert_eq!(
-            observed.read_with(&cx, |shell, _| shell.spot),
-            super::Spot::List
-        );
-
-        // And ctrl-j cycles the stack's lists without leaving the stack.
-        // Registration focuses what it adds, so the keyboard goes back to the
-        // root first — where ctrl-j finds it.
-        observed.update(&mut cx, |shell, cx| {
-            let commits = cx.new(|_| Commits::new(Vec::new(), Rc::new(Host::new())));
-            shell.panes.register(
-                "second",
-                Screen::commits(commits, Source::Fixtures, Generation::default(), "second"),
-            );
-            shell.panes.focus(0);
-            shell.sync_modes(cx);
-        });
-        cx.simulate_keystrokes("ctrl-j");
-        assert_eq!(
-            observed.read_with(&cx, |shell, _| shell.panes.focused_name().to_string()),
-            "second"
-        );
-        assert_eq!(
-            observed.read_with(&cx, |shell, _| shell.spot),
-            super::Spot::List
-        );
-    }
-
     /// The History destination draws the branch timeline and the selected
     /// commit's diff inside the workspace — the reference's layout, not the
     /// numbered stack.
@@ -10348,164 +8751,6 @@ mod tests {
     }
 
     /// The design's whole arrangement: stack, diff — two regions side by
-    /// side, with files, branches, commits and stash stacked inside the first
-    /// in the same order as their focus keys. Drawn from the same geometry the
-    /// click hit-tests read.
-    #[gpui::test]
-    fn the_window_is_two_regions_stack_and_diff(cx: &mut TestAppContext) {
-        let shell = shell(None, cx);
-        // The stack composition is the History destination now.
-        shell.update(cx, |shell, cx| shell.leave_workspace(cx));
-        shell.update(cx, |shell, cx| {
-            let host = config::host(cx);
-            let branches = cx.new(|_| {
-                crate::views::branches::Branches::from_prepared(crate::views::branches::prepare(
-                    Vec::new(),
-                    Vec::new(),
-                    None,
-                    Vec::new(),
-                    &host.theme,
-                    "t",
-                ))
-            });
-            shell.panes.register(
-                "files",
-                Screen::files(
-                    cx.new(|_| {
-                        crate::views::files::Files::from_prepared(crate::views::files::prepare(
-                            Default::default(),
-                            "t",
-                            std::collections::HashMap::new(),
-                        ))
-                    }),
-                    Generation::default(),
-                    "files",
-                ),
-            );
-            shell.panes.register(
-                "branches",
-                Screen::branches(branches, Generation::default(), "branches"),
-            );
-            shell.panes.register(
-                "stashes",
-                Screen::stashes(
-                    cx.new(|_| {
-                        crate::views::stashes::Stashes::from_prepared(
-                            crate::views::stashes::prepare(&[], "t"),
-                        )
-                    }),
-                    Generation::default(),
-                    "stashes",
-                ),
-            );
-            shell.panes.focus(0);
-            shell.sync_modes(cx);
-        });
-        let observed = shell.clone();
-        let handle = cx.update(|cx| {
-            gpui_component::init(cx);
-            cx.set_global(config::Active(Rc::new(Host::new())));
-            cx.open_window(
-                gpui::WindowOptions {
-                    window_bounds: Some(gpui::WindowBounds::Windowed(gpui::Bounds {
-                        origin: Default::default(),
-                        size: gpui::size(gpui::px(1200.0), gpui::px(600.0)),
-                    })),
-                    ..Default::default()
-                },
-                move |_, _| shell,
-            )
-            .unwrap()
-        });
-        let mut cx = gpui::VisualTestContext::from_window(handle.into(), cx);
-        cx.run_until_parked();
-        let sidebar = cx
-            .debug_bounds("sidebar")
-            .expect("the sidebar was not drawn");
-        let main = cx
-            .debug_bounds("main")
-            .expect("the main view was not drawn");
-
-        // Left to right, no gaps, both the same height: one window row, two
-        // regions.
-        assert_eq!(sidebar.right(), main.origin.x, "sidebar then diff");
-        assert_eq!(sidebar.origin.y, main.origin.y);
-        assert_eq!(sidebar.size.height, main.size.height);
-
-        let files = cx.debug_bounds("side-files").expect("no files section");
-        let branches = cx
-            .debug_bounds("side-branches")
-            .expect("no branches section");
-        let stashes = cx.debug_bounds("side-stashes").expect("no stashes section");
-        assert_eq!(files.origin.y, sidebar.origin.y);
-        assert_eq!(files.bottom(), branches.origin.y, "files then branches");
-
-        // The commit list is the stack's flexible middle: under the top
-        // sections, above the stash foot, taking the space between.
-        let commits = cx.debug_bounds("side-commits").expect("no commits section");
-        assert_eq!(branches.bottom(), commits.origin.y, "branches then commits");
-        assert_eq!(commits.bottom(), stashes.origin.y, "commits then stashes");
-        assert_eq!(
-            stashes.bottom(),
-            sidebar.bottom(),
-            "the stash ends the stack"
-        );
-        assert!(commits.size.height > gpui::px(super::section_height(0)));
-
-        // Three horizontal handles sit on the three pane boundaries.
-        for (selector, edge) in [
-            ("stack-divider-0", files.bottom()),
-            ("stack-divider-1", branches.bottom()),
-            ("stack-divider-2", commits.bottom()),
-        ] {
-            let divider = cx.debug_bounds(selector).expect("missing stack divider");
-            assert!(
-                (f32::from(divider.center().y) - f32::from(edge)).abs() < 3.0,
-                "{selector} did not straddle its pane boundary"
-            );
-        }
-
-        // Dragging the first boundary grows files and gives the same pixels
-        // back to branches; the following boundaries stay put.
-        let divider = cx
-            .debug_bounds("stack-divider-0")
-            .expect("missing first stack divider");
-        let start = divider.center();
-        let target = gpui::point(start.x, start.y + gpui::px(40.0));
-        cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
-        cx.simulate_mouse_move(
-            gpui::point(start.x, start.y + gpui::px(10.0)),
-            gpui::MouseButton::Left,
-            gpui::Modifiers::default(),
-        );
-        cx.simulate_mouse_move(target, gpui::MouseButton::Left, gpui::Modifiers::default());
-        cx.simulate_mouse_up(target, gpui::MouseButton::Left, gpui::Modifiers::default());
-        cx.run_until_parked();
-        let grown_files = cx.debug_bounds("side-files").expect("files disappeared");
-        let moved_branches = cx
-            .debug_bounds("side-branches")
-            .expect("branches disappeared");
-        assert!(
-            f32::from(grown_files.size.height) > f32::from(files.size.height) + 30.0,
-            "drag did not grow the pane"
-        );
-        assert_eq!(grown_files.bottom(), moved_branches.origin.y);
-        assert!(observed.read_with(&cx, |shell, _| shell.stack_resized.get()));
-
-        // Clicking a section's rows focuses *that* pane, and the keyboard
-        // moves with it.
-        cx.simulate_click(files.center(), gpui::Modifiers::default());
-        assert_eq!(
-            observed.read_with(&cx, |shell, _| shell.panes.focused_name().to_string()),
-            "files"
-        );
-        cx.simulate_click(moved_branches.center(), gpui::Modifiers::default());
-        assert_eq!(
-            observed.read_with(&cx, |shell, _| shell.panes.focused_name().to_string()),
-            "branches",
-        );
-    }
-
     #[gpui::test]
     fn browsing_from_a_fixture_says_so_and_opens_no_panel(cx: &mut TestAppContext) {
         // No repository behind the view: the file picker is never reached —
@@ -10796,26 +9041,20 @@ mod tests {
         });
     }
 
-    // ------------------------------------------------------- the main view
-
-    /// Installs `raw` as the main view's rows, with no repository behind it —
-    /// the shape a fixture window's main view has.
-    fn install_main(shell: &gpui::Entity<DevShell>, raw: &str, cx: &mut TestAppContext) {
+    /// Install the fixture diff into the workspace center instead of the
+    /// hidden main view: what the keyboard scrolls through the workspace
+    /// door is the center's rows, not the load buffer's.
+    fn install_center(shell: &gpui::Entity<DevShell>, raw: &str, cx: &mut TestAppContext) {
         shell.update(cx, |shell, cx| {
             let host = Rc::new(Host::new());
-            let view = cx.new(|cx| {
+            let center = cx.new(|cx| {
                 crate::views::diff::Diff::new(
                     gitten_core::parse_unified_diff(raw),
                     host.clone(),
                     cx,
                 )
             });
-            shell.main = Screen::diff(
-                view,
-                Some(Source::Fixtures),
-                Generation::default(),
-                "fixture",
-            );
+            shell.workspace.center = Some(center);
         });
     }
 
@@ -10902,27 +9141,21 @@ diff --git a/one.txt b/one.txt
         });
     }
 
-    /// The workspace composition state — enabled by default (the launch
-    /// destination per the interaction contract), one center entity built
-    /// on first entry; `workspace.history` switches to the History
-    /// destination in the same workspace, `workspace.changes` switches
-    /// back. The preview schedule itself runs on the executor, so this
-    /// asserts the composition state — enabled flag, destination, one
-    /// center entity — not the loaded rows.
+    /// The workspace composition state — Changes on launch per the
+    /// interaction contract, one center entity built on first entry;
+    /// `workspace.history` switches to the History destination in the same
+    /// workspace, `workspace.changes` switches back. The preview schedule
+    /// itself runs on the executor, so this asserts the composition
+    /// state — destination, one center entity — not the loaded rows.
     #[gpui::test]
-    fn workspace_toggle_raises_and_lowers_the_workspace(cx: &mut TestAppContext) {
+    fn workspace_destinations_switch_inside_the_workspace(cx: &mut TestAppContext) {
         let (shell, _, _) = files_shell(cx);
         shell.update(cx, |shell, cx| {
-            assert!(
-                shell.workspace.enabled,
-                "the workspace is the launch destination"
-            );
             assert_eq!(
                 shell.workspace.destination,
                 crate::views::workspace::Destination::Changes
             );
             shell.run_command("workspace.changes", cx);
-            assert!(shell.workspace.enabled);
             assert!(
                 shell.workspace.center.is_some(),
                 "entering builds the center"
@@ -10935,13 +9168,10 @@ diff --git a/one.txt b/one.txt
                 "re-entering rebuilds nothing"
             );
             shell.run_command("workspace.history", cx);
-            assert!(
-                shell.workspace.enabled,
-                "History is a destination in the workspace, not a lowering"
-            );
             assert_eq!(
                 shell.workspace.destination,
-                crate::views::workspace::Destination::History
+                crate::views::workspace::Destination::History,
+                "History is a destination in the workspace, not a lowering"
             );
             shell.run_command("workspace.changes", cx);
             assert_eq!(
@@ -10954,16 +9184,24 @@ diff --git a/one.txt b/one.txt
     #[gpui::test]
     fn keys_follow_the_region_the_list_moves_lists_and_j_scrolls_the_diff(cx: &mut TestAppContext) {
         let shell = commits_shell(cx);
-        install_main(&shell, ONE_HUNK, cx);
-        // The old main-view routing lives on the stack — the History
-        // destination; with the workspace up these names go to the center.
-        shell.update(cx, |shell, cx| shell.leave_workspace(cx));
-        // From the column, `j` moves the commit list and touches nothing else.
+        // The workspace owns key routing: entering builds the center, and
+        // History hands the keyboard to the commits timeline. `view.down`
+        // then moves the list through the ordinary pane path, and from the
+        // diff region through the workspace door onto the center — never
+        // the hidden main view, which keeps no keyboard names.
+        shell.update(cx, |shell, cx| shell.run_command("workspace.changes", cx));
+        install_center(&shell, ONE_HUNK, cx);
+        shell.update(cx, |shell, cx| shell.run_command("workspace.history", cx));
+        // From the timeline, `j` moves the commit list and touches nothing else.
         shell.update(cx, |shell, cx| shell.run_command("view.down", cx));
         assert_eq!(column_commits(&shell, cx), search_commit(1).sha);
-        shell.read_with(cx, |shell, cx| match &shell.main {
-            Screen::Diff { view, .. } => assert_eq!(view.read(cx).cursor(), 0),
-            _ => panic!("main view lost"),
+        shell.read_with(cx, |shell, cx| {
+            let center = shell
+                .workspace
+                .center
+                .clone()
+                .expect("center built on entry");
+            assert_eq!(center.read(cx).cursor(), 0);
         });
 
         // Enter hands the keyboard to the diff region...
@@ -10973,11 +9211,15 @@ diff --git a/one.txt b/one.txt
             assert_eq!(shell.modes.top(), "diff");
         });
 
-        // ...and now `j` scrolls the diff, leaving the list where it was.
+        // ...and now `j` scrolls the center, leaving the list where it was.
         shell.update(cx, |shell, cx| shell.run_command("view.down", cx));
-        shell.read_with(cx, |shell, cx| match &shell.main {
-            Screen::Diff { view, .. } => assert_eq!(view.read(cx).cursor(), 1),
-            _ => panic!("main view lost"),
+        shell.read_with(cx, |shell, cx| {
+            let center = shell
+                .workspace
+                .center
+                .clone()
+                .expect("center built on entry");
+            assert_eq!(center.read(cx).cursor(), 1);
         });
         assert_eq!(column_commits(&shell, cx), search_commit(1).sha);
     }
@@ -11918,13 +10160,12 @@ diff --git a/fresh.txt b/fresh.txt
     #[gpui::test]
     fn a_drop_arms_then_confirms_on_the_second_press_of_the_same_row(cx: &mut TestAppContext) {
         let (shell, repo) = stashes_shell(cx);
-        // The command tail schedules a workspace preview while the
-        // workspace is up; this pins the stack behavior — the History
-        // destination — where no preview runs. Lowering focuses the
-        // commits pane, so hand the keyboard back to the stashes pane
-        // this test is about.
+        // History focuses the commits pane, so hand the keyboard back to
+        // the stashes pane this test is about. The workspace stays up:
+        // the preview schedule early-outs outside Changes, and the
+        // arm/confirm behavior under test never depended on the stack.
         shell.update(cx, |shell, cx| {
-            shell.leave_workspace(cx);
+            shell.run_command("workspace.history", cx);
             shell.focus_named("stashes", cx);
         });
 
@@ -12351,11 +10592,9 @@ diff --git a/fresh.txt b/fresh.txt
         let ran = Rc::new(Cell::new(false));
         let refreshed = Rc::new(Cell::new(Generation::default()));
         shell.update(cx, |shell, cx| {
-            let commits = cx.new(|_| Commits::new(Vec::new(), Rc::new(Host::new())));
             shell.register_pane(
                 "extension",
                 ExtensionPane {
-                    view: commits,
                     ran: ran.clone(),
                     generation: refreshed.clone(),
                 },
@@ -12514,41 +10753,6 @@ diff --git a/fresh.txt b/fresh.txt
             vec!["delete loose.txt"],
             "the untracked mechanics ran, not a checkout"
         );
-    }
-
-    #[gpui::test]
-    fn the_files_header_prints_a_count_only_when_there_is_one(cx: &mut TestAppContext) {
-        // A clean tree is already described by its empty rows; a `0` in the
-        // header would be the empty state said twice, and no other pane
-        // prints one.
-        let (shell, _repo, _handle) = tree_shell(cx, Status::default());
-        shell.read_with(cx, |shell, cx| {
-            let Some(Screen::Files { view, .. }) = shell.active() else {
-                panic!("files pane lost");
-            };
-            assert_eq!(view.read(cx).changed(), 0);
-            assert_eq!(files_header_count(view, cx), None);
-        });
-
-        // One changed path, and the count is there for the header to read.
-        let mut tree = Status::default();
-        tree.staged.push(gitten_core::status::StagedEntry {
-            path: "gone.txt".into(),
-            change: gitten_core::status::Change::Deleted,
-            old_path: None,
-            kind: gitten_core::status::Kind::File,
-            submodule: Default::default(),
-        });
-        let (shell, _repo, _handle) = tree_shell(cx, tree);
-        shell.read_with(cx, |shell, cx| {
-            let Some(Screen::Files { view, .. }) = shell.active() else {
-                panic!("files pane lost");
-            };
-            assert_eq!(
-                files_header_count(view, cx).map(|c| c.to_string()),
-                Some("1".to_string())
-            );
-        });
     }
 
     #[gpui::test]
@@ -14183,33 +12387,8 @@ diff --git a/added.txt b/added.txt
 
 #[cfg(test)]
 mod title_tests {
-    use super::{
-        clamped_stack_splits, expand_project_path, fitted_stack_heights, heights_from_splits,
-        hidden_rows, quantized, repo_title, same_project_path, section_basis, section_height,
-        splits_from_heights, with_hidden, SECTION_MAX_ROWS, SECTION_MIN_H,
-    };
+    use super::{expand_project_path, repo_title, same_project_path, SECTION_MIN_H};
     use std::path::{Path, PathBuf};
-
-    #[test]
-    fn a_capped_section_counts_what_it_leaves_off() {
-        // Eight rows' worth of section under a nine-row pane: one hidden.
-        // The two helpers share one row arithmetic — a drawn row is one
-        // [`graph::ROW_H`] and the section's height is whole rows of it —
-        // so the subtraction is the same rows on both sides.
-        assert_eq!(hidden_rows(9, section_height(8)), 1);
-        // A pane that fits says nothing: no suffix on a count that is whole.
-        assert_eq!(
-            &*with_hidden("7".into(), hidden_rows(7, section_height(8))),
-            "7"
-        );
-        // A capped pane says how much its height left off.
-        assert_eq!(
-            &*with_hidden("56".into(), hidden_rows(56, section_height(8))),
-            "56 · +48"
-        );
-        // An empty pane's floor of one row never owes a suffix.
-        assert_eq!(hidden_rows(0, section_height(0)), 0);
-    }
 
     #[test]
     fn a_repository_under_home_is_spelled_from_tilde_and_cut_at_its_name() {
@@ -14298,115 +12477,6 @@ mod title_tests {
             expand_project_path("~/src/beta", Path::new("/repo/alpha")),
             PathBuf::from(home).join("src/beta")
         );
-    }
-
-    #[test]
-    fn a_section_is_its_header_plus_its_rows_and_never_shorter_than_one_row() {
-        assert_eq!(
-            section_height(0),
-            section_height(1),
-            "the empty line is a row"
-        );
-        assert_eq!(
-            section_height(5) - section_height(1),
-            4.0 * crate::graph::ROW_H
-        );
-        assert!(section_height(2) >= SECTION_MIN_H, "the floor is two rows");
-    }
-
-    #[test]
-    fn a_squeezed_section_shows_only_whole_rows() {
-        let row = crate::graph::ROW_H;
-        assert_eq!(
-            quantized(3.5 * row),
-            3.0 * row,
-            "the half row is padded away"
-        );
-        assert_eq!(
-            quantized(2.0 * row),
-            2.0 * row,
-            "a whole multiple is kept exactly"
-        );
-        assert_eq!(quantized(0.5 * row), 0.0, "less than a row shows nothing");
-        assert_eq!(quantized(0.0), 0.0);
-        // Whatever the squeeze, the shown height plus nothing is a whole-row
-        // multiple: the boundary lands between rows, never through a glyph.
-        assert_eq!(quantized(972.4) % row, 0.0);
-    }
-
-    #[test]
-    fn a_share_drag_is_railed_to_the_band() {
-        let lo = gitten_core::host::SIDEBAR_MIN;
-        let hi = gitten_core::host::SIDEBAR_MAX;
-        assert_eq!(super::clamped_share(lo), lo);
-        assert_eq!(super::clamped_share(hi), hi);
-        assert_eq!(
-            super::clamped_share(0.02),
-            lo,
-            "a drag past the edge stops at the rail"
-        );
-        assert_eq!(super::clamped_share(0.9), hi);
-        assert_eq!(
-            super::clamped_share(0.4),
-            0.4,
-            "a drag inside the band lands where the hand put it"
-        );
-    }
-
-    #[test]
-    fn an_unfocused_section_never_exceeds_the_cap() {
-        assert_eq!(
-            section_basis(16, false),
-            section_height(SECTION_MAX_ROWS),
-            "a long list asks for the cap, not its rows"
-        );
-        assert_eq!(
-            section_basis(3, false),
-            section_height(3),
-            "a short list keeps its natural height"
-        );
-        assert_eq!(
-            section_basis(16, true),
-            section_height(16),
-            "the focused section is uncapped"
-        );
-        // And the floor survives the cap: a squeezed section still shows two
-        // whole rows, whatever it asked for.
-        assert!(section_basis(16, false) >= SECTION_MIN_H);
-    }
-
-    #[test]
-    fn stack_splits_tile_the_height_and_keep_each_pane_usable() {
-        let total = 536.0;
-        let heights = fitted_stack_heights(
-            total,
-            [
-                section_height(1),
-                section_height(3),
-                SECTION_MIN_H,
-                section_height(1),
-            ],
-            4,
-            2,
-        );
-        assert!((heights.iter().sum::<f32>() - total).abs() < 0.01);
-        assert!(heights.iter().all(|height| *height >= SECTION_MIN_H));
-        assert!(heights[2] > heights[0], "commits receives the spare height");
-
-        let splits = splits_from_heights(heights, total, 4);
-        let rebuilt = heights_from_splits(splits, total, 4);
-        for (actual, expected) in rebuilt.into_iter().zip(heights) {
-            assert!((actual - expected).abs() < 0.01);
-        }
-    }
-
-    #[test]
-    fn stack_drag_boundaries_stop_before_crushing_a_neighbour() {
-        let total = 400.0;
-        let splits = clamped_stack_splits([-1.0, 0.1, 2.0], total, 4);
-        let heights = heights_from_splits(splits, total, 4);
-        assert!((heights.iter().sum::<f32>() - total).abs() < 0.01);
-        assert!(heights.iter().all(|height| *height + 0.01 >= SECTION_MIN_H));
     }
 
     #[test]

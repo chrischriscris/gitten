@@ -1,22 +1,14 @@
-//! Window chrome: the numbered pane headers and the status bar.
+//! Window chrome: shared furniture, row frames, and the status bar.
 //!
-//! The design being followed draws every region with the same furniture: a
-//! short header strip that names the pane with **the number of the key that
-//! focuses it** — numbered in stack order, so no literal here can go stale —
-//! and one status bar across the bottom that says where the keyboard is and
-//! what the nearest keys do. Both are drawn here, once, so the two regions
-//! cannot drift into two different ideas of a header.
-//!
-//! Nothing here holds state or makes a decision: a header is a number, a
-//! name and a count; the status bar is a badge, a list of `(key, label)`
-//! pairs and a version. The *content* of the hints is a projection of the
-//! same registries the help panel reads — [`Keymap::help`] for what is live,
-//! [`Commands::hint`] for the short label — so a key rebound in `gitten.toml`
-//! rewrites the bar on the next frame, and a command the focused pane cannot
-//! run is never advertised on it. A bar of keys that would not fire is the
-//! one lie a keyboard-first app must not tell.
+//! The workspace draws its regions from one vocabulary: hairline borders,
+//! compact text scales, and the spacing ladder below — one currency (the
+//! live font's advance), so a control cannot drift from its neighbours.
+//! Nothing here holds state or makes a decision: a header is a name and a
+//! count; the status bar's segments are spelled by the shell from loaded
+//! state. The live key-hint projection used to live here; the workspace bar
+//! carries sync state, the staging count, and the Commands door instead,
+//! and the help panel remains the command registry's reader.
 
-use gitten_core::command::{HelpRow, Modes};
 use gitten_core::font::Font;
 use gitten_core::host::Host;
 use gitten_core::theme::Surface;
@@ -44,9 +36,8 @@ pub fn icon(path: &'static str, size: f32, color: u32) -> AnyElement {
 pub const HEADER_H: f32 = 28.0;
 
 /// Height of the bottom bar. Twenty-nine pixels per the workspace spec — a
-/// readout strip, not a second pane: badge, sync state, staging count,
-/// hints, version. The badge math below derives from this, so the badge
-/// stays concentric with the window corner at any height.
+/// readout strip, not a second pane: sync state, the staging count, and the
+/// Commands door.
 pub const STATUS_H: f32 = 29.0;
 
 /// Left padding of every list row and section label. Ten pixels matches the
@@ -59,37 +50,13 @@ pub const ROW_PAD: f32 = 10.0;
 pub const ROW_BAR: f32 = 2.0;
 
 /// Shared corner radius for controls, keycaps and floating panels.
-/// The bottom mode badge is the deliberate exception: it is concentric with
-/// the window corner instead ([`STATUS_BADGE_RADIUS`]).
 pub const RADIUS: f32 = 4.0;
-/// The platform's window corner radius. A macOS fact, not a layout choice:
-/// GPUI hands the rounded frame over and nothing here draws it. It exists so
-/// the one control that sits in a corner can curve with it. Sixteen is
-/// macOS 26's frame — measured off a 2x screenshot by fitting a circle to the
-/// border pixels (16.75), not read from a document; older releases drew 10–12.
-pub const WINDOW_RADIUS: f32 = 16.0;
-/// Compact text in dense pane furniture.
-pub const COMPACT_TEXT_SCALE: f32 = 0.8;
 /// Title-bar controls and branch status: larger, but still below body text.
 pub const TOPBAR_TEXT_SCALE: f32 = 0.93;
 /// Repository path and other primary title-bar text.
 pub const TITLE_TEXT_SCALE: f32 = 1.0;
 /// Bottom-bar hints: full body size, so the shortcuts scan continuously.
 pub const STATUS_TEXT_SCALE: f32 = 1.0;
-/// The bottom bar's mode badge is a compact locator, not body text.
-const STATUS_BADGE_TEXT_SCALE: f32 = 0.73;
-/// The version is the quietest text in the bar.
-const STATUS_VERSION_TEXT_SCALE: f32 = 0.8;
-/// The mode badge's height, and the inset it leaves to the bar's edge on
-/// every side — the same distance left as below, so it sits in the corner
-/// rather than beside it.
-const STATUS_BADGE_H: f32 = 22.0;
-const STATUS_BADGE_INSET: f32 = (STATUS_H - STATUS_BADGE_H) / 2.0;
-/// Concentric with the window corner: an inner curve nested inside an outer
-/// one shares its centre, so its radius is the outer radius minus the inset.
-/// A capsule here (11px) sat 7px inside a 16px corner whose concentric
-/// answer is 9, and the two curves visibly fought.
-const STATUS_BADGE_RADIUS: f32 = WINDOW_RADIUS - STATUS_BADGE_INSET;
 
 // The chrome's spacing ladder — the whole vocabulary of distance the strips
 // spend, in one currency: the live font's advance ([`Font::char_width`]), not
@@ -121,12 +88,6 @@ pub fn gap_xl(font: &Font) -> Pixels {
 /// Two and four fifths — 25px at the shipped font.
 pub fn gap_xxl(font: &Font) -> Pixels {
     px((font.char_width() * 2.8).round())
-}
-
-/// One hint's non-text width: the key-to-label gap and the gap to the next
-/// item. Kept in pixels because those are the gaps the renderer actually uses.
-fn hint_air(font: &Font) -> f32 {
-    f32::from(gap_s(font)) + f32::from(gap_l(font))
 }
 
 /// The frame every list row sits in: a fixed height for `uniform_list`, the
@@ -283,450 +244,12 @@ pub fn empty_line(host: &Host, text: SharedString) -> AnyElement {
         .into_any_element()
 }
 
-/// The keycap a pane header starts with: the number of the key that focuses
-/// it, on a small filled key face. Unfocused caps stay quiet on the dedicated
-/// `keycap` surface. Focus fills the face with the accent and reverses the
-/// numeral into the window background, matching the guide's strongest and
-/// smallest navigation signal without adding another mark to the header.
-fn keycap(host: &Host, number: &str, focused: bool) -> Div {
-    let c = host.theme.chrome;
-    let size = px((host.font.char_width() * 1.8).round());
-    let (face, border, digit) = match focused {
-        true => (c.accent, c.accent, c.bg),
-        false => (c.keycap, c.border, c.fg),
-    };
-    div()
-        .flex_none()
-        .flex()
-        .items_center()
-        .justify_center()
-        .w(size)
-        .h(size)
-        .bg(rgb(face))
-        .border_1()
-        .border_color(rgb(border))
-        .rounded(px(RADIUS - 1.0))
-        .text_color(rgb(digit))
-        .when(focused, |d| d.font_weight(FontWeight::BOLD))
-        .child(SharedString::from(number.to_string()))
-}
-
-/// One pane's header strip: keycap, name, and — pushed to the right edge —
-/// whatever the pane counts, or anything else the caller has to say. Every
-/// header owns the `title_bg` surface; the focused header steps up to `raised`
-/// and reverses its keycap into the accent. This keeps focus visible in
-/// peripheral vision without turning the entire pane into a bordered card.
-///
-/// The strip spans its container's width (`w_full`), because the hairline
-/// under it is the region's edge and must reach it whatever the name's
-/// length. The count is right-edge furniture like anything else the caller
-/// passes in `right` — the design pins a section's number against its own
-/// right edge, where a drifting count next to a drifting name would wobble —
-/// and both are dropped when the pane has nothing worth counting.
-pub fn pane_header(
-    host: &Host,
-    number: &str,
-    name: SharedString,
-    count: Option<SharedString>,
-    focused: bool,
-    right: Option<AnyElement>,
-) -> Div {
-    let c = host.theme.chrome;
-    let name = div()
-        .text_color(rgb(match focused {
-            true => c.fg,
-            // The header strip is where the pane says what it is; dim raw
-            // measures 3.37:1 on `title_bg`, under the text floor, so the
-            // name resolves against the strip it lands on.
-            false => host.theme.dim_on(Surface::Title),
-        }))
-        .child(name)
-        .into_any_element();
-    pane_header_with(host, number, name, count, focused, right)
-}
-
-/// [`pane_header`] with the name already drawn. For the one header whose
-/// name is not a word but a path — the diff pane's `5 internal/host.go`,
-/// directory dim and filename bright through [`path_spans`] — where a single
-/// ink for the whole name would throw away the one cut the eye wants. The
-/// caller owns the name's colours; the header owns everything around it.
-pub fn pane_header_with(
-    host: &Host,
-    number: &str,
-    name: AnyElement,
-    count: Option<SharedString>,
-    focused: bool,
-    right: Option<AnyElement>,
-) -> Div {
-    let c = host.theme.chrome;
-    let ch = host.font.char_width();
-    let surface = match focused {
-        true => c.raised,
-        false => c.title_bg,
-    };
-    div()
-        .flex_none()
-        .w_full()
-        .flex()
-        .items_center()
-        .gap(px((ch * 0.7).round()))
-        .h(px(HEADER_H))
-        // Nothing paints outside the strip, ever. The right-edge furniture is
-        // `flex_none` after a name that can shrink; a deep path must give its
-        // directory up before it can push `hunk 2/7` out of the window.
-        .overflow_hidden()
-        .px(px((ch * 1.2).round()))
-        .text_size(px((host.font.size * COMPACT_TEXT_SCALE).round()))
-        .bg(rgb(surface))
-        .border_b_1()
-        // Focus is an accent-tinted rule, not a second stripe beside the
-        // keycap. One navigation signal per axis: keycap for the header,
-        // left bar for the selected data row.
-        .border_color(match focused {
-            true => rgb(c.accent).alpha(0.35),
-            false => rgb(c.border),
-        })
-        .child(keycap(host, number, focused))
-        // Pane names are navigation, not furniture: keep them at the full
-        // desktop body size while keycaps, counts and right-edge metadata stay
-        // compact. The wrapper also lets a diff path surrender its directory.
-        .child(div().min_w_0().text_size(px(host.font.size)).child(name))
-        // Everything after the name is right-edge furniture.
-        .child(div().min_w_0().flex_grow(1.0))
-        .children(count.map(|count| {
-            div()
-                .flex_none()
-                .text_color(rgb(host.theme.quiet_on(surface)))
-                .child(count)
-        }))
-        .children(right)
-}
-
-/// The bar across the bottom: where the keyboard is, and what the nearest
-/// keys do.
-///
-/// The focused mode is the only filled element. Hints read as compact
-/// `key label` pairs, with the key stronger than its description; the live
-/// registry still decides which pairs exist. `truncated` adds a faint ellipsis
-/// rather than silently claiming the visible hints are exhaustive.
-/// One fixed segment of the status bar's left half: sync state, remote,
-/// staging count. Drawn dim at bar text size, parted by `·` — the same
-/// separator the title strip's drift chip uses, so the two read as one
-/// language for "state beside identity".
-pub fn status_bar(
-    host: &Host,
-    badge: SharedString,
-    leading: &[SharedString],
-    hints: &[(SharedString, SharedString)],
-    truncated: bool,
-    version: &str,
-) -> Div {
-    let c = host.theme.chrome;
-    let chip_ink = c.status_bg;
-    let hint_ink = host.theme.dim_on(Surface::Status);
-    let label_ink = host.theme.quiet_on(c.status_bg);
-    let badge_pad = px((host.font.char_width() * 0.8).round());
-    #[cfg_attr(not(test), allow(unused_mut))]
-    let mut bar = div()
-        .flex_none()
-        .flex()
-        .items_center()
-        .gap(gap_l(&host.font))
-        .h(px(STATUS_H))
-        .pl(px(STATUS_BADGE_INSET))
-        .pr(gap_l(&host.font))
-        .bg(rgb(c.status_bg))
-        .border_t_1()
-        .border_color(rgb(c.border))
-        // The bar is read for where the keyboard is; raw dim is under the
-        // text floor on it (3.40), so the bar's text resolves against it.
-        .text_color(rgb(host.theme.dim_on(Surface::Status)))
-        .text_size(px((host.font.size * STATUS_TEXT_SCALE).round()))
-        .child(
-            div()
-                .flex_none()
-                .flex()
-                .items_center()
-                .justify_center()
-                .px(badge_pad)
-                .h(px(STATUS_BADGE_H))
-                .rounded(px(STATUS_BADGE_RADIUS))
-                .bg(rgb(c.accent))
-                .text_size(px((host.font.size * STATUS_BADGE_TEXT_SCALE).round()))
-                .font_weight(FontWeight::BOLD)
-                .text_color(rgb(chip_ink))
-                .child(badge),
-        )
-        .children(leading.iter().enumerate().map(|(i, segment)| {
-            div()
-                .flex_none()
-                .flex()
-                .items_center()
-                .gap(gap_l(&host.font))
-                .children((i > 0).then(|| {
-                    div()
-                        .flex_none()
-                        .text_color(rgb(host.theme.quiet_on(c.status_bg)))
-                        .child("·")
-                }))
-                .child(segment.clone())
-        }))
-        .children(hints.iter().map(|(key, label)| {
-            div()
-                .flex_none()
-                .flex()
-                .items_center()
-                .gap(gap_s(&host.font))
-                .child(
-                    div()
-                        .flex_none()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(hint_ink))
-                        .child(key.clone()),
-                )
-                .child(
-                    div()
-                        .flex_none()
-                        .text_color(rgb(label_ink))
-                        .child(label.clone()),
-                )
-        }))
-        .children(truncated.then(|| div().flex_none().text_color(rgb(label_ink)).child("…")))
-        .child(div().min_w_0().flex_grow(1.0))
-        .child(
-            div()
-                .flex_none()
-                .text_size(px((host.font.size * STATUS_VERSION_TEXT_SCALE).round()))
-                // Kept at the furniture floor rather than raw ghost: the
-                // version is quiet, but never illegible.
-                .text_color(rgb(host.theme.quiet_on(c.status_bg)))
-                .child(SharedString::from(version.to_string())),
-        );
-    #[cfg(test)]
-    {
-        bar = bar.debug_selector(|| "statusbar".to_string());
-    }
-    bar
-}
-
-/// What the bottom bar advertises for the pane holding the keyboard.
-///
-/// A projection and no decision, like [`Keymap::help`]: walk the same rows
-/// the help panel walks, keep commands carrying a short hint, and prefer the
-/// focused pane's mode before globals. Stops when `max_px` is spent and reports
-/// whether anything was omitted. A prompt holding the keyboard has no hints
-/// here because its field draws its own exits.
-/// One mode's hinted rows: the mode's name, then each command's name — what
-/// picks the pinned pairs out — beside the `(key, label)` pair it draws.
-type ModeHints = Vec<(String, Vec<(String, SharedString, SharedString)>)>;
-
-pub fn hints(
-    host: &Host,
-    modes: &Modes,
-    active: &str,
-    max_px: f32,
-) -> (Vec<(SharedString, SharedString)>, bool) {
-    let rows = host.keys.help(&host.commands, modes);
-    let ch = host.font.char_width() * STATUS_TEXT_SCALE;
-
-    // One pass collects each mode's hinted rows in registry order, so the
-    // bar's left-to-right order is the registry's — the order `[keys]` and
-    // the help panel already agree on. The command's name rides along: two
-    // names are held back to the bar's end, and the name is what picks them
-    // out — a label is display, a name is identity.
-    let mut per_mode: ModeHints = Vec::new();
-    for row in rows {
-        match row {
-            HelpRow::Mode(name) => per_mode.push((name, Vec::new())),
-            HelpRow::Command { name, keys, .. } => {
-                let Some(hint) = host.commands.hint(&name) else {
-                    continue;
-                };
-                let entry = (
-                    name,
-                    SharedString::from(keys),
-                    SharedString::from(hint.to_string()),
-                );
-                if let Some((_, list)) = per_mode.last_mut() {
-                    list.push(entry);
-                }
-            }
-            HelpRow::Blank => {}
-        }
-    }
-    // The focused pane's mode first, then the globals a repository answers
-    // from anywhere — push and pull ride with every pane.
-    let order = [active, "global"];
-    // The two keys that answer from anywhere — `q quit`, `? keys` — draw
-    // last and are never given up: a bar that runs out of room spends the
-    // middle's budget before theirs, so the ways out survive every squeeze.
-    // The first of each name wins, which is the walk's own precedence — a
-    // focused mode's key for a command outranks the global one. Drawn even
-    // into a budget nothing else fit into: two pairs a keyboard-first app
-    // does not trade away.
-    let mut middle: Vec<(SharedString, SharedString)> = Vec::new();
-    let mut pinned: Vec<(SharedString, SharedString)> = Vec::new();
-    let mut pinned_quit = false;
-    let mut pinned_help = false;
-    for mode in order {
-        let Some((_, list)) = per_mode.iter().find(|(m, _)| m == mode) else {
-            continue;
-        };
-        for (name, key, label) in list {
-            match (name.as_str(), pinned_quit, pinned_help) {
-                ("quit", false, _) => {
-                    pinned_quit = true;
-                    pinned.push((key.clone(), label.clone()));
-                }
-                ("help", _, false) => {
-                    pinned_help = true;
-                    pinned.push((key.clone(), label.clone()));
-                }
-                _ => middle.push((key.clone(), label.clone())),
-            }
-        }
-    }
-    // Their width, set aside before the middle spends a pixel: the room the
-    // pinned pairs were reserved, whether or not the middle reaches them.
-    let reserved: f32 = pinned
-        .iter()
-        .map(|(key, label)| {
-            (key.chars().count() + label.chars().count()) as f32 * ch + hint_air(&host.font)
-        })
-        .sum();
-    let mut out = Vec::new();
-    let mut spent = 0.0;
-    for (key, label) in middle {
-        // Compact text plus the same two gaps the bar renders.
-        let w = (key.chars().count() + label.chars().count()) as f32 * ch + hint_air(&host.font);
-        if spent + w > max_px - reserved {
-            out.extend(pinned);
-            return (out, true);
-        }
-        spent += w;
-        out.push((key, label));
-    }
-    out.extend(pinned);
-    (out, false)
-}
-
-/// The version the bar signs itself with. The workspace's own version —
-/// one number, bumped when the app ships, not per crate.
-pub fn version() -> &'static str {
-    concat!("gitten ", env!("CARGO_PKG_VERSION"))
-}
-
-/// How wide the hints may draw. Every fixed piece is costed at the exact scale
-/// and spacing the renderer uses; one ellipsis is reserved so truncation never
-/// pushes the version offscreen. `leading` is the bar's fixed left-half
-/// segments — sync state, remote, staging count — costed at bar text size
-/// with the same gaps the renderer parts them with, so the hints shrink by
-/// exactly what the segments spend.
-pub fn hints_budget(host: &Host, bar_px: f32, badge: &str, leading: &[SharedString]) -> f32 {
-    let body_ch = host.font.char_width();
-    let hint_ch = body_ch * STATUS_TEXT_SCALE;
-    let badge_ch = body_ch * STATUS_BADGE_TEXT_SCALE;
-    let version_ch = body_ch * STATUS_VERSION_TEXT_SCALE;
-    let outer = STATUS_BADGE_INSET + f32::from(gap_l(&host.font));
-    let fixed_gaps = 2.0 * f32::from(gap_l(&host.font));
-    let badge_pad = 2.0 * (body_ch * 0.8).round();
-    let badge = badge.chars().count() as f32 * badge_ch + badge_pad;
-    let version = version().chars().count() as f32 * version_ch;
-    let ellipsis_reserve = hint_ch + f32::from(gap_l(&host.font));
-    let leading_px: f32 = leading
-        .iter()
-        .map(|s| s.chars().count() as f32 * body_ch + f32::from(gap_l(&host.font)))
-        .sum();
-    (bar_px - outer - fixed_gaps - badge - version - ellipsis_reserve - leading_px).max(0.0)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{empty_suffix, gap_l, gap_m, gap_s, gap_xl, gap_xxl, hints};
-    use gitten_core::command::{Commands, Keymap, Modes};
+    use super::{empty_suffix, gap_l, gap_m, gap_s, gap_xl, gap_xxl};
+    use gitten_core::command::{Commands, Keymap};
     use gitten_core::font::Font;
-    use gpui::{px, SharedString};
-
-    #[test]
-    fn hints_come_from_the_registry_and_prefer_the_active_mode() {
-        let host = gitten_core::host::Host::new();
-        let mut modes = Modes::new();
-        modes.push("files");
-        let (out, truncated) = hints(&host, &modes, "files", 4000.0);
-        assert!(
-            out.iter()
-                .any(|(k, l)| l.as_ref() == "stage" && !k.is_empty()),
-            "the files pane's stage hint was not projected: {out:?}"
-        );
-        // Globals ride along after the pane's own.
-        assert!(out.iter().any(|(_, l)| l.as_ref() == "push"));
-        assert!(!truncated, "a bar wide enough for everything claimed a cut");
-    }
-
-    #[test]
-    fn a_one_pixel_bar_still_says_how_to_leave() {
-        let host = gitten_core::host::Host::new();
-        let mut modes = Modes::new();
-        modes.push("files");
-        let (out, truncated) = hints(&host, &modes, "files", 1.0);
-        // The middle gave everything up; the two keys that answer from
-        // anywhere did not. A bar with no room still names `q quit` and
-        // `? keys` — the last two pairs a keyboard-first app gives up.
-        assert_eq!(out.len(), 2, "a one-pixel bar held {out:?}");
-        assert!(out.iter().any(|(_, l)| l.as_ref() == "quit"));
-        assert!(out.iter().any(|(_, l)| l.as_ref() == "keys"));
-        assert!(truncated, "a bar that dropped every middle hint said so");
-    }
-
-    #[test]
-    fn the_ways_out_get_their_room_before_the_middle_does() {
-        // Exactly the room the pinned pairs need plus one middle pair: the
-        // first middle hint fits beside them, the second does not, and the
-        // flag has to say the bar was cut — this is the difference between
-        // "these are your keys" and "these are all your keys", and only one
-        // of them is true.
-        let host = gitten_core::host::Host::new();
-        let mut modes = Modes::new();
-        modes.push("files");
-        let (all, _) = hints(&host, &modes, "files", 4000.0);
-        assert!(
-            all.len() > 3,
-            "the files map had more than a middle pair and the pinned two"
-        );
-        let ch = host.font.char_width() * super::STATUS_TEXT_SCALE;
-        let pair_w = |(k, l): &(SharedString, SharedString)| {
-            (k.chars().count() + l.chars().count()) as f32 * ch + super::hint_air(&host.font)
-        };
-        let pinned: Vec<_> = all
-            .iter()
-            .filter(|(_, l)| l.as_ref() == "quit" || l.as_ref() == "keys")
-            .collect();
-        assert_eq!(pinned.len(), 2, "quit and help were both pinned: {all:?}");
-        let reserved: f32 = pinned.iter().map(|p| pair_w(p)).sum();
-        let middle = all
-            .iter()
-            .find(|(_, l)| l.as_ref() != "quit" && l.as_ref() != "keys")
-            .expect("a middle hint to pin beside");
-        // Half a pixel of slack: the budget is subtracted from the reserve
-        // in f32 inside the walk, and one ulp of rounding must not decide
-        // whether the pair fits.
-        let (out, truncated) = hints(&host, &modes, "files", reserved + pair_w(middle) + 0.5);
-        assert_eq!(out.len(), 3, "one middle pair and the pinned two: {out:?}");
-        assert_eq!(
-            &out[0], middle,
-            "the middle pair the budget fit drew first: {out:?}"
-        );
-        assert_eq!(&out[1], pinned[0], "the pinned pairs drew last: {out:?}");
-        assert_eq!(&out[2], pinned[1], "the pinned pairs drew last: {out:?}");
-        assert!(truncated, "a bar that stopped with hints left said nothing");
-    }
-
-    #[test]
-    fn an_unknown_mode_still_gets_the_globals() {
-        let host = gitten_core::host::Host::new();
-        let (out, _) = hints(&host, &Modes::new(), "nowhere", 4000.0);
-        assert!(out.iter().any(|(_, l)| l.as_ref() == "push"));
-    }
+    use gpui::px;
 
     #[test]
     fn every_hinted_command_is_registered_with_the_keymap_it_rides() {
