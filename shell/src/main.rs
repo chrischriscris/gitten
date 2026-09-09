@@ -1,3 +1,5 @@
+use gpui::prelude::FluentBuilder as _;
+mod assets;
 mod chrome;
 mod config;
 mod dispatch;
@@ -1567,11 +1569,12 @@ struct DevShell {
     /// Number of sidebar sections drawn this frame. Repository diff launches
     /// omit commits, so a drag clamps against the actual stack, not four.
     stack_count: Cell<usize>,
-    /// The guide-v2 workspace shell: toggle, center view and preview guard.
-    /// The sidebar holds no state of its own — it draws the files pane's
-    /// grouped projection under the files pane's cursor. See
-    /// [`views::workspace`]; the toggle's doors are `workspace.changes`
-    /// (enter) and `workspace.history` (back to the full stack).
+    /// The guide-v2 workspace shell: destination, center view and preview
+    /// guard. The sidebar holds no state of its own — it draws the files
+    /// pane's grouped projection under the files pane's cursor, or the
+    /// History destination's CURRENT BRANCH note. See
+    /// [`views::workspace`]; the two destinations are `workspace.changes`
+    /// and `workspace.history`, both inside the workspace.
     workspace: views::workspace::Workspace,
     /// The commit composer's drafts, one per repository path: Summary plus
     /// optional Description, written by the inspector's fields on every
@@ -1858,6 +1861,17 @@ fn push_label(ahead: Option<u32>) -> SharedString {
         None => "Push \u{2014}".into(),
         Some(0) => "Published".into(),
         Some(n) => format!("Push {n}").into(),
+    }
+}
+
+/// A registry name as a control spells it: `unified` -> `Unified`. The
+/// registry's own name is the identity `gitten.toml` and `[keys]` use and is
+/// never rewritten — this is presentation, applied where the name is drawn.
+fn title_case(name: &str) -> SharedString {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) => SharedString::from(format!("{}{}", first.to_uppercase(), chars.as_str())),
+        None => SharedString::from(""),
     }
 }
 
@@ -4608,7 +4622,7 @@ impl DevShell {
             // the write from the job queue — and where either is missing, the
             // same honest sentence an unknown command gets.
             "workspace.changes" => self.enter_workspace(cx),
-            "workspace.history" => self.leave_workspace(cx),
+            "workspace.history" => self.enter_history(cx),
             "workspace.preview" => self.sync_workspace_preview(cx),
             "files.stage" => self.stage_or_unstage(cx),
             "files.commit" => self.begin_commit_message(cx),
@@ -4675,14 +4689,20 @@ impl DevShell {
                 }
             }
             // The workspace center is not a Screen, so its keyboard verbs
-            // need an explicit door: workspace up and keyboard in the diff
-            // region, and the view/diff movement names go to the center
-            // view. The files pane keeps its names through the ordinary
-            // path while spot is List; the hidden main view keeps none.
+            // need an explicit door: workspace up with a built center and
+            // keyboard in the diff region, and the view/diff movement names
+            // go to the center view. The flag alone is not enough — a fresh
+            // shell names the workspace before its first entry builds the
+            // center, and swallowing keys for a view that does not exist
+            // yet is the silent kind of wrong. The files pane keeps its
+            // names through the ordinary path while spot is List; the
+            // hidden main view keeps none.
             "view.down" | "view.up" | "view.page-down" | "view.page-up" | "view.scroll-down"
             | "view.scroll-up" | "view.top" | "view.bottom" | "view.left" | "view.right"
             | "diff.next-file" | "diff.prev-file" | "diff.cycle-layout" | "diff.cycle-wrap"
-                if self.workspace.enabled && self.spot == Spot::Main =>
+                if self.workspace.enabled
+                    && self.workspace.center.is_some()
+                    && self.spot == Spot::Main =>
             {
                 if let Some(center) = self.workspace.center.clone() {
                     let host = config::host(cx);
@@ -5010,10 +5030,15 @@ impl DevShell {
             .cloned()
             .unwrap_or_default();
         if self.workspace.summary.is_none() {
-            let summary = cx.new(|cx| input::Input::new("", "Commit summary", "", cx));
+            let summary = cx.new(|cx| {
+                let mut field = input::Input::new("", "Commit summary", "", cx);
+                field.set_embedded();
+                field
+            });
             let description = cx.new(|cx| {
                 let mut field = input::Input::new("", "Description (optional)", "", cx);
                 field.set_multiline(true);
+                field.set_embedded();
                 field
             });
             let mut subs = Vec::new();
@@ -5162,8 +5187,26 @@ impl DevShell {
         self.sync_workspace_preview(cx);
     }
 
-    /// `workspace.history`: back to the full stack — the History destination
-    /// until the timeline moves into the workspace in a later phase.
+    /// `workspace.history`: the History destination — the branch timeline
+    /// beside the selected commit's diff, inside the same workspace. The
+    /// commits pane takes the keyboard and the one diff view is re-aimed at
+    /// the commit under its cursor, so the timeline and the detail cannot
+    /// disagree about which commit is selected.
+    fn enter_history(&mut self, cx: &mut Context<Self>) {
+        self.workspace.enabled = true;
+        self.workspace.destination = views::workspace::Destination::History;
+        if self.panes.position("commits").is_some() {
+            self.focus_named("commits", cx);
+        }
+        self.sync_main_diff(cx);
+        cx.notify();
+    }
+
+    /// Lowers the workspace onto the numbered stack — the test-only door to
+    /// the composition History used before the timeline moved in. Kept
+    /// because the stack's own behaviour (hit-testing, wheel ownership,
+    /// pane cycling) is still pinned through it.
+    #[cfg(test)]
     fn leave_workspace(&mut self, cx: &mut Context<Self>) {
         // The words on screen belong to this repository: file them before
         // the destination changes, so coming back restores them.
@@ -5185,7 +5228,22 @@ impl DevShell {
         }
         let host = config::host(cx);
         let center = cx.new(|cx| views::diff::Diff::new(Vec::new(), host.clone(), cx));
-        center.update(cx, |v, _| v.set_focused(self.spot == Spot::Main));
+        let weak = cx.entity().downgrade();
+        center.update(cx, |v, _| {
+            v.set_focused(self.spot == Spot::Main);
+            v.hunk_action = Some(Rc::new(move |row, cx| {
+                _ = weak.update(cx, |this, cx| {
+                    let address = this
+                        .workspace
+                        .center
+                        .as_ref()
+                        .and_then(|center| center.read(cx).hunk_for_row(row));
+                    if let Some((path, hunk)) = address {
+                        this.workspace_stage_hunk(path, hunk, cx);
+                    }
+                });
+            }));
+        });
         self.workspace.center = Some(center.clone());
         center
     }
@@ -5202,7 +5260,12 @@ impl DevShell {
     /// a newer generation, which counts as new — the preview follows the
     /// side that just moved without another keystroke.
     fn sync_workspace_preview(&mut self, cx: &mut Context<Self>) {
-        if !self.workspace.enabled {
+        // Only Changes has a preview to aim; History reads the commits pane
+        // and the one diff view instead, and re-aiming the hidden file
+        // center there would be a load nobody sees.
+        if !self.workspace.enabled
+            || self.workspace.destination != views::workspace::Destination::Changes
+        {
             return;
         }
         let Some(Screen::Files {
@@ -5819,7 +5882,7 @@ impl DevShell {
             let rail = views::workspace::sidebar_width(f32::from(vp.width));
             let in_sidebar = f32::from(ev.position.x) >= 0.0
                 && f32::from(ev.position.x) < rail
-                && f32::from(ev.position.y) >= TITLE_H + views::workspace::HEADER_H
+                && f32::from(ev.position.y) >= TITLE_H
                 && f32::from(ev.position.y) < f32::from(vp.height) - chrome::STATUS_H;
             if in_sidebar {
                 let mut moved = false;
@@ -5847,28 +5910,43 @@ impl DevShell {
                         if let Some(px) =
                             Self::smooth_pixels(&name, f32::from(delta.y), host.view.rows)
                         {
-                            let acc = self.workspace.sidebar_px.get() + px;
-                            // Positive pixels scrolled up: towards lower
-                            // indices, the center's own sign convention.
-                            let step = (-acc / crate::graph::ROW_H).trunc() as isize;
-                            if step != 0 {
-                                let top = self.workspace.sidebar_top.get() as isize;
-                                let max = grouped_len.saturating_sub(1) as isize;
-                                let next = (top + step).clamp(0, max);
-                                self.workspace
-                                    .sidebar_scroll
-                                    .scroll_to_item(next as usize, ScrollStrategy::Top);
-                                self.workspace.sidebar_top.set(next as usize);
-                                self.workspace.sidebar_px.set(match next == top {
-                                    // Clamped against a bound: forget the
-                                    // remainder, or the first flick back
-                                    // jumps by the stored distance.
-                                    true => 0.0,
-                                    false => acc + step as f32 * crate::graph::ROW_H,
-                                });
-                                moved |= next != top;
-                            } else {
-                                self.workspace.sidebar_px.set(acc);
+                            // The mirror against the rail's actual position
+                            // first: the keyboard-follow scroll moves the list
+                            // without stepping it, and stepping from a stale
+                            // top jumps.
+                            let max = grouped_len.saturating_sub(1);
+                            let mirror = self.workspace.sidebar_top.get();
+                            let top = views::workspace::reconcile_top(
+                                &self.workspace.sidebar_scroll,
+                                mirror,
+                                crate::graph::ROW_H,
+                                max,
+                            );
+                            let acc = match top == mirror {
+                                // Another path moved the list: the banked
+                                // remainder belongs to the old position, so
+                                // this flick starts fresh.
+                                true => self.workspace.sidebar_px.get() + px,
+                                false => {
+                                    self.workspace.sidebar_top.set(top);
+                                    px
+                                }
+                            };
+                            match views::workspace::wheel_step(top, acc, crate::graph::ROW_H, max) {
+                                Some((next, rest)) => {
+                                    // Strict: the step already spent its
+                                    // pixels, so the row lands on top even
+                                    // when it is already visible. Non-strict
+                                    // would sit still while the mirror walks
+                                    // away from the window it claims to name.
+                                    self.workspace
+                                        .sidebar_scroll
+                                        .scroll_to_item_strict(next, ScrollStrategy::Top);
+                                    self.workspace.sidebar_top.set(next);
+                                    self.workspace.sidebar_px.set(rest);
+                                    moved |= next != top;
+                                }
+                                None => self.workspace.sidebar_px.set(acc),
                             }
                         }
                     }
@@ -6181,6 +6259,188 @@ impl DevShell {
     /// sidebar + center-diff + inspector row. Widths are fixed px per
     /// the spec (255/266, 280/295 past 1550px), read from the viewport once
     /// here at composition time — never from inside a view.
+    /// The 76px destination band: a 19px title over dim counts on the left,
+    /// the working-copy sentence on the right. One function because Changes
+    /// and History differ only in what they name, and two copies would drift.
+    fn destination_header(&self, host: &Host, title: &'static str, sub: SharedString) -> Div {
+        let c = host.theme.chrome;
+        div()
+            .flex_none()
+            .h(px(views::workspace::HEADER_H))
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .px(px(22.0))
+            .border_b_1()
+            .border_color(rgb(c.border))
+            .bg(rgb(c.title_bg))
+            .font_family(host.chrome_family.clone())
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .justify_center()
+                    .gap_y(px(4.0))
+                    .child(
+                        div()
+                            .text_size(px(19.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(c.fg))
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .text_size(px((host.font.size * chrome::TOPBAR_TEXT_SCALE).round()))
+                            .text_color(rgb(host.theme.dim_on(theme::Surface::Title)))
+                            .child(sub),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(chrome::gap_s(&host.font))
+                    .text_size(px((host.font.size * chrome::TOPBAR_TEXT_SCALE).round()))
+                    .text_color(rgb(host.theme.dim_on(theme::Surface::Title)))
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(5.0))
+                            .h(px(5.0))
+                            .rounded_full()
+                            .bg(rgb(c.accent)),
+                    )
+                    .child("Working copy"),
+            )
+    }
+
+    /// The History destination: the branch timeline beside the selected
+    /// commit's diff. The sidebar is already built by the caller with its
+    /// CURRENT BRANCH note; this owns the header and the two-pane centre.
+    fn history_body(
+        &mut self,
+        host: &Host,
+        sidebar: impl IntoElement,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let dim = host.theme.dim_on(theme::Surface::Context);
+        let Some(commits) = self.column_commits() else {
+            return div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(rgb(dim))
+                .child("no commit history in this view")
+                .into_any_element();
+        };
+        let Screen::Diff {
+            view: diff_view, ..
+        } = &self.main
+        else {
+            return div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(rgb(dim))
+                .child("no commit diff in this view")
+                .into_any_element();
+        };
+        let diff_view = diff_view.clone();
+        // The timeline follows the commits cursor: when it moves — a key, a
+        // click, a refresh re-anchor — park one scroll on the timeline's own
+        // handle. `usize::MAX` is "never scrolled", so the first render lands
+        // on the cursor rather than at row zero.
+        let cursor = commits.read(cx).cursor();
+        if self.workspace.history_cursor.get() != cursor {
+            self.workspace.history_cursor.set(cursor);
+            self.workspace
+                .history_scroll
+                .scroll_to_item(cursor, ScrollStrategy::Nearest);
+        }
+        let branch = self
+            .head_label(cx)
+            .unwrap_or_else(|| SharedString::from("detached HEAD"));
+
+        // A timeline click is two named steps, the same pair a keyboard move
+        // leaves through: move the commits cursor, then re-aim the one diff.
+        let me = cx.entity().downgrade();
+        let select: views::history::Select = Rc::new(move |row, cx| {
+            if let Some(shell) = me.upgrade() {
+                shell.update(cx, |this, cx| {
+                    if let Some(commits) = this.column_commits() {
+                        let host = config::host(cx);
+                        commits.update(cx, |v, cx| {
+                            v.select_row(row, &host);
+                            cx.notify();
+                        });
+                    }
+                    this.sync_main_diff(cx);
+                    cx.notify();
+                });
+            }
+        });
+        let me_changes = cx.entity().downgrade();
+        let changes: Rc<dyn Fn(&mut App)> = Rc::new(move |cx| {
+            if let Some(shell) = me_changes.upgrade() {
+                shell.update(cx, |this, cx| this.run_command("workspace.changes", cx));
+            }
+        });
+        let changed = self
+            .panes
+            .get("files")
+            .and_then(|screen| match screen {
+                Screen::Files { view, .. } => Some(view.read(cx).changed()),
+                _ => None,
+            })
+            .unwrap_or(0);
+        let deps = views::history::HistoryDeps {
+            commits: commits.clone(),
+            diff: diff_view,
+            scroll: self.workspace.history_scroll.clone(),
+            select,
+            changes,
+            changed,
+            branch: branch.clone(),
+        };
+        let history = views::history::render_history(&deps, cx);
+        let total = commits.read(cx).total();
+        let header = self.destination_header(
+            host,
+            "History",
+            SharedString::from(format!("{branch} \u{00b7} {total} recent commits")),
+        );
+
+        div()
+            .min_h_0()
+            .flex_grow(1.0)
+            .flex()
+            .flex_row()
+            .overflow_hidden()
+            .child(sidebar)
+            .child(
+                div()
+                    .min_w_0()
+                    .min_h_0()
+                    .flex_grow(1.0)
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden()
+                    .child(header)
+                    .child(
+                        div()
+                            .min_h_0()
+                            .flex_grow(1.0)
+                            .overflow_hidden()
+                            .child(history),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn workspace_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let host = config::host(cx);
         let c = host.theme.chrome;
@@ -6201,9 +6461,7 @@ impl DevShell {
                 .into_any_element();
         };
         let Screen::Files {
-            view: files_view,
-            label: files_label,
-            ..
+            view: files_view, ..
         } = files_screen
         else {
             unreachable!("panes are named")
@@ -6225,7 +6483,7 @@ impl DevShell {
             )
         };
         let mut status_line = format!("{changed} files changed");
-        if let Some(note) = filter_note {
+        if let Some(note) = &filter_note {
             status_line = format!("{status_line} \u{00b7} {note}");
         }
         let title: SharedString = match &self.repo {
@@ -6249,9 +6507,23 @@ impl DevShell {
             files: files_view.clone(),
             dispatch: dispatch.clone(),
             title,
-            subtitle: SharedString::from(files_label.borrow().clone()),
-            status_line: SharedString::from(status_line.clone()),
+            subtitle: SharedString::from(
+                self.repo
+                    .as_ref()
+                    .map(|(path, _)| {
+                        let (dir, name) = repo_title(path, home());
+                        format!("{dir}{name}")
+                    })
+                    .unwrap_or_default(),
+            ),
+            changed,
+            filter_note: filter_note.clone().map(SharedString::from),
             destination: self.workspace.destination,
+            history_note: (self.workspace.destination == views::workspace::Destination::History)
+                .then(|| {
+                    self.head_label(cx)
+                        .unwrap_or_else(|| SharedString::from("detached HEAD"))
+                }),
             scroll: self.workspace.sidebar_scroll.clone(),
         };
         let sidebar = div()
@@ -6266,10 +6538,24 @@ impl DevShell {
             .border_r_1()
             .border_color(rgb(c.border))
             // A click anywhere here is the keyboard coming back to the
-            // files pane — capture phase, so the row's own handler stages
-            // the row the keyboard is already on.
-            .capture_any_mouse_down(cx.listener(|this, _, _, cx| this.focus_named("files", cx)))
+            // pane this destination reads: the files cursor in Changes,
+            // the commits cursor in History. Capture phase, so the row's
+            // own handler still stages the row the keyboard is already on.
+            .capture_any_mouse_down(cx.listener(|this, _, _, cx| {
+                let pane = match this.workspace.destination {
+                    views::workspace::Destination::Changes => "files",
+                    views::workspace::Destination::History => "commits",
+                };
+                this.focus_named(pane, cx);
+            }))
             .child(views::sidebar::render_sidebar(&deps, cx));
+
+        // The History destination is a different centre — a timeline beside
+        // the commit's diff — so it leaves through its own assembly before
+        // any of the working-tree pieces are built.
+        if self.workspace.destination == views::workspace::Destination::History {
+            return self.history_body(&host, sidebar, cx);
+        }
 
         // The center: breadcrumb, Unified/Split toggle, status and totals
         // over the shared diff view, fed one file's rows per selection.
@@ -6286,15 +6572,25 @@ impl DevShell {
             _ => "Modified",
         };
         let breadcrumb: AnyElement = match &cursor_file {
-            Some((_, _, dir, name)) => chrome::path_spans(
-                &host,
-                dir.clone(),
-                name.clone(),
-                c.fg,
-                theme::Surface::Title,
-                false,
-            )
-            .into_any_element(),
+            Some((_, _, dir, name)) => div()
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .min_w_0()
+                .child(chrome::icon(
+                    "gitten/file.svg",
+                    14.0,
+                    host.theme.dim_on(theme::Surface::Title),
+                ))
+                .child(chrome::path_spans(
+                    &host,
+                    dir.clone(),
+                    name.clone(),
+                    c.fg,
+                    theme::Surface::Title,
+                    false,
+                ))
+                .into_any_element(),
             None => div()
                 .text_color(rgb(host.theme.dim_on(theme::Surface::Title)))
                 .child("No file selected")
@@ -6324,132 +6620,101 @@ impl DevShell {
             ),
             _ => None,
         };
-        let toggle = div().flex_none().flex().flex_row().children(
-            layout_names
-                .into_iter()
-                .enumerate()
-                .map(|(i, name)| {
-                    let center = center.clone();
-                    let chosen = i == layout_index;
-                    div()
-                        .id(("ws-layout", i))
-                        .px(chrome::gap_s(&host.font))
-                        .py(px(2.0))
-                        .rounded(px(chrome::RADIUS))
-                        .cursor_pointer()
-                        .bg(rgb(match chosen {
-                            true => c.raised,
-                            false => c.bg,
-                        }))
-                        .text_color(rgb(match chosen {
-                            true => c.fg,
-                            false => host.theme.dim_on(theme::Surface::Title),
-                        }))
-                        .child(name)
-                        // Presentation state, not app dispatch: the toggle
-                        // names one of the registry entries this very view
-                        // published. The rebuild keeps the reading position
-                        // and carries the selection by content (see
-                        // `snapshot_selection`); an unresolvable end drops it.
-                        .on_click(move |_, _, cx| {
-                            let host = config::host(cx);
-                            center.update(cx, |v, cx| v.set_layout(i, &host, cx));
-                        })
-                        .into_any_element()
-                })
-                .collect::<Vec<_>>(),
-        );
+        let toggle = div()
+            .flex_none()
+            .flex()
+            .flex_row()
+            .p(px(2.0))
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(rgb(c.border))
+            .bg(rgb(c.bg))
+            .children(
+                layout_names
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, name)| {
+                        let center = center.clone();
+                        let chosen = i == layout_index;
+                        div()
+                            .id(("ws-layout", i))
+                            .px(px(8.0))
+                            .py(px(4.0))
+                            .rounded(px(4.0))
+                            .cursor_pointer()
+                            .bg(rgb(match chosen {
+                                true => host.theme.chrome.title_bg,
+                                false => c.bg,
+                            }))
+                            .text_color(rgb(match chosen {
+                                true => c.fg,
+                                false => host.theme.dim_on(theme::Surface::Title),
+                            }))
+                            .child(title_case(name))
+                            // Presentation state, not app dispatch: the toggle
+                            // names one of the registry entries this very view
+                            // published. The rebuild keeps the reading position
+                            // and carries the selection by content (see
+                            // `snapshot_selection`); an unresolvable end drops it.
+                            .on_click(move |_, _, cx| {
+                                let host = config::host(cx);
+                                center.update(cx, |v, cx| v.set_layout(i, &host, cx));
+                            })
+                            .into_any_element()
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        // The center header: breadcrumb left, status + totals + the
+        // Unified/Split segmented control right — the reference's 48px
+        // diff-toolbar, chosen segment on the surface over the rail tint.
         let center_header = div()
             .flex_none()
             .flex()
-            .items_center()
-            .justify_between()
-            .gap(chrome::gap_l(&host.font))
-            .px(px(12.0))
-            .h(px(40.0))
-            .border_b_1()
-            .border_color(rgb(c.border))
-            .child(div().min_w_0().flex_shrink(1.0).child(breadcrumb))
+            .flex_col()
+            .bg(rgb(host.theme.chrome.title_bg))
+            .font_family(host.chrome_family.clone())
+            .text_size(px(11.0))
             .child(
                 div()
-                    .flex_none()
                     .flex()
                     .items_center()
-                    .gap(chrome::gap_m(&host.font))
-                    .child(
-                        div()
-                            .text_color(rgb(host.theme.dim_on(theme::Surface::Title)))
-                            .child(status_word),
-                    )
-                    .children(totals)
+                    .justify_between()
+                    .px(px(18.0))
+                    .h(px(48.0))
+                    .border_b_1()
+                    .border_color(rgb(c.border))
+                    .child(div().min_w_0().flex_shrink(1.0).child(breadcrumb))
                     .child(toggle),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px(px(18.0))
+                    .h(px(38.0))
+                    .border_b_1()
+                    .border_color(rgb(c.border))
+                    .child(
+                        div().flex().gap(px(8.0)).child(status_word).child(
+                            div()
+                                .text_color(rgb(host.theme.dim_on(theme::Surface::Title)))
+                                .child("in working tree"),
+                        ),
+                    )
+                    .children(totals),
             );
-        // The hunk strip: one stage/unstage chip per hunk of the shown
-        // file, each bound to its own (path, hunk) through
-        // `hunk_for_row` — the button's row, never the keyboard's. The
-        // verb follows the side on screen (staged twin unstages, every
-        // other side stages); untracked files keep the whole-file refusal
-        // through the shared submit path. Hidden unless the preview key
-        // and the loaded file agree: a strip for a stale file would stage
-        // bytes nobody is looking at.
-        let me_hunk = cx.entity().downgrade();
-        let hunk_strip: Option<AnyElement> = match &self.workspace.last {
-            Some((section, previewed, _)) => {
-                let staged_side = matches!(section, views::files::Section::Staged);
-                let shown: Vec<(String, usize)> = center
-                    .read(cx)
-                    .loaded_hunks()
-                    .into_iter()
-                    .filter(|(path, _)| previewed.as_bytes() == path.as_bytes())
-                    .collect();
-                match shown.as_slice() {
-                    [(path, hunks)] if *hunks > 0 => Some(
-                        div()
-                            .flex_none()
-                            .flex()
-                            .flex_row()
-                            .flex_wrap()
-                            .items_center()
-                            .gap(chrome::gap_s(&host.font))
-                            .px(px(12.0))
-                            .py(px(4.0))
-                            .border_b_1()
-                            .border_color(rgb(c.border))
-                            .children((0..*hunks).map(|n| {
-                                let path = path.clone();
-                                let me_hunk = me_hunk.clone();
-                                div()
-                                    .id(("ws-hunk", n))
-                                    .flex_none()
-                                    .px(chrome::gap_s(&host.font))
-                                    .py(px(2.0))
-                                    .rounded(px(chrome::RADIUS))
-                                    .cursor_pointer()
-                                    .bg(rgb(c.bg))
-                                    .text_color(rgb(host.theme.dim_on(theme::Surface::Title)))
-                                    .hover(|s| s.bg(rgb(c.raised)).text_color(rgb(c.fg)))
-                                    .child(SharedString::from(format!(
-                                        "{} hunk {}",
-                                        match staged_side {
-                                            true => "Unstage",
-                                            false => "Stage",
-                                        },
-                                        n + 1,
-                                    )))
-                                    .on_click(move |_, _, cx| {
-                                        _ = me_hunk.update(cx, |this, cx| {
-                                            this.workspace_stage_hunk(path.clone(), n, cx)
-                                        });
-                                    })
-                                    .into_any_element()
-                            }))
-                            .into_any_element(),
-                    ),
-                    _ => None,
-                }
+        let staged_side = matches!(
+            self.workspace.last,
+            Some((views::files::Section::Staged, _, _))
+        );
+        center.update(cx, |view, _| {
+            view.hunk_action_label = if staged_side {
+                "− Unstage hunk"
+            } else {
+                "+ Stage hunk"
             }
-            None => None,
-        };
+        });
         let center_pane = div()
             .id("workspace-center")
             .debug_selector(|| "workspace-center".to_string())
@@ -6461,7 +6726,6 @@ impl DevShell {
             .overflow_hidden()
             .capture_any_mouse_down(cx.listener(|this, _, _, cx| this.set_spot(Spot::Main, cx)))
             .child(center_header)
-            .children(hunk_strip)
             .child(
                 div()
                     .min_h_0()
@@ -6489,7 +6753,7 @@ impl DevShell {
             .and_then(|key| self.drafts.get(key))
             .is_some_and(CommitDraft::has_message);
         let (can_commit, commit_note) = match (staged_total > 0, draft_has_message) {
-            (false, _) => (false, SharedString::from("Stage a hunk to enable commit")),
+            (false, _) => (false, SharedString::from("No staged changes")),
             (true, false) => (
                 false,
                 SharedString::from("Write a summary to enable commit"),
@@ -6518,29 +6782,16 @@ impl DevShell {
             .border_color(rgb(c.border))
             .child(views::inspector::render_inspector(&inspector_deps, cx));
 
-        let (destination_title, header_sub) = match self.workspace.destination {
-            views::workspace::Destination::Changes => {
-                ("Changes", format!("{status_line} \u{00b7} working copy"))
-            }
-            views::workspace::Destination::History => ("History", status_line.clone()),
-        };
-        let header = div()
-            .flex_none()
-            .h(px(views::workspace::HEADER_H))
-            .flex()
-            .flex_col()
-            .justify_center()
-            .gap_y(px(4.0))
-            .px(px(16.0))
-            .border_b_1()
-            .border_color(rgb(c.border))
-            .bg(rgb(c.title_bg))
-            .child(div().text_color(rgb(c.fg)).child(destination_title))
-            .child(
-                div()
-                    .text_color(rgb(host.theme.dim_on(theme::Surface::Title)))
-                    .child(SharedString::from(header_sub)),
-            );
+        // The destination header: the reference's 76px band, shared with the
+        // History destination so the two cannot drift.
+        let header = self.destination_header(
+            &host,
+            match self.workspace.destination {
+                views::workspace::Destination::Changes => "Changes",
+                views::workspace::Destination::History => "History",
+            },
+            SharedString::from(status_line.clone()),
+        );
 
         // The confirmation standing over the workspace: branch, message and
         // staged counts as they stand now — the submit re-gates, so a dialog
@@ -6651,19 +6902,27 @@ impl DevShell {
             .min_h_0()
             .flex_grow(1.0)
             .flex()
-            .flex_col()
+            .flex_row()
             .overflow_hidden()
-            .child(header)
+            .child(sidebar)
             .child(
                 div()
+                    .min_w_0()
                     .min_h_0()
                     .flex_grow(1.0)
                     .flex()
-                    .flex_row()
+                    .flex_col()
                     .overflow_hidden()
-                    .child(sidebar)
-                    .child(center_pane)
-                    .child(inspector),
+                    .child(header)
+                    .child(
+                        div()
+                            .min_h_0()
+                            .flex_grow(1.0)
+                            .flex()
+                            .overflow_hidden()
+                            .child(center_pane)
+                            .child(inspector),
+                    ),
             );
         match dialog {
             Some(dialog) => div()
@@ -6701,6 +6960,11 @@ impl Render for DevShell {
         let host = config::host(cx);
         let c = host.theme.chrome;
         let f = &host.font;
+        // The reference's narrow tier: under 1150px the branch chip drops
+        // its `from <base>` suffix (the 850px composer move stays a browser
+        // reference — the desktop keeps its inspector and scrolls instead
+        // of shearing the grid). Read here at composition, never in a view.
+        let narrow = f32::from(window.viewport_size().width) < 1150.0;
 
         // **The two regions**: a vertically resizable stack on the left and
         // the diff filling the rest. Until a divider moves, files, branches
@@ -7141,45 +7405,14 @@ impl Render for DevShell {
             view.read(cx).head_info()
         });
 
-        // The settings button, right-aligned: one gear where five pickers
-        // stood. `,` and the menu open the same window; this is the
-        // discoverable third door, wearing the same chrome the branch chip
-        // does so the strip stays one surface. Unhighlighted by design: the
-        // window is its own surface with its own keyboard, not a mode of
-        // this one, so this strip says nothing about whether it stands.
-        let settings_button = {
-            let me = me.clone();
-            div()
-                .id("settings-button")
-                .debug_selector(|| "settings-button".to_string())
-                .flex_none()
-                .flex()
-                .items_center()
-                .justify_center()
-                .h(px(CHIP_H))
-                .w(px(CHIP_H))
-                .rounded(px(chrome::RADIUS))
-                .border_1()
-                .border_color(rgb(c.border))
-                .bg(rgb(c.raised))
-                .cursor_pointer()
-                .hover(|s| s.bg(rgb(c.keycap)).border_color(rgb(c.faint)))
-                .child(
-                    Icon::new(IconName::Settings)
-                        .size(px(14.0))
-                        .text_color(rgb(host.theme.dim_on(theme::Surface::Title))),
-                )
-                .on_click(move |_, _, cx| {
-                    _ = me.update(cx, |this, cx| this.run_command("settings", cx));
-                })
-                .into_any_element()
-        };
-
         // Commands: the palette's mouse door. One name —
         // `commands.palette` — for this button, the menu adapter and
-        // `cmd-k`, so the three cannot drift into three behaviors.
+        // `cmd-k`, so the three cannot drift into three behaviors. The
+        // reference draws it as plain muted text with a magnifier, not a
+        // bordered control: the only button in the strip is Push.
         let commands_button = {
             let me = me.clone();
+            let ink = host.theme.dim_on(theme::Surface::Title);
             div()
                 .id("commands-button")
                 .debug_selector(|| "commands-button".to_string())
@@ -7187,26 +7420,17 @@ impl Render for DevShell {
                 .flex()
                 .items_center()
                 .gap(px((ch * 0.7).round()))
-                .h(px(CHIP_H))
-                .px(chrome::gap_l(&host.font))
-                .bg(rgb(c.raised))
-                .border_1()
-                .border_color(rgb(c.border))
-                .rounded(px(chrome::RADIUS))
                 .text_size(px((f.size * chrome::TOPBAR_TEXT_SCALE).round()))
-                .text_color(rgb(c.fg))
+                .font_family(host.chrome_family.clone())
+                .text_color(rgb(ink))
                 .cursor_pointer()
-                .hover(|s| s.bg(rgb(c.keycap)).border_color(rgb(c.faint)))
+                .hover(|s| s.text_color(rgb(c.fg)))
                 .on_click(move |_, _, cx| {
                     _ = me.update(cx, |this, cx| this.run_command("commands.palette", cx));
                 })
+                .child(chrome::icon("gitten/search.svg", 15.0, ink))
                 .child("Commands")
-                .child(
-                    div()
-                        .flex_none()
-                        .text_color(rgb(host.theme.dim_on(theme::Surface::Title)))
-                        .child("\u{2318}K"),
-                )
+                .child(div().flex_none().child("\u{2318}K"))
                 .into_any_element()
         };
 
@@ -7239,7 +7463,8 @@ impl Render for DevShell {
                     .border_1()
                     .border_color(rgb(c.border))
                     .rounded(px(chrome::RADIUS))
-                    .text_size(px((f.size * chrome::TOPBAR_TEXT_SCALE).round()));
+                    .text_size(px((f.size * chrome::TOPBAR_TEXT_SCALE).round()))
+                    .font_family(host.chrome_family.clone());
                 button = match live {
                     true => {
                         let me = me.clone();
@@ -7350,7 +7575,11 @@ impl Render for DevShell {
                     // The window has no titlebar of its own any more, so the
                     // traffic lights are drawn *into* this strip and the title
                     // has to start after them.
-                    .pl(px(LIGHTS_W))
+                    .pl(px(if self.workspace.enabled {
+                        views::workspace::sidebar_width(f32::from(window.viewport_size().width))
+                    } else {
+                        LIGHTS_W
+                    }))
                     .pr(px((ch * 1.7).round()))
                     .bg(rgb(c.title_bg))
                     .border_b_1()
@@ -7379,21 +7608,17 @@ impl Render for DevShell {
                             // parent is the part to sacrifice.
                             .whitespace_nowrap()
                             .text_ellipsis_start()
-                            .child(title),
+                            .when(!self.workspace.enabled, |d| d.child(title)),
                     )
-                    // The branch chip: HEAD's mark, then the name the head
-                    // read above the strip spelled. The mark is geometry and
-                    // not a glyph — the design's branch icon was a Nerd Font
-                    // codepoint, and a codepoint the *configured* face does
-                    // not carry draws as the platform's missing-glyph box,
-                    // which Menlo rendered as `[?] ux-polish`. The list's
-                    // own markers went through geometry for the same
-                    // reason; this one is HEAD's dot, in the same accent
-                    // the list gives HEAD's row.
+                    // The branch control: HEAD's branch glyph, then the name
+                    // the head read above the strip spelled. The reference
+                    // draws this as plain text in the strip — no chip, no
+                    // border — so the name is the only thing with weight and
+                    // the `from <base>` beside it is the strip's dim.
                     .children(head_chip.map(|info| {
                         let me = me.clone();
                         // The base half's ink, spelled once here for the
-                        // chip and the `from` below it.
+                        // control and the `from` below it.
                         let dim = rgb(host.theme.dim_on(theme::Surface::Title));
                         div()
                             .id("branch-control")
@@ -7402,39 +7627,33 @@ impl Render for DevShell {
                             .flex()
                             .items_center()
                             .gap(px((ch * 0.7).round()))
-                            .h(px(CHIP_H))
-                            .px(chrome::gap_l(&host.font))
-                            .bg(rgb(c.raised))
-                            .border_1()
-                            .border_color(rgb(c.border))
-                            .rounded(px(chrome::RADIUS))
                             .text_size(px((f.size * chrome::TOPBAR_TEXT_SCALE).round()))
+                            .font_family(host.chrome_family.clone())
                             .whitespace_nowrap()
-                            // The chip is a control, not a label: a click
-                            // focuses the branches pane through the same
-                            // name the `3` key resolves to.
+                            // The control focuses the branches pane through
+                            // the same name the `3` key resolves to.
                             .cursor_pointer()
-                            .hover(|s| s.bg(rgb(c.keycap)).border_color(rgb(c.faint)))
+                            .hover(|s| s.text_color(rgb(c.fg)))
                             .on_click(move |_, _, cx| {
                                 _ = me
                                     .update(cx, |this, cx| this.run_command("branches.focus", cx));
                             })
-                            // Both halves were spelled at prepare; a
-                            // frame clones two refcounts.
-                            .children(info.branch.then(|| {
-                                div()
-                                    .flex_none()
-                                    .w(px(6.0))
-                                    .h(px(6.0))
-                                    .rounded(px(3.0))
-                                    .bg(rgb(c.accent))
-                            }))
+                            // The branch glyph, tinted like the strip's
+                            // secondary text. A real SVG in the asset source,
+                            // never a codepoint the configured face may not
+                            // carry.
+                            .child(chrome::icon(
+                                "gitten/branch.svg",
+                                15.0,
+                                host.theme.dim_on(theme::Surface::Title),
+                            ))
                             .child(div().flex_none().text_color(rgb(c.fg)).child(info.chip))
                             // The base the branch reads as `from`: spelled
                             // halves, no per-frame format — the name above
                             // and these two ride the same dim the strip
-                            // resolves its secondary text in.
-                            .children(info.base.map(|base| {
+                            // resolves its secondary text in. Hidden on
+                            // narrow windows per the reference's 1150px tier.
+                            .children(info.base.filter(|_| !narrow).map(|base| {
                                 div()
                                     .flex_none()
                                     .text_color(dim)
@@ -7471,23 +7690,12 @@ impl Render for DevShell {
                                     )
                             }))
                     }))
-                    .children(cfg!(debug_assertions).then(|| {
-                        // One word and not the sentence this used to be — "DEBUG
-                        // BUILD — timings meaningless, use --release" was fifty
-                        // characters of a strip that has four controls in it, and
-                        // the sentence belongs beside the numbers it is about,
-                        // which is the stats overlay. No chip behind it either:
-                        // chips are for controls and states, this is a caveat,
-                        // and the accent alone is unmistakable.
-                        div().flex_none().text_color(rgb(c.accent)).child("debug")
-                    }))
                     // Pushes the right-edge controls off the title and takes the
                     // clicks that land between them, so a stray click on the
                     // title bar does not fall through to whatever is under it.
                     .child(div().flex_grow(1.0))
                     .child(commands_button)
-                    .children(push_button)
-                    .child(settings_button),
+                    .children(push_button),
             )
             // The two regions in one row: the left stack, the diff. A fixture
             // has no stack — no repository to list — and the diff fills the
@@ -7668,6 +7876,37 @@ impl Render for DevShell {
                                 .child(e)
                         }))
                         .into_any_element(),
+                    None if self.workspace.enabled => div()
+                        .id("statusbar")
+                        .debug_selector(|| "statusbar".to_string())
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .h(px(chrome::STATUS_H))
+                        .px(px(14.0))
+                        .border_t_1()
+                        .border_color(rgb(c.border))
+                        .bg(rgb(c.title_bg))
+                        .font_family(host.chrome_family.clone())
+                        .text_size(px(10.0))
+                        .text_color(rgb(host.theme.dim_on(theme::Surface::Title)))
+                        .child(
+                            div()
+                                .flex()
+                                .gap(px(10.0))
+                                .children(leading.iter().cloned().map(|text| div().child(text))),
+                        )
+                        .child(
+                            div()
+                                .id("workspace-shortcuts")
+                                .cursor_pointer()
+                                .child("Keyboard shortcuts  ?")
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.run_command("help", cx)),
+                                ),
+                        )
+                        .into_any_element(),
                     None => chrome::status_bar(
                         &host,
                         badge,
@@ -7792,13 +8031,13 @@ fn main() {
         {
             let recents = gitten_app::projects::load();
             if let Some(started) = open_recent(view, &recents) {
-                let app = gpui_platform::application().with_assets(gpui_component_assets::Assets);
+                let app = gpui_platform::application().with_assets(assets::Assets);
                 start::mark("gpui application up; entering run");
                 app.run(move |cx| open_main_window(Launch::Ready(started), cx));
                 return;
             }
             eprintln!("gitten: no repository here; choose one to open");
-            let app = gpui_platform::application().with_assets(gpui_component_assets::Assets);
+            let app = gpui_platform::application().with_assets(assets::Assets);
             app.run(move |cx| offer_repo_then_open(view, cx));
             return;
         }
@@ -7810,7 +8049,7 @@ fn main() {
     };
     match launch {
         Ok(launch) => {
-            let app = gpui_platform::application().with_assets(gpui_component_assets::Assets);
+            let app = gpui_platform::application().with_assets(assets::Assets);
             start::mark("gpui application up; entering run");
             app.run(move |cx| open_main_window(launch, cx));
         }
@@ -8479,6 +8718,14 @@ fn open_main_window(launch: Launch, cx: &mut App) {
                 shell.update(cx, |shell, cx| {
                     shell.sync_modes(cx);
                     shell.sync_focus(cx);
+                    // The workspace is the launch destination per the
+                    // interaction contract: build the center, focus the
+                    // files pane and schedule the preview on frame one.
+                    // A fixture has no files pane — `enter_workspace`
+                    // focuses nothing and the preview early-outs — and a
+                    // skeleton's rows arrive with its wave, which re-aims
+                    // the preview on landing.
+                    shell.enter_workspace(cx);
                     // Frame one already names its commit: schedule the
                     // newest one's diff through the same guarded rails
                     // every later selection rides. The header and the
@@ -9388,6 +9635,9 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         let (shell, wheeled) = wheel_shell(cx);
+        // This pins the stack hit-testing — the History destination; the
+        // workspace owns the wheel while it is up.
+        shell.update(cx, |shell, cx| shell.leave_workspace(cx));
         let focused = wheel_focused(&shell, cx);
 
         // An empty window is only the `&mut Window` the capture handler
@@ -9421,6 +9671,9 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         let (shell, wheeled) = wheel_shell(cx);
+        // This pins the stack hit-testing — the History destination; the
+        // workspace owns the wheel while it is up.
+        shell.update(cx, |shell, cx| shell.leave_workspace(cx));
         let focused = wheel_focused(&shell, cx);
         let window = cx.add_empty_window();
 
@@ -9593,6 +9846,9 @@ mod tests {
         // exactly as a picker's does — and only while it is open: the same
         // wheel over the same pane, menu closed, scrolls it.
         let (shell, wheeled) = wheel_shell(cx);
+        // This pins the stack hit-testing — the History destination; the
+        // workspace owns the wheel while it is up.
+        shell.update(cx, |shell, cx| shell.leave_workspace(cx));
         let current = |v: &Commits| v.current().map(|c| c.sha.to_string());
         shell.update(cx, |s, _| {
             s.context = Some(ContextMenu {
@@ -9937,6 +10193,8 @@ mod tests {
     #[gpui::test]
     fn the_stack_and_the_main_view_sit_side_by_side(cx: &mut TestAppContext) {
         let shell = shell(None, cx);
+        // The stack composition is the History destination now.
+        shell.update(cx, |shell, cx| shell.leave_workspace(cx));
         let observed = shell.clone();
         let handle = cx.update(|cx| {
             gpui_component::init(cx);
@@ -9955,13 +10213,12 @@ mod tests {
         });
         let mut cx = gpui::VisualTestContext::from_window(handle.into(), cx);
         cx.run_until_parked();
-        // One control in the top bar, right-aligned: the settings button that
-        // replaced the five pickers.
-        let settings = cx
-            .debug_bounds("settings-button")
-            .expect("the settings button was not drawn");
-        assert!(settings.size.width > gpui::px(0.0));
-        assert!(settings.right() <= gpui::px(800.0));
+        // Commands is the toolbar's entry point; settings lives in its palette.
+        let commands = cx
+            .debug_bounds("commands-button")
+            .expect("the commands button was not drawn");
+        assert!(commands.size.width > gpui::px(0.0));
+        assert!(commands.right() <= gpui::px(800.0));
         let statusbar = cx
             .debug_bounds("statusbar")
             .expect("the bottom bar was not drawn");
@@ -10041,6 +10298,55 @@ mod tests {
         );
     }
 
+    /// The History destination draws the branch timeline and the selected
+    /// commit's diff inside the workspace — the reference's layout, not the
+    /// numbered stack.
+    #[gpui::test]
+    fn the_history_destination_draws_a_timeline_beside_the_commit_diff(cx: &mut TestAppContext) {
+        let shell = commits_shell(cx);
+        shell.update(cx, |shell, cx| {
+            let files = cx.new(|_| {
+                crate::views::files::Files::from_prepared(crate::views::files::prepare(
+                    gitten_core::status::Status::default(),
+                    "gitten",
+                    Default::default(),
+                ))
+            });
+            shell.panes.register(
+                "files",
+                Screen::files(files, gitten_app::jobs::Generation::default(), "files"),
+            );
+            shell.run_command("workspace.history", cx);
+        });
+        let observed = shell.clone();
+        let handle = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.set_global(config::Active(Rc::new(Host::new())));
+            cx.open_window(
+                gpui::WindowOptions {
+                    window_bounds: Some(gpui::WindowBounds::Windowed(gpui::Bounds {
+                        origin: Default::default(),
+                        size: gpui::size(gpui::px(1200.0), gpui::px(800.0)),
+                    })),
+                    ..Default::default()
+                },
+                move |_, _| observed,
+            )
+            .unwrap()
+        });
+        let mut cx = gpui::VisualTestContext::from_window(handle.into(), cx);
+        cx.run_until_parked();
+        let history = cx
+            .debug_bounds("workspace-history")
+            .expect("the history destination was not drawn");
+        assert!(history.size.width > gpui::px(0.0));
+        assert!(history.size.height > gpui::px(0.0));
+        assert_eq!(
+            shell.read_with(&cx, |shell, _| shell.workspace.destination),
+            crate::views::workspace::Destination::History
+        );
+    }
+
     /// The design's whole arrangement: stack, diff — two regions side by
     /// side, with files, branches, commits and stash stacked inside the first
     /// in the same order as their focus keys. Drawn from the same geometry the
@@ -10048,6 +10354,8 @@ mod tests {
     #[gpui::test]
     fn the_window_is_two_regions_stack_and_diff(cx: &mut TestAppContext) {
         let shell = shell(None, cx);
+        // The stack composition is the History destination now.
+        shell.update(cx, |shell, cx| shell.leave_workspace(cx));
         shell.update(cx, |shell, cx| {
             let host = config::host(cx);
             let branches = cx.new(|_| {
@@ -10594,22 +10902,27 @@ diff --git a/one.txt b/one.txt
         });
     }
 
-    /// The workspace toggle: `workspace.changes` raises the workspace and
-    /// builds the center once; `workspace.history` lowers it again. The
-    /// preview schedule itself runs on the executor, so this asserts the
-    /// composition state — enabled flag, destination, one center entity —
-    /// not the loaded rows.
+    /// The workspace composition state — enabled by default (the launch
+    /// destination per the interaction contract), one center entity built
+    /// on first entry; `workspace.history` switches to the History
+    /// destination in the same workspace, `workspace.changes` switches
+    /// back. The preview schedule itself runs on the executor, so this
+    /// asserts the composition state — enabled flag, destination, one
+    /// center entity — not the loaded rows.
     #[gpui::test]
     fn workspace_toggle_raises_and_lowers_the_workspace(cx: &mut TestAppContext) {
         let (shell, _, _) = files_shell(cx);
         shell.update(cx, |shell, cx| {
-            assert!(!shell.workspace.enabled);
-            shell.run_command("workspace.changes", cx);
-            assert!(shell.workspace.enabled);
+            assert!(
+                shell.workspace.enabled,
+                "the workspace is the launch destination"
+            );
             assert_eq!(
                 shell.workspace.destination,
                 crate::views::workspace::Destination::Changes
             );
+            shell.run_command("workspace.changes", cx);
+            assert!(shell.workspace.enabled);
             assert!(
                 shell.workspace.center.is_some(),
                 "entering builds the center"
@@ -10622,10 +10935,18 @@ diff --git a/one.txt b/one.txt
                 "re-entering rebuilds nothing"
             );
             shell.run_command("workspace.history", cx);
-            assert!(!shell.workspace.enabled);
+            assert!(
+                shell.workspace.enabled,
+                "History is a destination in the workspace, not a lowering"
+            );
             assert_eq!(
                 shell.workspace.destination,
                 crate::views::workspace::Destination::History
+            );
+            shell.run_command("workspace.changes", cx);
+            assert_eq!(
+                shell.workspace.destination,
+                crate::views::workspace::Destination::Changes
             );
         });
     }
@@ -10634,6 +10955,9 @@ diff --git a/one.txt b/one.txt
     fn keys_follow_the_region_the_list_moves_lists_and_j_scrolls_the_diff(cx: &mut TestAppContext) {
         let shell = commits_shell(cx);
         install_main(&shell, ONE_HUNK, cx);
+        // The old main-view routing lives on the stack — the History
+        // destination; with the workspace up these names go to the center.
+        shell.update(cx, |shell, cx| shell.leave_workspace(cx));
         // From the column, `j` moves the commit list and touches nothing else.
         shell.update(cx, |shell, cx| shell.run_command("view.down", cx));
         assert_eq!(column_commits(&shell, cx), search_commit(1).sha);
@@ -11594,6 +11918,15 @@ diff --git a/fresh.txt b/fresh.txt
     #[gpui::test]
     fn a_drop_arms_then_confirms_on_the_second_press_of_the_same_row(cx: &mut TestAppContext) {
         let (shell, repo) = stashes_shell(cx);
+        // The command tail schedules a workspace preview while the
+        // workspace is up; this pins the stack behavior — the History
+        // destination — where no preview runs. Lowering focuses the
+        // commits pane, so hand the keyboard back to the stashes pane
+        // this test is about.
+        shell.update(cx, |shell, cx| {
+            shell.leave_workspace(cx);
+            shell.focus_named("stashes", cx);
+        });
 
         // First press: asked, in the band; nothing written.
         shell.update(cx, |shell, cx| shell.run_command("stashes.drop", cx));
@@ -11832,6 +12165,83 @@ diff --git a/fresh.txt b/fresh.txt
                 "a refusal left the panes believing they are current"
             );
             assert_eq!(shell.refresh_pending, 0, "the wave never came home");
+        });
+    }
+
+    struct CommitJob {
+        fail: bool,
+    }
+
+    impl Job for CommitJob {
+        fn name(&self) -> &str {
+            "commit"
+        }
+
+        fn run(self: Box<Self>) -> Result<(), String> {
+            match self.fail {
+                true => Err("git commit: hook declined".into()),
+                false => Ok(()),
+            }
+        }
+    }
+
+    /// The inspector's draft against the commit finish line: a refused
+    /// commit keeps its words standing beside git's verbatim error (and
+    /// drops the dialog); a clean finish spends exactly that
+    /// repository's draft. The production pump both times — submit,
+    /// drain, and the re-acquire wave — never a test-local event read.
+    #[gpui::test]
+    fn a_refused_commit_keeps_its_draft_and_a_clean_one_spends_it(cx: &mut TestAppContext) {
+        let (shell, _repo, _handle) = files_shell(cx);
+        let submit = wire_runner(&shell, cx);
+        let key = shell.read_with(cx, |shell, _| shell.draft_key().expect("a recorded repo"));
+        let draft = || super::CommitDraft {
+            summary: "keep the gutter still".into(),
+            description: String::new(),
+        };
+
+        // Refused: the words survive, the dialog does not, the error is
+        // git's own.
+        shell.update(cx, |shell, _| {
+            shell.drafts.insert(key.clone(), draft());
+            shell.pending_commit_key = Some(key.clone());
+            shell.commit_confirm = true;
+        });
+        assert!(submit.submit(Box::new(CommitJob { fail: true })).is_ok());
+        pump_until(&shell, cx, |shell| shell.error.is_some());
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, _| {
+            assert!(
+                shell
+                    .drafts
+                    .get(&key)
+                    .is_some_and(super::CommitDraft::has_message),
+                "the refused commit spent its draft"
+            );
+            assert!(
+                !shell.commit_confirm,
+                "the dialog stood over a finished job"
+            );
+            assert_eq!(
+                shell.error.as_deref(),
+                Some("hook declined"),
+                "the band paraphrased the hook"
+            );
+        });
+
+        // Clean: exactly this repository's draft is spent.
+        shell.update(cx, |shell, _| {
+            shell.error = None;
+            shell.pending_commit_key = Some(key.clone());
+        });
+        assert!(submit.submit(Box::new(CommitJob { fail: false })).is_ok());
+        pump_until(&shell, cx, |shell| shell.pending_commit_key.is_none());
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, _| {
+            assert!(
+                !shell.drafts.contains_key(&key),
+                "the clean commit kept its draft"
+            );
         });
     }
 

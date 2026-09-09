@@ -2229,7 +2229,7 @@ impl Commands {
             ),
             (
                 "workspace.history",
-                "leave the workspace for the History destination",
+                "enter the workspace's History destination",
                 Some("history"),
             ),
             (

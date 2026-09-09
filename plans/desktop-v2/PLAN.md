@@ -84,6 +84,73 @@ later is free because a key is data and a command is a name.
 - Never `window.viewport_size()` from a view; probe/measure pane bounds.
 - Do not launch a client unasked; verify with `./dev check` + `./dev dump`.
 
+## Phase 5 status (landed): workspace default + acceptance
+
+Commit `desktop-v2 phase5: workspace default + old-stack removal`:
+shell 410 (incl. 2 new), core 498, app 155; `cargo fmt --check` +
+`cargo clippy --workspace --all-targets -- -D warnings` clean.
+
+DONE:
+
+- Workspace is the launch destination: `Workspace::default()` is
+  `enabled` on Changes; the startup path runs `enter_workspace` on
+  frame one (center built, files focused, preview scheduled; fixture
+  launches early-out cleanly, skeleton waves re-aim on landing).
+- Real robustness fix found by the flip: the `view.*`/`diff.*`
+  keyboard door routed on the `enabled` flag alone, swallowing keys
+  for a center that did not exist yet. It now requires
+  `center.is_some()` too.
+- 7 stack-pinning tests now lower the workspace first
+  (`workspace.history`), documenting that the old composition is the
+  History destination; one also re-focuses stashes after lowering
+  moved focus to commits.
+- New coverage: `a_refused_commit_keeps_its_draft_and_a_clean_one_spends_it`
+  (production pump both ways: refusal keeps words + closes dialog +
+  verbatim hook error; clean finish spends exactly that repo's draft)
+  and `the_workspace_is_the_launch_destination` (default pin).
+
+REMOVED vs KEPT (deliberate, each with its reason):
+
+- Removed: nothing structural. The stacked-panes assembly
+  (STACK_TOP/STACK_FOOT, `sidebar` + `main_region` construction,
+  `pane_header`, divider drag) still renders the History destination
+  (`workspace.history` lowers onto it), so it is live code, not dead
+  code — deleting it deletes History, which the interaction contract
+  requires as a separate destination. Full deletion awaits the
+  History timeline moving into the workspace (defined follow-up).
+- Kept: `files.commit` prompt path (still the bound `c` key + help +
+  tests; removing it removes keyboard commit), `panes.rs` registry
+  (untouched), all destructive safeguards (untouched, spot-checked by
+  existing tests: discard two-press, reset guards, amend/refusal
+  paths).
+- Known waste, not fixed: `sidebar` + `main_region` subtrees are built
+  every frame even while the workspace is up (used only by the History
+  branch). Same order of cost as normal render construction and
+  dwarfed by virtualized-row work; lazily branching them is a
+  follow-up, not a blocker.
+
+ACCEPTANCE (headless-verifiable subset; window-only items need eyes):
+
+- Startup default / selection→diff-only / partial+full staging +
+  mixed checkbox / unstage / staged-only commit w/ unstaged retained /
+  Changes↔History nav + draft survival / push counts + `—` for
+  unknowable `ahead` / hook-failure + refusal verbatim at the
+  operation site / empty status (`0 changed` + grouped empty tree) /
+  detached-HEAD + gone-upstream refusal paths: covered by existing +
+  new tests, all green.
+- Long paths / large diffs / resize breakpoints / light+dark visual
+  contrast / GPUI rendering: NOT verifiable headless (`./dev dump`
+  is TUI-only). The 1550px + 1150px rules are pure functions with
+  tests; what they look like needs the window.
+- `./check.sh`: everything green EXCEPT `diffcheck(., HEAD~4..HEAD)`
+  — our patience vs `git --patience` diverges +22/1767 changed lines
+  on `shell/src/views/sidebar.rs` (a new file of near-identical
+  `div()` builder chains, the adversarial shape for anchor choice).
+  Reproduces on clean 1759521 (stashed), and `core/src/differ.rs` is
+  untouched across the whole branch: pre-existing algorithm behavior,
+  not a v2 regression. Left for a dedicated differ pass — touching
+  the differ at this hour, for all clients, is the wrong call.
+
 ## Recon outputs (this plan's evidence)
 
 Scout maps from the parallel recon wave are summarized here; per-lane details
@@ -261,9 +328,75 @@ DONE:
   passes its row, the strip passes `None` — it never discards), restoring
   the original refuse-before-arm order.
 
-STILL OWING (resume pass): the `sidebar_top` mirror desyncs on
-scrollbar-thumb drags (native scrolls bypass it) and `ScrollStrategy::Top`
-is non-strict, so a step whose target is already visible spends the
-remainder without moving; both need the resume's reconcile-or-strict
-decision. No `STUB(phase4-resume)` markers were needed — everything
-committed compiles and is tested.
+DONE (resume `desktop-v2 phase4A-resume`):
+
+- `sidebar_top` reconcile: `reconcile_top` (`views/workspace.rs`) adopts
+  the handle's settled pixel offset at each wheel decision — except while a
+  programmatic request is still parked, when the mirror names the intent and
+  stays authoritative. The wheel path also drops the banked remainder when
+  another path moved the list, so the next flick starts fresh instead of
+  jumping. (There is no sidebar scrollbar element to drag; the bypass path
+  that actually exists is the keyboard-follow `Nearest` scroll.)
+- Strict Top: the wheel path parks `scroll_to_item_strict`, and the settle
+  arithmetic lives in pure `wheel_step` — `None` banks sub-row pixels,
+  clamping forgets the remainder. Tests:
+  `a_step_onto_an_already_visible_row_still_moves_the_top`,
+  `the_mirror_follows_a_scroll_it_did_not_issue`,
+  `sidebar_steps_park_strict_requests` (contract pin on GPUI's strict).
+
+## Phase 4B status (landed): visual fidelity
+
+Commit `desktop-v2 phase4B: visual fidelity`: shell 408 (incl. new
+`workspace_rows_are_two_lines_plus_air`), app 155, core 498;
+`cargo check` zero warnings; `cargo fmt --check` + `cargo clippy
+--workspace --all-targets -- -D warnings` clean; `./check.sh` all green
+(incl. the real-fixture diff pipeline).
+
+DONE:
+
+- Contrast audit: `Theme::guide()` passes every floor with headroom —
+  only two `*` marks, both the mechanism working as designed (gutter
+  lifted per-surface to >=3.01 everywhere; Comment lifted to >=3.5).
+  Strictly cleaner than `dark` (which lifts five syntax classes on
+  MovedRemoved). No theme value changed. Subdued surfaces hold:
+  title_bg 1.05, status_bg 1.01 vs bg; edges are `border` hairlines.
+- Font decision (the open question since Phase 1): dual-face via
+  `Host.chrome_family` (default `"SF Pro Text"`, `[font] chrome_family`
+  knob, dump/apply round-trip tested). The spacing ladder, gutters and
+  truncation stay on the mono advance — the chrome face is a name only,
+  never measured. Workspace chrome (sidebar, inspector, toolbar chips,
+  headers, center header) draws in it; diff rows keep `font.family`, so
+  space-aligned columns cannot shear. Face resolution itself needs one
+  look at a running window (headless builds cannot prove a family name).
+- Sidebar rows rebuilt in the reference's shape: 48px two-line rows
+  (filename over dim directory) from `ws_row_h` (scales with settings),
+  14px boxes with 4px radius, partial boxes in accent on accent borders,
+  accent `n/m` fractions, small ink status letters, green-tint selection
+  with rounded ends and no keyboard bar, sentence-case muted group
+  headings with counts, 35px nav with tinted actives, repo mark + name +
+  path identity, bordered filter box, utilities hairline, 18px rails,
+  staged/total hunk footer from the refresh's own counts map.
+- Inspector: staged-count pill (accent on green tint), slimmer STAGED
+  FILES caption, composer hairline above the fields.
+- Center header 40->48px with the segmented Unified/Split control
+  (tinted pill, surface chosen); workspace header with 19px semibold
+  title, 22px insets, working-copy dot sentence on the right.
+- Responsive: `narrow` under 1150px hides the branch chip's `from <base>`
+  at composition time (never in a view); 1550px 280/295px rails already
+  held. The 850px composer move stays a browser reference — the desktop
+  keeps its inspector and scrolls.
+
+DEVIATIONS FROM THE MOCK (deliberate, each with its reason):
+
+- Checked boxes read from the accent fill alone — no check glyph, because
+  no icon-font codepoint is safe in an arbitrary configured face.
+- Headings share the 48px file-row slot (centered): `uniform_list`
+  virtualizes one height, and the mock's group gaps absorb the air.
+- No diff-summary strip: status word + totals live in the 48px center
+  header rather than a second band — one band names the file.
+- 18px sidebar rails vs the old stack's 10px ROW_PAD axis (workspace-only;
+  the numbered stack keeps its axis until Phase 5).
+- Sidebar rows are 48px at 15px against ~50px at 13px in CSS: same
+  proportions, GPUI-measured. No CSS pixel was copied anywhere.
+- The exact chrome-face rendering ("SF Pro Text" resolution) is
+  unverified headless — first window look confirms or corrects it.

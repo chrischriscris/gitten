@@ -675,7 +675,15 @@ pub struct FileSummary {
     pub hunks: usize,
 }
 
+/// A hunk-header control: the hunk's 1-based number and the app to act on.
+/// Named so the field's type reads as a contract rather than a nested
+/// generic, and so the workspace and the view share one spelling.
+pub(crate) type HunkAction = Rc<dyn Fn(usize, &mut App)>;
+
 pub struct Diff {
+    /// Optional hunk-header control, supplied by the containing workspace.
+    pub(crate) hunk_action: Option<HunkAction>,
+    pub(crate) hunk_action_label: &'static str,
     /// The parsed diff, kept so a layout change can rebuild the rows.
     ///
     /// This is the memory cost of a live toggle, and it is a real one: on the
@@ -1252,7 +1260,6 @@ impl Diff {
     /// must never pay); this is the address space those buttons live in,
     /// pinned by test, and live in the tests, which is what it is here
     /// for. A binary crate does not count a test as a use.
-    #[allow(dead_code)]
     pub fn hunk_for_row(&self, visual: usize) -> Option<(String, usize)> {
         let r = *self.order.get(visual)?;
         let renderers = self.renderers.borrow();
@@ -1273,17 +1280,6 @@ impl Diff {
             .hunks
             .get(hunk_no)
             .cloned()
-    }
-
-    /// The files on screen with their hunk counts, in load order: what the
-    /// workspace's hunk strip lists without re-reading the repository. A
-    /// neighbour of [`Diff::file_summary`], which names the one file under
-    /// the keyboard — this names every file the strip can offer a button for.
-    pub fn loaded_hunks(&self) -> Vec<(String, usize)> {
-        self.files
-            .iter()
-            .map(|f| (f.path.clone(), f.hunks.len()))
-            .collect()
     }
 
     /// Where the keyboard is, as the pane header names it. `None` when nothing
@@ -1610,6 +1606,8 @@ impl Diff {
             dragging: false,
             widest: built.widest,
             armed_hunk: None,
+            hunk_action: None,
+            hunk_action_label: "+ Stage hunk",
             focused: false,
             headers: Rc::new(built.headers),
             scroll: UniformListScrollHandle::new(),
@@ -2336,6 +2334,8 @@ impl Render for Diff {
         // The host is read here, per batch, rather than cloned in once when the
         // view was built. That is the whole of what makes a saved config file
         // appear on the next frame instead of the next launch.
+        let hunk_action = self.hunk_action.clone();
+        let hunk_action_label = self.hunk_action_label;
         let list = uniform_list("diff", order.len(), move |range, _, cx| {
             rendered.set(range.len());
             top.set(range.start);
@@ -2372,7 +2372,7 @@ impl Render for Diff {
                     // Two integer comparisons on a row with no selection, which
                     // is every row of every frame until somebody drags.
                     let at = sel.as_ref().and_then(|s| s.at(i, r.logical()));
-                    renderers[r.owner as usize].render(
+                    let row = renderers[r.owner as usize].render(
                         r.index as usize,
                         r.seg as usize,
                         &host,
@@ -2384,7 +2384,44 @@ impl Render for Diff {
                             in_hunk: extent.is_some_and(|e| e.contains(r.owner, r.index)),
                         },
                         shift,
-                    )
+                    );
+                    if r.seg == 0
+                        && hunk_action.is_some()
+                        && renderers[r.owner as usize]
+                            .hunk_span(r.index as usize)
+                            .is_some_and(|(start, _)| start == r.index)
+                    {
+                        let action = hunk_action.clone().unwrap();
+                        div()
+                            .relative()
+                            .w_full()
+                            .h(px(ROW_H))
+                            .child(row)
+                            .child(
+                                div()
+                                    .id(("hunk-action", i))
+                                    .absolute()
+                                    .right(px(16.0))
+                                    .top_0()
+                                    .h(px(ROW_H))
+                                    .flex()
+                                    .items_center()
+                                    .px(px(8.0))
+                                    .bg(rgb(host.theme.diff.hunk_bg))
+                                    .font_family(host.chrome_family.clone())
+                                    .text_size(px(10.0))
+                                    .text_color(rgb(host.theme.chrome.accent))
+                                    .cursor_pointer()
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation()
+                                    })
+                                    .on_click(move |_, _, cx| action(i, cx))
+                                    .child(hunk_action_label),
+                            )
+                            .into_any_element()
+                    } else {
+                        row
+                    }
                 })
                 .collect()
         })

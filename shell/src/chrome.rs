@@ -22,6 +22,21 @@ use gitten_core::host::Host;
 use gitten_core::theme::Surface;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
+use gpui_component::Icon;
+
+/// One of gitten's own stroke glyphs, tinted and sized. The path names an
+/// asset the shell's own [`crate::assets::Assets`] embeds under `gitten/`;
+/// `currentColor` in the SVG resolves through `text_color`, so a caller
+/// picks the ink the same way it picks it for text. A helper and not a
+/// literal at each call site: the size/colour pair is the whole contract and
+/// a drifted copy is a glyph that does not match its neighbours.
+pub fn icon(path: &'static str, size: f32, color: u32) -> AnyElement {
+    Icon::empty()
+        .path(path)
+        .size(px(size))
+        .text_color(rgb(color))
+        .into_any_element()
+}
 
 /// Height of a pane's header strip. The guide's 28px band is deliberately
 /// taller than a 22px data row: enough separation to read as chrome without

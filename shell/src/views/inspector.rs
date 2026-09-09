@@ -10,8 +10,7 @@
 //! path calls — one commit implementation, two doors.
 
 use super::files::StagedFile;
-use crate::chrome::{self, section_label};
-use crate::graph::ROW_H;
+use crate::chrome;
 use crate::input::Input;
 use gitten_core::theme::Surface;
 #[allow(unused_imports)]
@@ -100,79 +99,70 @@ pub(crate) fn render_inspector(deps: &InspectorDeps, cx: &mut App) -> AnyElement
     };
 
     let commit = deps.dispatch.clone();
-    let commit_row = div()
+    let commit_button = div()
+        .id("ws-commit")
         .flex_none()
         .flex()
         .items_center()
-        .justify_between()
-        .gap(chrome::gap_m(&host.font))
-        .child(div().text_color(dim).child(SharedString::from(format!(
-            "{} hunks staged",
-            deps.staged_hunks
-        ))))
-        .child(
-            div()
-                .id("ws-commit")
-                .flex_none()
-                .flex()
-                .items_center()
-                .justify_center()
-                .h(px(28.0))
-                .px(chrome::gap_l(&host.font))
-                .rounded(px(chrome::RADIUS))
-                .cursor_pointer()
-                // Lit when it may fire, furniture when it may not — and
-                // still clickable then, because the press says *why* not
-                // rather than swallowing the click.
-                .bg(rgb(match deps.can_commit {
-                    true => host.theme.chrome.accent,
-                    false => host.theme.chrome.raised,
-                }))
-                .text_color(rgb(match deps.can_commit {
-                    true => host.theme.chrome.status_bg,
-                    false => host.theme.dim_on(Surface::Context),
-                }))
-                .child("Commit")
-                .on_click(move |_, _, cx| commit("workspace.commit", cx)),
-        );
+        .justify_center()
+        .w_full()
+        .h(px(34.0))
+        .rounded(px(5.0))
+        .cursor_pointer()
+        .bg(rgb(host.theme.chrome.accent).alpha(if deps.can_commit { 1.0 } else { 0.45 }))
+        .text_color(rgb(host.theme.chrome.title_bg))
+        .font_weight(FontWeight::SEMIBOLD)
+        .child("Commit  ›")
+        .on_click(move |_, _, cx| commit("workspace.commit", cx));
 
     div()
         .flex()
         .flex_col()
         .size_full()
         .overflow_hidden()
-        .bg(rgb(host.theme.chrome.bg))
+        .bg(rgb(host.theme.chrome.title_bg))
+        .font_family(host.chrome_family.clone())
+        .text_size(px(11.0))
         .child(
             div()
                 .flex_none()
-                .flex()
-                .items_center()
-                .justify_between()
-                .px(px(chrome::ROW_PAD))
-                .h(px(ROW_H + 8.0))
-                .child(div().text_color(rgb(host.theme.chrome.fg)).child("Commit"))
-                .child(div().text_color(dim).child(SharedString::from(format!(
-                    "{} files staged",
-                    deps.staged.len()
-                )))),
+                .px(px(18.0))
+                .pt(px(30.0))
+                .pb(px(26.0))
+                .text_size(px(17.0))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(host.theme.chrome.fg))
+                .child("Commit"),
         )
         .child(
             div()
                 .flex_none()
-                .px(px(chrome::ROW_PAD))
-                .pb(px(4.0))
-                .child(section_label(
-                    &host,
-                    SharedString::from("STAGED FILES"),
-                    Some(SharedString::from(deps.staged.len().to_string())),
-                    ROW_H,
-                )),
+                .mx(px(18.0))
+                .pt(px(14.0))
+                .border_t_1()
+                .border_color(rgb(host.theme.chrome.border))
+                .child(
+                    div()
+                        .flex()
+                        .justify_between()
+                        .text_size(px(9.0))
+                        .text_color(dim)
+                        .child("STAGED FILES")
+                        .child(
+                            div()
+                                .text_color(rgb(host.theme.chrome.accent))
+                                .child(SharedString::from(deps.staged.len().to_string())),
+                        ),
+                ),
         )
         .child(
             div()
-                .flex_none()
-                .px(px(chrome::ROW_PAD))
-                .pb(px(8.0))
+                .id("workspace-staged-files")
+                .min_h_0()
+                .flex_grow(1.0)
+                .overflow_y_scroll()
+                .px(px(18.0))
+                .py(px(26.0))
                 .child(staged_rows),
         )
         .child(
@@ -180,60 +170,33 @@ pub(crate) fn render_inspector(deps: &InspectorDeps, cx: &mut App) -> AnyElement
                 .flex_none()
                 .flex()
                 .flex_col()
-                .gap_y(px(2.0))
-                .px(px(chrome::ROW_PAD))
-                .pb(px(6.0))
-                .child(div().text_color(rgb(host.theme.chrome.fg)).child("Summary"))
-                .child(field(&deps.summary, "Summary arrives with the workspace.")),
-        )
-        .child(
-            div()
-                .min_h_0()
-                .flex_shrink(1.0)
-                .flex()
-                .flex_col()
-                .gap_y(px(2.0))
-                .px(px(chrome::ROW_PAD))
-                .pb(px(6.0))
-                .overflow_hidden()
-                .child(
-                    div()
-                        .flex_none()
-                        .flex()
-                        .gap(chrome::gap_s(&host.font))
-                        .text_color(rgb(host.theme.chrome.fg))
-                        .child("Description")
-                        .child(div().text_color(dim).child("Optional")),
-                )
-                .child(
-                    div()
-                        .min_h_0()
-                        .flex_shrink(1.0)
-                        .overflow_hidden()
-                        .child(field(
-                            &deps.description,
-                            "Description arrives with the workspace.",
-                        )),
-                ),
-        )
-        .child(
-            div()
-                .flex_none()
-                .flex()
-                .flex_col()
-                .gap_y(px(4.0))
-                .px(px(chrome::ROW_PAD))
-                .py(px(8.0))
+                .gap_y(px(7.0))
+                .p(px(18.0))
                 .border_t_1()
                 .border_color(rgb(host.theme.chrome.border))
-                .child(commit_row)
-                // The gate's reason, said aloud under the button when it
-                // may not fire — a disabled control that names its missing
-                // half instead of swallowing the click.
-                .children(
-                    (!deps.can_commit && !deps.commit_note.is_empty())
-                        .then(|| div().text_color(dim).child(deps.commit_note.clone())),
-                ),
+                .child(div().text_color(rgb(host.theme.chrome.fg)).child("Summary"))
+                .child(field(&deps.summary, "Summary arrives with the workspace."))
+                .child(
+                    div()
+                        .flex()
+                        .justify_between()
+                        .mt(px(8.0))
+                        .text_color(rgb(host.theme.chrome.fg))
+                        .child("Description")
+                        .child(div().text_size(px(10.0)).text_color(dim).child("Optional")),
+                )
+                .child(field(
+                    &deps.description,
+                    "Description arrives with the workspace.",
+                ))
+                .child(div().my(px(5.0)).text_size(px(10.0)).text_color(dim).child(
+                    if deps.can_commit {
+                        SharedString::from(format!("{} hunks staged", deps.staged_hunks))
+                    } else {
+                        deps.commit_note.clone()
+                    },
+                ))
+                .child(commit_button),
         )
         .into_any_element()
 }

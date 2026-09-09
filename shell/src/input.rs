@@ -126,6 +126,7 @@ pub struct Input {
     /// naming a key that would not fire is the one lie a prompt of keys must
     /// not tell, and this is the highest-stakes text entry in the app.
     exits: Option<(SharedString, SharedString)>,
+    embedded: bool,
 }
 
 impl Input {
@@ -151,12 +152,17 @@ impl Input {
             multiline: false,
             selecting: false,
             exits: None,
+            embedded: false,
         }
     }
 
     /// Turns the field multiline — the Description's shape. Newlines survive
     /// paste, Enter (as `input.newline`, routed by the shell) breaks the
     /// line, and the render grows one row per visual line.
+    pub fn set_embedded(&mut self) {
+        self.embedded = true;
+    }
+
     pub fn set_multiline(&mut self, multiline: bool) {
         self.multiline = multiline;
     }
@@ -1052,6 +1058,9 @@ impl Render for Input {
             // names it.
             .px(gap_m(&host.font))
             .bg(rgb(chrome.status_bg))
+            .when(self.embedded, |d| {
+                d.bg(rgb(chrome.title_bg)).border_1().rounded(px(5.0))
+            })
             .border_t_1()
             .border_color(rgb(chrome.border))
             .cursor(CursorStyle::IBeam)
@@ -1141,6 +1150,9 @@ impl Input {
             // longer text it invites.
             .min_h(px(f32::from(window.line_height()) * 3.0))
             .bg(rgb(chrome.raised))
+            .when(self.embedded, |d| {
+                d.bg(rgb(chrome.title_bg)).min_h(px(100.0))
+            })
             .border_1()
             .border_color(rgb(chrome.border))
             .rounded(px(crate::chrome::RADIUS))
@@ -1183,11 +1195,13 @@ impl Input {
             .flex()
             .flex_col()
             .gap_y(px(2.0))
-            .child(
-                div()
-                    .text_color(rgb(host.theme.dim_on(gitten_core::theme::Surface::Context)))
-                    .child(self.label.clone()),
-            )
+            .when(!self.embedded, |d| {
+                d.child(
+                    div()
+                        .text_color(rgb(host.theme.dim_on(gitten_core::theme::Surface::Context)))
+                        .child(self.label.clone()),
+                )
+            })
             .child(field)
     }
 }

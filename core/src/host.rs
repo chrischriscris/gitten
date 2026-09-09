@@ -102,6 +102,13 @@ pub struct Host {
     /// The face it draws in, and the numbers derived from it. More than
     /// appearance — see [`Font`] for what depends on getting it right.
     pub font: Font,
+    /// The face for window chrome — sidebar, inspector, toolbar, headers —
+    /// where the reference mock sets system UI type against the diff's
+    /// monospace. A name only, never measured: the spacing ladder, gutters
+    /// and truncation columns all stay on [`Font::char_width`], so swapping
+    /// this face cannot shear a table or a box rule. The diff rows never
+    /// read it; they keep `font.family` whatever this says.
+    pub chrome_family: String,
 }
 
 impl Default for Host {
@@ -127,6 +134,7 @@ impl Host {
             theme: Theme::dark(),
             themes: Themes::builtin(),
             font: Font::default(),
+            chrome_family: String::from("SF Pro Text"),
         }
     }
 

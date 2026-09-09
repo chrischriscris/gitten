@@ -218,7 +218,7 @@ pub fn apply(host: &mut Host, text: &str) -> Vec<String> {
     };
 
     if let Some(font) = doc.get("font") {
-        apply_font(&mut host.font, font, &mut warn);
+        apply_font(&mut host.font, &mut host.chrome_family, font, &mut warn);
     }
     if let Some(theme) = doc.get("theme") {
         apply_theme(host, theme, &mut warn);
@@ -478,7 +478,12 @@ fn apply_diff(host: &mut Host, value: &toml::Value, warn: &mut Vec<String>) {
     }
 }
 
-fn apply_font(font: &mut Font, value: &toml::Value, warn: &mut Vec<String>) {
+fn apply_font(
+    font: &mut Font,
+    chrome_family: &mut String,
+    value: &toml::Value,
+    warn: &mut Vec<String>,
+) {
     let Some(t) = value.as_table() else {
         warn.push("config: [font] is not a table".into());
         return;
@@ -515,6 +520,13 @@ fn apply_font(font: &mut Font, value: &toml::Value, warn: &mut Vec<String>) {
                     }
                 }
                 None => warn.push("config: font.monospaced must be true or false".into()),
+            },
+            // The chrome face is a name only, never measured: sidebar,
+            // inspector, toolbar and headers draw in it while diff rows
+            // keep `family`. An empty value keeps the shipped default.
+            "chrome_family" => match v.as_str() {
+                Some(s) if !s.trim().is_empty() => *chrome_family = s.to_string(),
+                _ => warn.push("config: font.chrome_family must be a non-empty string".into()),
             },
             other => warn.push(format!("config: unknown key font.{other}")),
         }
@@ -723,7 +735,10 @@ pub fn dump(host: &Host) -> String {
     out.push_str(&format!("size = {:?}\n", f.size));
     out.push_str("# Both of these apply on the next launch, not on save.\n");
     out.push_str(&format!("monospaced = {}\n", f.monospaced));
-    out.push_str(&format!("advance = {:?}\n\n", f.advance));
+    out.push_str(&format!("advance = {:?}\n", f.advance));
+    out.push_str("# The window chrome's face (sidebar, inspector, toolbar, headers).\n");
+    out.push_str("# A name only, never measured: diff rows keep `family` whatever this says.\n");
+    out.push_str(&format!("chrome_family = {:?}\n\n", host.chrome_family));
 
     out.push_str("# All of these apply on the next launch. The first five decide what the\n");
     out.push_str("# diff *is* and are read before a window exists; the last two are how it\n");
@@ -1624,6 +1639,7 @@ mod tests {
             monospaced: true,
             advance: 0.5,
         };
+        original.chrome_family = "Iosevka Aile".into();
         original.differ.select("patience");
         original.differ.context = 5;
         original.differ.whitespace = Whitespace::Change;
@@ -1650,6 +1666,10 @@ mod tests {
             "theme did not survive:\n{text}"
         );
         assert_eq!(restored.font, original.font, "font did not survive");
+        assert_eq!(
+            restored.chrome_family, original.chrome_family,
+            "font.chrome_family did not survive"
+        );
         assert_eq!(
             restored.differ.selected(),
             "patience",

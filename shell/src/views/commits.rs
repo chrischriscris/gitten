@@ -184,6 +184,24 @@ impl Commits {
             .get(*self.visible.get(self.view.get().cursor())?)
     }
 
+    /// The commit at a *visible* row — the History timeline's read. Through
+    /// the indirection like [`Commits::current`], so a filter cannot make the
+    /// timeline name a different commit than the keyboard is on.
+    pub(crate) fn commit_at(&self, row: usize) -> Option<&Commit> {
+        self.data.commits.get(*self.visible.get(row)?)
+    }
+
+    /// The relative age at a visible row, derived at load and re-banded by
+    /// the clock — the timeline's dim half, read by the same row index.
+    pub(crate) fn age_at(&self, row: usize) -> Option<&SharedString> {
+        self.ages.get(*self.visible.get(row)?)
+    }
+
+    /// The visible cursor row — what the History timeline tints as selected.
+    pub(crate) fn cursor(&self) -> usize {
+        self.view.get().cursor()
+    }
+
     /// The live query, for pre-filling an edit of it. Empty means none.
     pub fn query(&self) -> Option<&str> {
         self.query.as_deref()

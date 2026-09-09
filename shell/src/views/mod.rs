@@ -407,6 +407,7 @@ pub mod branches;
 pub mod commits;
 pub mod diff;
 pub mod files;
+pub mod history;
 pub mod inspector;
 pub mod markdown;
 pub mod sidebar;
