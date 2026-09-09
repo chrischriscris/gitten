@@ -15,7 +15,6 @@ use gpui::*;
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation as _;
 
-pub const MODE: &str = "input";
 const KEY_CONTEXT: &str = "GittenInput";
 
 /// The input band's height: [`crate::chrome::STATUS_H`] plus 8. Taller than

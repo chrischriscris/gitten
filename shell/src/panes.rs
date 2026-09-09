@@ -5,8 +5,6 @@
 //! tenant in place, so adding a files or branches panel does not add another
 //! branch to layout or dispatch code.
 
-pub const MODE: &str = "panes";
-
 struct Entry<T> {
     name: String,
     value: T,

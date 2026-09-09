@@ -9,14 +9,12 @@
 //! so there is still one implementation of each setting — the window is
 //! drawing and input, like every client must be.
 //!
-//! The keyboard answer, because a window with no keymap would be a mouse
-//! surface: the window resolves against [`settings::MODE`] alone — the same
-//! mode the overlay resolved against, so the shipped bindings and any
-//! extension's all mean what they mean in the main window — plus
-//! [`input::MODE`] while the search field holds focus. That is the whole key
-//! context: a fixed set, not the full stack, because the stack's lower modes
-//! name panes this window does not have. `esc` and `,` close; closing returns
-//! focus to the main window, which never stopped living underneath.
+//! The keyboard answer, because a window with no keys would be a mouse-only
+//! surface: arrows move, left/right turn the knob, Enter applies, Tab walks
+//! the filter field and the rows, `esc` and `,` close; closing returns
+//! focus to the main window, which never stopped living underneath. A fixed
+//! set, not a keymap — the field owns every other press while it holds
+//! focus, the way a native field does.
 //!
 //! Reuse, not duplication: opening while open activates the window instead,
 //! tracked in the [`Open`] global. Closing the main window while settings
@@ -29,8 +27,7 @@
 //! a knob does.
 
 use crate::chrome::{gap_m, RADIUS, ROW_BAR};
-use crate::{config, dispatch, input, settings};
-use gitten_core::command::{chord_string, Key, Modes, Resolve};
+use crate::{config, input, settings};
 use gitten_core::theme::Surface;
 use gpui::*;
 use gpui_component::Root;
@@ -124,29 +121,17 @@ pub(crate) struct SettingsWindow {
     query: String,
     sel: usize,
     focused: Option<FocusHandle>,
-    pending: Vec<Vec<Key>>,
     footer: Option<String>,
 }
 
 impl SettingsWindow {
     fn new(main: Entity<crate::DevShell>, _window: &mut Window, cx: &mut Context<Self>) -> Self {
         let search = cx.new(|cx| input::Input::new("filter", "Filter settings…", "", cx));
-        // The field speaks its exits the way every prompt's does: resolved
-        // once, here, against the input mode it will run under.
-        let mut modes = Modes::new();
-        modes.push(input::MODE);
-        let host = config::host(cx);
-        let accept = host
-            .keys
-            .live_keys_for("input.accept", &modes)
-            .into_iter()
-            .next();
-        let cancel = host
-            .keys
-            .live_keys_for("input.cancel", &modes)
-            .into_iter()
-            .next();
-        search.update(cx, |field, _| field.set_exits(accept, cancel));
+        // The field speaks fixed exits — Enter moves on, Esc closes the
+        // window — the way every prompt's does.
+        search.update(cx, |field, _| {
+            field.set_exits(Some("enter".into()), Some("esc".into()))
+        });
         // Detached, not stored: the feed lives exactly as long as the
         // window does, and there is no close-the-field-keep-the-window
         // state for an unsubscribe to name.
@@ -169,7 +154,6 @@ impl SettingsWindow {
             query: String::new(),
             sel: 0,
             focused: None,
-            pending: Vec::new(),
             footer: None,
         }
     }
@@ -270,11 +254,10 @@ impl SettingsWindow {
         window.remove_window();
     }
 
-    /// One named command, run. The fixed context: the settings mode's verbs
-    /// that name rows, the input mode's two exits while the field holds
-    /// focus, and the way out. Anything else the map resolves is either the
-    /// help this window cannot show — said, not swallowed — or a binding a
-    /// future map added, which this fixed context honestly does not speak.
+    /// One named command, run. The fixed set below is the whole surface:
+    /// list movement, knob turning, the field's two exits, and the way
+    /// out. Called from native keys only — there is no keymap to resolve
+    /// against in this window.
     fn dispatch(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
         let sections = self.main.read(cx).settings_sections(cx);
         let filtered = self.filtered(&sections);
@@ -291,10 +274,6 @@ impl SettingsWindow {
             // The field's enter is not a commit: the filter stays, the rows
             // take the keyboard. Focus, not state — the query survives.
             "input.accept" => window.focus(&self.nav, cx),
-            "help" => {
-                self.footer = Some("the keymap lives in the main window".to_string());
-                cx.notify();
-            }
             _ => {}
         }
     }
@@ -303,63 +282,57 @@ impl SettingsWindow {
     /// resolution, dispatch — the main shell's pipeline, narrowed to the two
     /// modes this window speaks. Anything consumed stops propagation, because
     /// the alternative is a meaning firing in the main window behind it.
+    /// One keypress, wherever it landed in this window. Native keys
+    /// only: arrows move, left/right turn the knob, Enter applies (or
+    /// hands the keyboard to the rows from the field), Esc closes, Tab
+    /// moves between the filter field and the rows. Anything else belongs
+    /// to the field or to nothing.
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        // A pending chord is a promise about where the keyboard is; a focus
-        // change breaks it. Cheap to check, never wrong.
-        let now_focused = window.focused(cx);
-        if self.focused != now_focused {
-            self.focused = now_focused;
-            self.pending.clear();
-        }
-        let candidates = dispatch::translate(&ev.keystroke);
-        if candidates.is_empty() {
+        // Where the keyboard is, read fresh: Tab's walk depends on it.
+        self.focused = window.focused(cx);
+        let key = ev.keystroke.key.as_str();
+        let mods = &ev.keystroke.modifiers;
+        let clean = !mods.control && !mods.alt && !mods.platform && !mods.function;
+        let in_field = self.focused == Some(self.search.read(cx).focus_handle());
+        if !clean {
             return;
         }
-        let host = config::host(cx);
-        let in_field = self.focused == Some(self.search.read(cx).focus_handle());
-        self.pending.push(candidates);
-        // One candidate list per press, handed over whole: which spelling runs
-        // is the map's decision, made against the chord at once.
-        let typed: Vec<&[Key]> = self.pending.iter().map(Vec::as_slice).collect();
-        // While the field holds focus it owns the keyboard the way a native
-        // field does: resolved against the input mode alone, so a `j` types
-        // instead of moving the rows. Anywhere else, the settings mode alone.
-        let resolved = match in_field {
-            true => host.keys.resolve_mode_any(input::MODE, &typed),
-            false => host.keys.resolve_mode_any(settings::MODE, &typed),
-        };
-        match resolved {
-            Resolve::Pending => {}
-            Resolve::Run(name) => {
-                let name = name.to_string();
-                self.pending.clear();
-                self.footer = None;
-                cx.stop_propagation();
-                cx.notify();
-                self.dispatch(&name, window, cx);
-                return;
-            }
-            Resolve::None => {
-                if in_field {
-                    // Not an app command in this mode, so it is text-field
-                    // mechanics or text for the platform input handler. Let it
-                    // continue down the focus path untouched.
-                    self.pending.clear();
-                    return;
-                }
-                // Named by the spellings as they were typed — the insert when
-                // there was one, the key underneath when there was not.
-                let shown: Vec<Key> = self.pending.iter().map(|c| c[0]).collect();
-                let unknown = chord_string(&shown);
-                self.pending.clear();
-                // Said, not swallowed: a key that does nothing and a key that
-                // is not bound look identical, and only one of them is worth
-                // opening `?` about.
-                self.footer = Some(format!("{unknown} is not bound"));
-            }
+        // Esc closes from anywhere — the field included, where it beats
+        // the field's own cancel because the window is what is leaving.
+        if key == "escape" && !mods.shift {
+            cx.stop_propagation();
+            Self::close(window);
+            return;
         }
-        cx.stop_propagation();
-        cx.notify();
+        if in_field {
+            // The field owns every other press: typing, arrows, Tab.
+            return;
+        }
+        let name = match (key, mods.shift) {
+            ("up", false) => Some("view.up"),
+            ("down", false) => Some("view.down"),
+            ("pageup", false) => Some("view.top"),
+            ("pagedown", false) => Some("view.bottom"),
+            ("home", false) => Some("view.top"),
+            ("end", false) => Some("view.bottom"),
+            ("left", false) => Some("view.left"),
+            ("right", false) => Some("view.right"),
+            ("enter", false) => Some("settings.apply"),
+            _ => None,
+        };
+        // Tab walks field and rows both ways; shift decides the direction.
+        if key == "tab" {
+            cx.stop_propagation();
+            match &self.focused {
+                Some(f) if *f == self.search.read(cx).focus_handle() => window.focus(&self.nav, cx),
+                _ => window.focus(&self.search.read(cx).focus_handle(), cx),
+            }
+            return;
+        }
+        if let Some(name) = name {
+            cx.stop_propagation();
+            self.dispatch(name, window, cx);
+        }
     }
 }
 

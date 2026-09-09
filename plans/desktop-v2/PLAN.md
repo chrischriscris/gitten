@@ -425,3 +425,35 @@ DEVIATIONS FROM THE MOCK (deliberate, each with its reason):
   proportions, GPUI-measured. No CSS pixel was copied anywhere.
 - The exact chrome-face rendering ("SF Pro Text" resolution) is
   unverified headless — first window look confirms or corrects it.
+
+## Native-keys shell, option B (landed): command keys + help panel removed
+
+The desktop no longer drives commands from single keys. Arrows/Tab/Enter/Esc,
+text editing, menus, and the Commands palette stay; `on_key` keymap
+resolution, the modes stack, `dispatch::translate` (+tests), `help.rs`, the
+`?` binding, and `[keys]`-as-driver are gone. shell 371 · app 155 ·
+core 498 green; fmt + workspace clippy `-D warnings` clean. `core`/`app`/
+TUI/CLI untouched — the registry, bindings, and keymaps still serve them.
+
+- Removed: `shell/src/dispatch.rs`, `shell/src/help.rs`, modes-stack
+  driving, `sync_modes`, `pending` chords, `Pane::mode` readers
+  (`Screen::mode` is `cfg(test)` now; the trait seam keeps
+  `#[allow(dead_code)]` like `label`), status-bar hint projection
+  (`hints`, `hints_budget`, `version`, badge consts), `MODE` consts
+  (input/panes/settings), `leave`-adjacent key docs across shell.
+- Restored after an over-broad cut: `cycle_pane`/`pane_walk` + the four
+  `pane.*` arms (pure focus cycling, palette-runnable; TUI still owns the
+  names), with de-keyboarded docs.
+- Rewired, not removed: settings window on native keys (fixed exits +
+  arrows/Tab/Enter/Esc); reset question answered from Commands
+  (`reset to {}? Commands: soft · mixed · hard · esc cancels`);
+  `commands.palette` is a real filter dialog (toolbar button, Ctrl-K,
+  macOS Cmd-K menu adapter).
+- Confirmation flows (discard two-press, reset answers) still run through
+  named commands, so the palette answers them — but no clickable dialog
+  buttons exist yet. Flagged follow-up, not silently kept.
+- Reverted out of scope: a `vercel` theme + mock restyle the run produced
+  unasked (`core/`, `app/`, `artifacts/`, `docs/` restored verbatim).
+- Tests: command-key driving + help/context-menu tests deleted with
+  reason; focus/esc/search/commit/tag/reset/discard behavior kept via
+  `run_command`; reset copy updated to match.

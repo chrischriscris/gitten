@@ -13,8 +13,7 @@
 //! [`Host::themes`], [`Differs::names`](gitten_core::differ::Differs::names),
 //! [`Wraps::names`](gitten_core::wrap::Wraps::names) and the view's own layout
 //! list — so an extension's algorithm or theme is a row here the day it is
-//! registered, with no edit to this file. That is the same seam the help
-//! overlay and the context menu hold.
+//! registered, with no edit to this file.
 //!
 //! Every row applies **live**: choosing is doing, the way the pickers were.
 //! There is no next-launch row in here — `font.monospaced`, `font.advance`
@@ -33,11 +32,6 @@
 
 use gitten_core::differ::Whitespace;
 use gitten_core::host::Host;
-
-/// The mode a press resolves against while settings stand. Beside
-/// [`crate::help::MODE`] and [`crate::input::MODE`]: the name belongs to
-/// whoever stands it up, and `core` holds the bindings.
-pub const MODE: &str = "settings";
 
 /// Which knob a row edits. Fixed identity for every row the panel holds, so
 /// the shell matches on this rather than on a label that might be reworded.

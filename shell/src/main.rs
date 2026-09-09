@@ -1,12 +1,11 @@
 mod assets;
 mod chrome;
 mod config;
-mod dispatch;
 mod graph;
-mod help;
 mod input;
 mod menu;
 mod modal;
+mod palette;
 mod panes;
 mod session;
 mod settings;
@@ -18,7 +17,6 @@ use gitten_app::acquire::{Data, Loaded};
 use gitten_app::cli::{Request, Source, View};
 use gitten_app::jobs::{Event as JobEvent, Generation, Job, Runner, Submitter};
 use gitten_app::{Configured, Started, Startup};
-use gitten_core::command::{chord_string, Code, Key, Modes, Resolve};
 use gitten_core::differ::{Overrides, Whitespace};
 use gitten_core::host::Host;
 use gitten_core::refs::ResetMode;
@@ -246,24 +244,6 @@ enum Open {
     Project,
 }
 
-/// The open context menu: the pane it was opened over — whose mode the rows
-/// were projected from, and whose *registration name* a pick routes through,
-/// the way a prompt's pane name routes its result back — the row a
-/// right-click landed on when one was, the pointer, and the rows themselves.
-/// A snapshot of the projection, the way a settings row is its registry's:
-/// the menu says what the keymap said when it was asked.
-struct ContextMenu {
-    pane: String,
-    /// The row the right-click landed on, as the view published it. Read by
-    /// nothing — the selection already happened, and a pick dispatches by
-    /// name — but the open state's record of what it is over, and what a
-    /// test asserts.
-    #[allow(dead_code)]
-    row: Option<usize>,
-    at: Point<Pixels>,
-    rows: Vec<menu::Row>,
-}
-
 type RefreshValue = Box<dyn std::any::Any + Send>;
 type ApplyRefresh = dyn FnOnce(RefreshValue, &Host, &mut App) -> Result<(), String>;
 
@@ -431,6 +411,10 @@ impl Refresh {
 /// seam. Only drawing, local command behavior and optional repository refresh
 /// live here; stable naming, placement and focus belong to [`panes::Panes`].
 trait Pane {
+    /// Spelled for out-of-tree panes: no in-tree caller since the keymap
+    /// driving went away, but an extension pane implements this seam in a
+    /// production build, so it must exist outside `cfg(test)`.
+    #[allow(dead_code)]
     fn mode(&self) -> &'static str;
 
     /// Spelled for tests and out-of-tree panes: no in-tree caller since the
@@ -607,7 +591,9 @@ impl Screen {
         }
     }
 
-    /// Which mode's bindings are live. The name the keymap and `gitten.toml` use.
+    /// Which mode's bindings were live. Test-only since the keymap driving
+    /// went away; the workspace destinations name themselves.
+    #[cfg(test)]
     fn mode(&self) -> &'static str {
         match self {
             Screen::Commits { .. } => "commits",
@@ -1055,17 +1041,6 @@ impl Screen {
     }
 }
 
-/// The keymap mode the reset question pushes while it stands — see
-/// [`DevShell::sync_modes`]. Its name is the keymap's `[reset]` section in
-/// `gitten.toml`.
-const RESET_MODE: &str = "reset";
-
-/// The keymap mode the message overlay pushes while it stands — see
-/// [`DevShell::sync_modes`]. It binds nothing itself: the overlay is a reading
-/// pane, and its exits (`esc`, the copy) answer to whatever the keymap already
-/// says, so a config file can rebind them and the panel follows.
-const MESSAGE_MODE: &str = "message";
-
 /// What the band says, and why it is saying it. Two, because the two sentences
 /// are not the same sentence: an info describes what was tried, and a question
 /// is the one the keyboard is about to spend — the loudest thing on screen,
@@ -1223,11 +1198,6 @@ struct DevShell {
     /// at startup.
     over: Overrides,
     open: Option<Open>,
-    /// The open context menu, if a right-click asked for one. One at a time,
-    /// like any menu — a second right-click moves the one there is — and
-    /// dismissed by any key, a wheel, a focus change or a pick. See
-    /// [`DevShell::open_context_menu`].
-    context: Option<ContextMenu>,
     /// A failed re-diff. Shown, not swallowed: the usual cause is a repository
     /// that moved under the window, and silently keeping the old rows would be a
     /// diff labelled with an algorithm that did not produce it.
@@ -1299,37 +1269,19 @@ struct DevShell {
     /// repository and read per frame. Keyed on the path, because the tests
     /// swap `repo` in place and a memo that trusted construction would lie.
     title_memo: RefCell<Option<(std::path::PathBuf, SharedString, SharedString)>>,
-    /// Which modes' bindings are live, innermost last: the pane container, the
-    /// focused tenant, then input or help over it. Rebuilt by
-    /// [`DevShell::sync_modes`] whenever any of those changes.
-    modes: Modes,
-    /// Keys typed so far that have not resolved. Empty almost always; a chord
-    /// is what puts something in it. One entry per press, and every entry
-    /// carries **every spelling** that press could mean
-    /// ([`dispatch::translate`]) — which of them runs is the keymap's
-    /// `resolve_any` decision, made against the whole chord at once, so a
-    /// half-typed `ß`/alt-s stays alive as both. Reset on every change of
-    /// host, mode, focus, menu, help or screen — a pending chord is a
-    /// promise about what is on screen, and none of those promises survive a
-    /// change of any of it.
-    pending: Vec<Vec<Key>>,
-    help: bool,
-    /// The help panel's row scroll. The handle is the shell's and not the
-    /// panel's because the panel is a pure element — see [`help::overlay`] —
-    /// and the keyboard has to reach its tail, which is the one piece of
-    /// state a pure element cannot hold. Reset when help opens: the rows are
-    /// a different projection every time — the active modes' — and an offset
-    /// the last reading left is a promise about rows that no longer exist.
-    help_scroll: ScrollHandle,
+    /// The Commands palette: open flag, selection into the filtered rows,
+    /// the filter field (built once, subscription included), its
+    /// subscription, and the mirrored query text.
+    palette_open: bool,
+    palette_sel: usize,
+    palette_field: Option<Entity<input::Input>>,
+    palette_sub: Option<Subscription>,
+    palette_query: String,
     /// The window's one focusable element: this shell itself. Key events reach a
     /// listener through the focus path, so something has to hold focus, and one
     /// handle owned here means the views never have to know input exists.
     focus: FocusHandle,
     focused: Option<FocusHandle>,
-    /// The host the last key was resolved against. A saved `gitten.toml` swaps
-    /// the map mid-session; a chord half-typed against the old one means nothing
-    /// under the new.
-    seen_host: Option<Rc<Host>>,
     /// Which axis the wheel gesture in flight belongs to. `gpui`'s own lock,
     /// held here — the one place that sees every wheel event first.
     ongoing: Cell<OngoingScroll>,
@@ -1612,9 +1564,14 @@ impl DevShell {
         if spot == Spot::List && self.list_order().is_empty() {
             return;
         }
+        if spot == Spot::List && self.list_order().is_empty() {
+            return;
+        }
         if self.spot != spot {
             self.spot = spot;
-            self.sync_modes(cx);
+            // A menu belongs to the pane it was opened over: focus moving
+            // closes it, or it stands invisible and swallows the wheel.
+            self.open = None;
             self.sync_focus(cx);
         }
     }
@@ -1660,73 +1617,9 @@ impl DevShell {
         self.active().map_or(self.which, Screen::mode)
     }
 
-    /// Rebuilds the mode stack from what is focused, and drops whatever was
-    /// pending against the previous arrangement: any half-typed chord, any
-    /// open menu and any context menu — a menu belongs to the pane it was
-    /// opened over, and one left standing after focus changes is invisible
-    /// but still in `self.open` or `self.context`, where
-    /// [`DevShell::on_wheel`] swallows for it forever.
-    /// Called on every change of region focus or help state — the places
-    /// [`Modes`] can change — and at the tail of [`DevShell::run_command`],
-    /// because a cursor move inside a list can end a standing question.
-    fn sync_modes(&mut self, cx: &App) {
-        self.modes = self.stack_for(self.active(), cx);
-        self.pending.clear();
-        self.open = None;
-        self.context = None;
-    }
-
-    /// The [`Modes`] stack a key would resolve against if `screen` held the
-    /// keyboard — [`DevShell::sync_modes`]' builder without its side effects.
-    /// The keyboard's own stack stays in `self.modes`; the wheel resolves
-    /// against this one so the pane under it answers for the event while
-    /// focus stays where it was. The modal halves — a standing prompt, the
-    /// error band — belong to the window either way, so they ride along
-    /// unchanged; only the screen's own mode is swapped for the target's.
-    fn stack_for(&self, screen: Option<&Screen>, cx: &App) -> Modes {
-        let mut modes = Modes::new();
-        // Cycling the lists needs more than one of them to be worth a key.
-        if self.list_order().len() > 1 {
-            modes.push(panes::MODE);
-        }
-        if let Some(screen) = screen {
-            modes.push(screen.mode());
-        }
-        // The reset question, lazygit's menu: while the commits view has a
-        // reset armed, its three letters capture s/m/h for the strengths —
-        // `h` included, which outside the question is the pane move. The
-        // question is the pane's own state and survives nothing that moves
-        // the cursor, so this reads it rather than mirrors it.
-        if let Some(Screen::Commits { view, .. }) = screen {
-            if view.read(cx).armed() {
-                modes.push(RESET_MODE);
-            }
-        }
-        if self.input.is_some() {
-            modes.push(input::MODE);
-        }
-        if self.help {
-            modes.push(help::MODE);
-        }
-        if self.show_message && self.error.is_some() {
-            modes.push(MESSAGE_MODE);
-        }
-        modes
-    }
-
-    /// The live host, and the chord reset that goes with it when the file has
-    /// been reloaded since the last key.
+    /// The live host, rebuilt per event from the render-path accessor.
     fn fresh_host(&mut self, cx: &mut Context<Self>) -> Rc<Host> {
-        let host = config::host(cx);
-        let changed = match &self.seen_host {
-            Some(seen) => !Rc::ptr_eq(seen, &host),
-            None => true,
-        };
-        if changed {
-            self.pending.clear();
-            self.seen_host = Some(host.clone());
-        }
-        host
+        config::host(cx)
     }
 
     fn set_notice(&mut self, message: impl Into<String>) {
@@ -1746,26 +1639,14 @@ impl DevShell {
         if let Some(previous) = self.input.replace(input) {
             previous.update(cx, |input, cx| input.cancel(cx));
         }
-        self.sync_modes(cx);
-        // The field speaks its own exits, because the status hints are blanked
-        // while it stands and a prompt that hides how to leave it is a modal
-        // with no door. Resolved here and once: `sync_modes` has just pushed
-        // the input mode, so `live_keys_for` answers what a press means right
-        // now — a key an inner mode took over is never named — and the field
-        // does not re-walk the keymap per frame for a keyboard it holds.
-        let host = config::host(cx);
-        let accept = host
-            .keys
-            .live_keys_for("input.accept", &self.modes)
-            .into_iter()
-            .next();
-        let cancel = host
-            .keys
-            .live_keys_for("input.cancel", &self.modes)
-            .into_iter()
-            .next();
+        // The field speaks its own exits — Enter to accept, Esc to cancel —
+        // because a prompt that hides how to leave it is a modal with no
+        // door. Fixed native text now, not a keymap lookup: no chord state
+        // survives to answer what a press means.
         if let Some(field) = self.input.as_ref() {
-            field.update(cx, |field, _| field.set_exits(accept, cancel));
+            field.update(cx, |field, _| {
+                field.set_exits(Some("enter".into()), Some("esc".into()))
+            });
         }
         cx.notify();
     }
@@ -1788,7 +1669,6 @@ impl DevShell {
             true => input.accept(cx),
             false => input.cancel(cx),
         });
-        self.sync_modes(cx);
         match (accept, self.prompt.take()) {
             (true, Some(Prompt::CommitMessage)) => self.commit_message(text, cx),
             (true, Some(Prompt::AmendMessage)) => self.amend_message(text, cx),
@@ -1849,9 +1729,9 @@ impl DevShell {
 
     /// `files.commit`: gather a message over the pane, then commit on accept.
     ///
-    /// The input owns the keyboard while it is open — [`input::MODE`] sits on
-    /// top of the pane stack — and [`DevShell::close_input`] routes the text
-    /// back here through the prompt slot.
+    /// The input owns the keyboard while it is open — the field takes every
+    /// press the window does not consume — and [`DevShell::close_input`]
+    /// routes the text back here through the prompt slot.
     /// `workspace.commit`: the inspector's commit door — the Commit button,
     /// the `CommitStaged` menu action and cmd-enter all arrive here. Opens
     /// the confirmation dialog when the gate holds (staged content and a
@@ -2252,12 +2132,10 @@ impl DevShell {
     /// A commit list that silently loses its top rows reads as data loss no
     /// matter what the reflog knows, so the question is asked in the band
     /// where the eyes are.
-    /// `commits.reset-menu`: open the reset question on the commit the
-    /// keyboard is on — lazygit's `g`. The question is the pane's armed slot
-    /// plus the [reset] mode its arming pushes; the band carries the three
-    /// letters, and `esc` drops it. Asking while one already stands closes
-    /// it: the same key opens and dismisses, and nothing but a strength
-    /// letter or `esc` executes anything.
+    /// `commits.reset-menu`: open the reset question on the selected commit.
+    /// The question is the pane's armed slot; the band names the three
+    /// answers, `esc` drops it, and the answering command spends it.
+    /// Asking while one already stands closes it.
     fn reset_menu(&mut self, cx: &mut Context<Self>) {
         let Some(Screen::Commits { view, .. }) = self.active() else {
             self.set_notice("commits.reset-menu is not supported here");
@@ -2276,16 +2154,14 @@ impl DevShell {
             return;
         }
         self.set_question(Self::reset_question(&commit));
-        // The arm just opened; the question's letters are live this frame.
-        self.sync_modes(cx);
     }
 
-    /// The band's sentence for a standing reset question: the target and the
-    /// three answers, each in the ink of nothing — the band is `dim`, and the
-    /// letters are read, not hunted.
+    /// The band's sentence for a standing reset question: the target and
+    /// the three answers, each named as the Commands entry that runs it —
+    /// the band is `dim`, and the names are read, not hunted.
     fn reset_question(commit: &Commit) -> String {
         format!(
-            "reset to {}? s soft · m mixed · h hard · esc cancels",
+            "reset to {}? Commands: soft · mixed · hard · esc cancels",
             commit.short
         )
     }
@@ -2313,15 +2189,12 @@ impl DevShell {
             "commits.reset-mixed" => ResetMode::Mixed,
             _ => ResetMode::Hard,
         };
-        // A strength letter answers a standing question and does nothing
-        // else. The check is *before* any arming — the arm is `g`'s to set,
-        // and a letter that opened a question by itself would be two presses
-        // deciding a hard reset. Only a stale mode after a cursor move can
-        // resolve a strength tonight; the mode stack is re-synced so it
-        // stops.
+        // An answering command spends a standing question and does nothing
+        // else. The check is *before* any arming — the arm is the menu
+        // command's to set, and an answer that opened a question by itself
+        // would be two presses deciding a hard reset.
         if !view.read(cx).armed() {
-            self.set_notice("no reset is being asked — press g to ask");
-            self.sync_modes(cx);
+            self.set_notice("no reset is being asked — run commits.reset-menu from Commands");
             return;
         }
         if !view.update(cx, |v, _| v.confirm_or_arm_reset(&commit.sha)) {
@@ -3156,7 +3029,6 @@ impl DevShell {
         cx: &mut Context<Self>,
     ) {
         self.panes.register(name, Screen::custom(pane));
-        self.sync_modes(cx);
         cx.notify();
     }
 
@@ -3397,7 +3269,6 @@ impl DevShell {
     /// item is an intervening event, and a chord is a promise about what is on
     /// screen that survives none of them.
     fn native(&mut self, command: &str, cx: &mut Context<Self>) {
-        self.pending.clear();
         self.run_command(command, cx);
     }
 
@@ -3784,13 +3655,11 @@ impl DevShell {
     fn toggle_project_menu(&mut self, cx: &mut Context<Self>) {
         if self.open == Some(Open::Project) {
             self.open = None;
-            self.pending.clear();
             cx.notify();
             return;
         }
         let Some((current, _)) = self.repo.clone() else {
             self.set_notice("this view has no repository to switch from");
-            self.pending.clear();
             return;
         };
         // Current first: the menu reads most-recent-first, and the window
@@ -3805,7 +3674,6 @@ impl DevShell {
         }
         self.projects = listed;
         self.open = Some(Open::Project);
-        self.pending.clear();
         cx.notify();
     }
 
@@ -3846,11 +3714,9 @@ impl DevShell {
     fn browse_for_project(&mut self, cx: &mut Context<Self>) {
         if self.repo.is_none() {
             self.set_notice("this view has no repository to browse from");
-            self.pending.clear();
             return;
         }
         self.open = None;
-        self.pending.clear();
         let picked = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
@@ -3955,9 +3821,7 @@ impl DevShell {
         if self.input.is_some() {
             self.close_input(false, cx);
         }
-        self.context = None;
         self.open = None;
-        self.pending.clear();
         let path = path.canonicalize().unwrap_or(path);
         if same_project_path(&path, &old_path) {
             gitten_app::projects::record(&path);
@@ -4161,7 +4025,6 @@ impl DevShell {
                     }))
                     .on_click(move |_, _, cx| {
                         _ = me.update(cx, |this, cx| {
-                            this.pending.clear();
                             this.pick_project(i, cx);
                         });
                     })
@@ -4196,7 +4059,7 @@ impl DevShell {
                 }
             }
             "quit" => cx.quit(),
-            "help" => self.toggle_help(cx),
+            "help" | "commands.palette" => self.open_palette(cx),
             // Settings stand in their own window now, not over this one: the
             // command opens (or activates) it, and the window owns its own
             // keyboard from there. Every door — `,`, the gear, the menu,
@@ -4204,36 +4067,18 @@ impl DevShell {
             "settings" => {
                 settings_window::open(cx.entity(), cx);
             }
-            // While the panel stands, the movement verbs are the panel's: the
-            // rows under it are occluded, and one of these keys moving the list
-            // underneath instead would scroll something the reader cannot see.
-            // The names are the map's — bound in the help mode in `core` — so
-            // the routing here is the only client-side half of it.
-            "view.scroll-down" | "view.scroll-up" if self.help => {
-                help::scroll_by(
-                    &self.help_scroll,
-                    match command {
-                        "view.scroll-up" => -1.0,
-                        _ => 1.0,
-                    },
-                );
-            }
-            "view.top" | "view.bottom" if self.help => {
-                help::scroll_to_end(&self.help_scroll, command == "view.bottom");
-            }
             "back" => self.back(cx),
             "theme.cycle" => self.cycle_theme(cx),
             "input.accept" => self.close_input(true, cx),
             "input.cancel" => self.close_input(false, cx),
+            // Focus lists without pointing: cycle the registry in drawing
+            // order, or walk one stop over toward the diff. Tab covers
+            // regions; these cover lists.
             "pane.next" => self.cycle_pane(1, cx),
             "pane.prev" => self.cycle_pane(-1, cx),
-            // lazygit's pane moves, on h/l and the arrows: a walk across
-            // every pane the window has, in reading order — the stack's
-            // lists top to bottom, then the diff last. At either end the
-            // move is answered and stays.
             "pane.left" => self.pane_walk(-1, cx),
             "pane.right" => self.pane_walk(1, cx),
-            // lazygit's R: refresh everything. The wave itself is the queue
+            // Refresh everything. The wave itself is the queue
             // finish's; this just rings the bell.
             "repo.refresh" => {
                 let sent = self.writes().map(|w| w.send(Box::new(RefreshAll)));
@@ -4263,11 +4108,10 @@ impl DevShell {
             "commits.search" | "files.search" | "branches.search" | "stashes.search" => {
                 self.begin_search(command, cx)
             }
-            // History's verbs, aimed at the commit the keyboard is on. Reset
+            // History's verbs, aimed at the selected commit. Reset
             // and revert read the pane; the write goes through the queue.
-            // The reset question is lazygit's menu: `g` opens it, and the
-            // three strengths answer it only while it stands — see
-            // [`DevShell::sync_modes`] for the mode that captures s/m/h.
+            // The reset question is answered from Commands: `reset-menu`
+            // opens it, and the three strengths answer it while it stands.
             "commits.reset-menu" => self.reset_menu(cx),
             "commits.reset-soft" | "commits.reset-mixed" | "commits.reset-hard" => {
                 self.reset_selected(command, cx)
@@ -4329,11 +4173,6 @@ impl DevShell {
             // sits over, they act on the branch HEAD is on — which is why
             // their keys are globals.
             "repo.push" | "repo.pull" | "repo.fetch" => self.sync_remote(command, cx),
-            // The palette is the help panel by another door: the window's
-            // whole command list, opened by mouse or by key. One panel,
-            // two names — a second list would be a second thing to keep
-            // true about what is bound.
-            "commands.palette" => self.toggle_help(cx),
             // The inspector's commit door: the button, the key and the
             // dialog confirm all arrive here or below, and the write is
             // always `act::commit_message`'s — never a second
@@ -4396,11 +4235,7 @@ impl DevShell {
         // The keyboard may just have moved the commits cursor — or a refresh
         // may have re-anchored it under the last command. Either way this is
         // the one hook every command leaves through, so it is where the main
-        // view learns its selection changed — and where the mode stack learns
-        // the reset question ended: a cursor move disarms it inside the view,
-        // and the question's letters must stop capturing the moment it is
-        // gone. One read on the no-op path.
-        self.sync_modes(cx);
+        // view learns its selection changed. One read on the no-op path.
         self.sync_main_diff(cx);
         // The workspace center learns the same way, off the files cursor.
         // Disabled is one bool read; a refresh wave re-lands the same
@@ -4410,14 +4245,12 @@ impl DevShell {
         cx.notify();
     }
 
-    /// Closes the help, the settings panel, the input field, or the diff
-    /// region's hold on the keyboard.
-    ///
-    /// One key for all of it, because all of it is "get me out of this" — and
-    /// **innermost first**, or a menu left open after its context is popped
-    /// keeps occluding nothing: invisible, but still in `self.open`, where
-    /// [`DevShell::on_wheel`] swallows every event for it forever. So an open
-    /// menu is the whole of this `esc`: closed, pending dropped with it.
+    /// Closes the topmost thing — the palette, the message overlay, an
+    /// error, an open menu, the input field, or the diff region's hold on
+    /// the keyboard — innermost first, or a menu left open after its
+    /// context is popped keeps occluding nothing: invisible, but still in
+    /// `self.open`, where [`DevShell::on_wheel`] swallows every event for
+    /// it forever. So an open menu is the whole of this `esc`: closed.
     ///
     /// With nothing stacked above, `esc` hands the keyboard back from the
     /// diff to the stack — lazygit's way out of a main view. The lists
@@ -4426,15 +4259,13 @@ impl DevShell {
     /// lighter. A selection is inside a list, so it goes after the region
     /// switch; the diff's own selection stays until its rows are replaced.
     fn back(&mut self, cx: &mut Context<Self>) {
-        if self.show_message {
-            self.show_message = false;
-            self.sync_modes(cx);
-            cx.notify();
+        if self.palette_open {
+            self.close_palette(cx);
             return;
         }
-        if self.help {
-            self.help = false;
-            self.sync_modes(cx);
+        if self.show_message {
+            self.show_message = false;
+            cx.notify();
             return;
         }
         // An error is a message, not a context: it stands until dismissed, and
@@ -4442,12 +4273,10 @@ impl DevShell {
         if self.error.is_some() {
             self.error = None;
             self.error_is_load = false;
-            self.sync_modes(cx);
             cx.notify();
             return;
         }
         if self.open.take().is_some() {
-            self.pending.clear();
             cx.notify();
             return;
         }
@@ -4481,24 +4310,74 @@ impl DevShell {
     fn focus_pane(&mut self, at: usize, cx: &mut Context<Self>) {
         // Focusing a list means looking at that list: the keyboard goes
         // with it, out of the diff if it was there. The spot moves even
-        // when the tenant was *already* the focused one — walking back
-        // left from the diff lands on the pane that held the keyboard
-        // before it left, and `5` from the diff must reach the stash it
-        // names — which is why the registry's "no change" answer is not
-        // allowed to end this method before the spot has.
+        // when the tenant was *already* the focused one — which is why the
+        // registry's "no change" answer is not allowed to end this method
+        // before the spot has.
         if self.panes.focus(at) || self.spot != Spot::List {
             self.set_spot(Spot::List, cx);
-            self.sync_modes(cx);
             self.sync_focus(cx);
             cx.notify();
         }
     }
 
-    /// Cycles the lists — what ctrl-j/ctrl-k do, walking `1 → 2 → 3 → 4`:
-    /// the stack's four panes in drawing order, then any pane an extension
-    /// registered. The command names still say *pane*: they were
-    /// named for the panes that used to stack, and a rename would break
-    /// every `[keys]` file in flight.
+    /// Tab's walk: the list, the center, the composer fields, and back —
+    /// the regions a mouse reaches by pointing, in reading order.
+    /// Shift-Tab walks it backwards. The list is the destination's own
+    /// (files in Changes, commits in History); stops with no entity yet
+    /// are skipped, so a fresh shell tabs between what stands.
+    fn cycle_focus(&mut self, by: isize, window: &mut Window, cx: &mut Context<Self>) {
+        #[derive(Clone, Copy)]
+        enum Stop {
+            List,
+            Center,
+            Summary,
+            Description,
+        }
+        let list = match self.workspace.destination {
+            views::workspace::Destination::History => "commits",
+            _ => "files",
+        };
+        let mut stops = vec![Stop::List];
+        if self.workspace.center.is_some() {
+            stops.push(Stop::Center);
+        }
+        if self.workspace.summary.is_some() {
+            stops.push(Stop::Summary);
+        }
+        if self.workspace.description.is_some() {
+            stops.push(Stop::Description);
+        }
+        let current = match self.workspace_field_focused(window, cx) {
+            Some(true) => stops.iter().position(|s| matches!(s, Stop::Description)),
+            Some(false) => stops.iter().position(|s| matches!(s, Stop::Summary)),
+            None if self.spot == Spot::Main => stops.iter().position(|s| matches!(s, Stop::Center)),
+            None => Some(0),
+        }
+        .unwrap_or(0);
+        let next = stops[(current as isize + by).rem_euclid(stops.len() as isize) as usize];
+        match next {
+            Stop::List => self.focus_named(list, cx),
+            Stop::Center => {
+                self.set_spot(Spot::Main, cx);
+                cx.notify();
+            }
+            Stop::Summary => {
+                if let Some(field) = self.workspace.summary.clone() {
+                    window.focus(&field.read(cx).focus_handle(), cx);
+                }
+            }
+            Stop::Description => {
+                if let Some(field) = self.workspace.description.clone() {
+                    window.focus(&field.read(cx).focus_handle(), cx);
+                }
+            }
+        }
+    }
+
+    /// Cycles the lists in drawing order, then any pane an extension
+    /// registered: the Commands way to move focus between lists without
+    /// pointing. With fewer than two lists there is nowhere to go, and
+    /// that is said rather than silently staying.
     fn cycle_pane(&mut self, by: isize, cx: &mut Context<Self>) {
         let order: Vec<String> = self.list_order().iter().map(|s| s.to_string()).collect();
         if order.len() < 2 {
@@ -4515,13 +4394,11 @@ impl DevShell {
         self.focus_named(&name, cx);
     }
 
-    /// Walks the keyboard one pane over — what h/l and the arrows run. The
-    /// order is the window's reading order: the stack's lists top to bottom
-    /// ([`DevShell::list_order`], the same walk the number keys spell out),
-    /// then the diff as the last stop. Left of the diff is the stack's foot;
-    /// right of the last list is the diff; an edge answers and stays, which
-    /// is what a walk that refuses to wrap must do to keep h/l a line and
-    /// not a ring — the number keys already cover the jumping.
+    /// Walks focus one stop over, in the window's reading order: the lists
+    /// ([`DevShell::list_order`]) then the diff as the last stop. Left of
+    /// the diff is the last list; right of the last list is the diff; an
+    /// edge answers and stays. The Tab walk ([`DevShell::cycle_focus`])
+    /// covers regions; this covers lists.
     fn pane_walk(&mut self, by: isize, cx: &mut Context<Self>) {
         let order: Vec<String> = self.list_order().iter().map(|s| s.to_string()).collect();
         if order.is_empty() {
@@ -4540,7 +4417,7 @@ impl DevShell {
                 let Some(at) = order.iter().position(|name| *name == focused) else {
                     // The focused tenant is not in the walk order — it can
                     // only be an extension registered after this frame's
-                    // order was read. The stack's top is the honest home.
+                    // order was read. The first list is the honest home.
                     if by < 0 {
                         self.focus_named(&order[0], cx);
                     }
@@ -4612,27 +4489,6 @@ impl DevShell {
             return;
         }
         self.schedule_main_diff(commit, false, cx);
-    }
-
-    /// `workspace.changes`: enter the guide-v2 workspace — the Changes
-    /// destination. The stack stays alive underneath (cursors, refresh,
-    /// commands all keep working), and the center builds once, on first
-    /// entry. Reachable by name only until the commands palette lands in
-    /// Phase 3; tests drive it directly.
-    /// `help` and `commands.palette`: the window's command list, toggled.
-    /// One panel under both names — the toolbar button, `?` and cmd-k all
-    /// land on the same overlay, which lists the live registry rather than
-    /// a second inventory anyone would have to keep true.
-    fn toggle_help(&mut self, cx: &mut Context<Self>) {
-        self.help = !self.help;
-        // Reopening starts at the top: the rows are a different
-        // projection every time — the active modes' — and an offset
-        // the last reading left is a promise about rows that no
-        // longer exist.
-        if self.help {
-            help::scroll_to_end(&self.help_scroll, false);
-        }
-        self.sync_modes(cx);
     }
 
     /// The draft store's key for this window: the repository path, so
@@ -5231,20 +5087,6 @@ impl DevShell {
     /// alternative is a second, hardcoded meaning firing behind it — which is
     /// precisely what this file used to have and must not again.
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        // A pending chord is a promise about where the keyboard is; a focus
-        // change breaks it. Cheap to check, never wrong.
-        let now_focused = window.focused(cx);
-        if self.focused != now_focused {
-            self.focused = now_focused;
-            self.pending.clear();
-        }
-        // Any press dismisses the context menu first — a keyboard-first app
-        // must never make a key wait for a mouse surface — and then resolves
-        // exactly as if the menu were not there. The menu is the keymap's
-        // rows; the key is still the keymap's.
-        if self.context.take().is_some() {
-            cx.notify();
-        }
         // The commit dialog stands over the workspace: Esc cancels it from
         // anywhere and hands the keyboard back to the files pane — the same
         // focus restoration the prompt path keeps when its field closes.
@@ -5255,7 +5097,6 @@ impl DevShell {
             && !ev.keystroke.modifiers.platform
             && !ev.keystroke.modifiers.function
         {
-            self.pending.clear();
             cx.stop_propagation();
             self.cancel_commit_confirm(cx);
             return;
@@ -5274,7 +5115,6 @@ impl DevShell {
             let mods = &ev.keystroke.modifiers;
             let clean = !mods.control && !mods.alt && !mods.platform && !mods.function;
             if key == "escape" && clean {
-                self.pending.clear();
                 cx.stop_propagation();
                 self.focus_named("files", cx);
                 cx.notify();
@@ -5302,65 +5142,114 @@ impl DevShell {
             }
             return;
         }
-        let candidates = dispatch::translate(&ev.keystroke);
-        if candidates.is_empty() {
-            return;
-        }
-        let host = self.fresh_host(cx);
-        self.pending.push(candidates);
-        // One candidate list per press, handed over whole: which spelling runs
-        // is the map's decision, made against the chord at once.
-        let typed: Vec<&[Key]> = self.pending.iter().map(Vec::as_slice).collect();
-        let resolved = match self.input.is_some() {
-            true => host.keys.resolve_mode_any(input::MODE, &typed),
-            // While the help panel stands it owns the keyboard the same way a
-            // native field does: resolved against its mode *alone*, so a chord
-            // the map does not give it runs nothing underneath — a pane's `D`
-            // reads as "not bound" instead of arming a discard behind a screen
-            // that is only describing it. `Resolve::None` below says so.
-            false if self.help => host.keys.resolve_mode_any(help::MODE, &typed),
-            false => host.keys.resolve_any(&self.modes, &typed),
-        };
-        match resolved {
-            Resolve::Pending => {}
-            Resolve::Run(name) => {
-                let name = name.to_string();
-                self.pending.clear();
-                self.notice = None;
-                cx.stop_propagation();
-                cx.notify();
-                self.run_command(&name, cx);
-            }
-            Resolve::None => {
-                if self.input.is_some() {
-                    // Not an app command in this mode, so it is text-field
-                    // mechanics or text for the platform input handler. Let it
-                    // continue down the focus path untouched.
-                    self.pending.clear();
+        // Native keys, and only these. The desktop answers arrows, Tab,
+        // Enter and Esc directly — every other press belongs to a field
+        // (handled above), a platform binding (the menu adapters), or
+        // nothing at all. There is no keymap to consult and no chord state
+        // to keep: an unhandled key falls through untouched, never nagging
+        // about being unbound.
+        let key = ev.keystroke.key.as_str();
+        let mods = &ev.keystroke.modifiers;
+        let clean = !mods.control && !mods.alt && !mods.platform && !mods.function;
+        // The palette stands over the workspace and owns the keyboard the
+        // way a field does: arrows move, Enter runs, Esc leaves — anything
+        // else types into its filter.
+        if self.palette_open {
+            match key {
+                _ if key == "escape" && clean => {
+                    cx.stop_propagation();
+                    self.close_palette(cx);
                     return;
                 }
-                // Named by the spellings as they were typed — the insert when
-                // there was one, the key underneath when there was not.
-                let shown: Vec<Key> = self.pending.iter().map(|c| c[0]).collect();
-                let unknown = chord_string(&shown);
-                self.pending.clear();
-                // Said, not swallowed: a key that does nothing and a key that is
-                // not bound look identical, and only one of them is worth
-                // opening `?` about.
-                self.set_notice(format!("{unknown} is not bound"));
+                _ if key == "enter" && clean && !mods.shift => {
+                    cx.stop_propagation();
+                    self.run_palette_selection(cx);
+                    return;
+                }
+                _ if key == "up" && clean && !mods.shift => {
+                    cx.stop_propagation();
+                    self.palette_step(-1, cx);
+                    return;
+                }
+                _ if key == "down" && clean && !mods.shift => {
+                    cx.stop_propagation();
+                    self.palette_step(1, cx);
+                    return;
+                }
+                _ => return,
             }
         }
-        cx.stop_propagation();
-        cx.notify();
+        if key == "escape" && clean {
+            cx.stop_propagation();
+            self.back(cx);
+            cx.notify();
+            return;
+        }
+        if key == "enter" && clean && !mods.shift {
+            if self.commit_confirm {
+                cx.stop_propagation();
+                self.confirm_commit(cx);
+                return;
+            }
+            if self.input.is_some() {
+                cx.stop_propagation();
+                self.close_input(true, cx);
+                return;
+            }
+            return;
+        }
+        if key == "tab" && clean {
+            cx.stop_propagation();
+            self.cycle_focus(
+                match mods.shift {
+                    true => -1,
+                    false => 1,
+                },
+                window,
+                cx,
+            );
+            return;
+        }
+        // The arrows move whatever holds the keyboard through the same
+        // named verbs a click would run: the center when the diff region
+        // is up, the focused list otherwise. Every view answers the whole
+        // set — sideways in a list is a no-op, never a nag.
+        if clean && !mods.shift {
+            let verb = match key {
+                "up" => Some("view.up"),
+                "down" => Some("view.down"),
+                "pageup" => Some("view.page-up"),
+                "pagedown" => Some("view.page-down"),
+                "home" => Some("view.top"),
+                "end" => Some("view.bottom"),
+                "left" => Some("view.left"),
+                "right" => Some("view.right"),
+                _ => None,
+            };
+            if let Some(verb) = verb {
+                cx.stop_propagation();
+                self.run_command(verb, cx);
+                return;
+            }
+        }
+        // The file filter, the one single-key door the mock keeps: `/`
+        // filters the destination's own list — files in Changes, commits
+        // in History.
+        if key == "/" && clean && !mods.shift {
+            let search = match self.workspace.destination {
+                views::workspace::Destination::History => "commits.search",
+                _ => "files.search",
+            };
+            cx.stop_propagation();
+            self.run_command(search, cx);
+        }
     }
 
-    /// The pixels the smooth path feeds the list for a resolved wheel command.
+    /// The pixels the smooth path feeds the list for a fixed scroll name.
     ///
-    /// The **command** signs them, not the finger: a finger-flick away from you
-    /// is positive, but `wheelup = "view.scroll-down"` means that flick scrolls
-    /// *down* — so the resolved name flips it. `[view] scroll` multiplies. Any
-    /// other command — a page, an extension's — is `None` here and goes through
-    /// named dispatch instead; unbinding does nothing at all, exactly like a key.
+    /// The **command** signs them, not the finger: a finger-flick away from
+    /// you is positive, but `view.scroll-down` means that flick scrolls
+    /// *down* — so the name flips it. `[view] scroll` multiplies.
     fn smooth_pixels(command: &str, dy: f32, rows: usize) -> Option<f32> {
         let px = dy.abs() * rows as f32;
         match command {
@@ -5368,23 +5257,6 @@ impl DevShell {
             "view.scroll-down" => Some(-px),
             _ => None,
         }
-    }
-
-    /// The menu's pick: named dispatch over the pane the menu was opened on —
-    /// the same path the wheel's resolved name takes — and the menu gone,
-    /// because a pick is one decision and not two.
-    fn context_pick(&mut self, name: &str, cx: &mut Context<Self>) {
-        let Some(menu) = self.context.take() else {
-            return;
-        };
-        // By the pane's registration name, not a captured tenant: the same
-        // routing a prompt's result takes back to the pane it was opened
-        // over, so a tenant re-registered while the menu stood still answers.
-        let Some(screen) = self.panes.get(&menu.pane).cloned() else {
-            return;
-        };
-        self.notice = None;
-        self.run_command_from(name, Some(&screen), cx);
     }
 
     /// One wheel event, wherever it rolled.
@@ -5395,23 +5267,21 @@ impl DevShell {
     /// list's own scroll handler can turn a sideways flick into vertical
     /// movement.
     ///
-    /// What changed with command dispatch is who owns the vertical half. The
-    /// delta becomes a [`Code::WheelUp`] / [`Code::WheelDown`] and resolves
-    /// through the same map as every other press — so `wheeldown = ""` really
-    /// stops the wheel, `wheeldown = "view.page-down"` really pages, and what
-    /// ships (`view.scroll-down`) moves the list by the event's own pixels,
-    /// which is what keeps a trackpad smooth.
+    /// What changed with command dispatch is who owns the vertical half:
+    /// the wheel scrolls natively, always — no keymap is consulted, so no
+    /// binding can rebind, page, or stop it. What ships (`view.scroll-down`
+    /// semantics) moves the list by the event's own pixels, which is what
+    /// keeps a trackpad smooth.
     fn on_wheel(&mut self, ev: &ScrollWheelEvent, window: &mut Window, cx: &mut Context<Self>) {
         // A wheel notch is an intervening event wherever it lands: a chord
         // half-typed when the fingers touch the wheel is not half-typed any
         // more. The same rule the focus and host checks apply, one line each.
-        self.pending.clear();
-        // Help is up, or a project menu or a context menu: their occluding
-        // surfaces keep the rows out of the hit path, while this capture
+        // A project menu or dialog stands open: its occluding surface
+        // keeps the rows out of the hit path, while this capture
         // interceptor stands aside so a handler on the visible panel can
         // still see the event. Stopping propagation here would prevent that
         // bubble handler.
-        if self.help || self.open.is_some() || self.context.is_some() {
+        if self.open.is_some() {
             return;
         }
         // The workspace owns the whole middle, so the capture handler
@@ -5436,29 +5306,18 @@ impl DevShell {
                 }
                 if !delta.y.is_zero() {
                     let host = self.fresh_host(cx);
-                    let key = Key::new(
-                        match f32::from(delta.y) > 0.0 {
-                            true => Code::WheelUp,
-                            false => Code::WheelDown,
-                        },
-                        ev.modifiers.control,
-                        ev.modifiers.alt,
-                        false,
-                    );
-                    let modes = self.stack_for(Some(&self.main), cx);
-                    if let Resolve::Run(name) = host.keys.resolve(&modes, &[key]) {
-                        let name = name.to_string();
-                        // The view.* names land on the center through
-                        // the workspace door in `run_command_from`.
-                        match Self::smooth_pixels(&name, f32::from(delta.y), host.view.rows) {
-                            Some(px) => {
-                                moved |= center.update(cx, |v, _| v.scroll_pixels(px, &host));
-                            }
-                            _ => {
-                                self.notice = None;
-                                self.run_command_from(&name, None, cx);
-                            }
-                        }
+                    // Native scroll, always: a flick away from you scrolls
+                    // down, toward you scrolls up — the shipped
+                    // `view.scroll-*` meaning, without consulting a keymap
+                    // no finger can rebind. Cursor verbs never rode the
+                    // wheel here; only pixels did.
+                    let name = match f32::from(delta.y) > 0.0 {
+                        true => "view.scroll-down",
+                        false => "view.scroll-up",
+                    };
+                    if let Some(px) = Self::smooth_pixels(name, f32::from(delta.y), host.view.rows)
+                    {
+                        moved |= center.update(cx, |v, _| v.scroll_pixels(px, &host));
                     }
                 }
                 cx.stop_propagation();
@@ -5490,66 +5349,56 @@ impl DevShell {
         if in_sidebar {
             let mut moved = false;
             if !delta.y.is_zero() {
-                let modes = match self.panes.get("files") {
-                    Some(files) => self.stack_for(Some(files), cx),
-                    None => Modes::new(),
-                };
                 let grouped_len = match self.panes.get("files") {
                     Some(Screen::Files { view, .. }) => view.read(cx).grouped().rows.len(),
                     _ => 0,
                 };
                 let host = self.fresh_host(cx);
-                let key = Key::new(
-                    match f32::from(delta.y) > 0.0 {
-                        true => Code::WheelUp,
-                        false => Code::WheelDown,
-                    },
-                    ev.modifiers.control,
-                    ev.modifiers.alt,
-                    false,
-                );
-                if let Resolve::Run(name) = host.keys.resolve(&modes, &[key]) {
-                    let name = name.to_string();
-                    if let Some(px) = Self::smooth_pixels(&name, f32::from(delta.y), host.view.rows)
-                    {
-                        // The mirror against the rail's actual position
-                        // first: the keyboard-follow scroll moves the list
-                        // without stepping it, and stepping from a stale
-                        // top jumps.
-                        let max = grouped_len.saturating_sub(1);
-                        let mirror = self.workspace.sidebar_top.get();
-                        let top = views::workspace::reconcile_top(
-                            &self.workspace.sidebar_scroll,
-                            mirror,
-                            crate::graph::ROW_H,
-                            max,
-                        );
-                        let acc = match top == mirror {
-                            // Another path moved the list: the banked
-                            // remainder belongs to the old position, so
-                            // this flick starts fresh.
-                            true => self.workspace.sidebar_px.get() + px,
-                            false => {
-                                self.workspace.sidebar_top.set(top);
-                                px
-                            }
-                        };
-                        match views::workspace::wheel_step(top, acc, crate::graph::ROW_H, max) {
-                            Some((next, rest)) => {
-                                // Strict: the step already spent its
-                                // pixels, so the row lands on top even
-                                // when it is already visible. Non-strict
-                                // would sit still while the mirror walks
-                                // away from the window it claims to name.
-                                self.workspace
-                                    .sidebar_scroll
-                                    .scroll_to_item_strict(next, ScrollStrategy::Top);
-                                self.workspace.sidebar_top.set(next);
-                                self.workspace.sidebar_px.set(rest);
-                                moved |= next != top;
-                            }
-                            None => self.workspace.sidebar_px.set(acc),
+                // Native scroll, always — the shipped `view.scroll-*`
+                // meaning, without consulting a keymap. A glance pans the
+                // rail; cursor verbs never rode it.
+                let name = match f32::from(delta.y) > 0.0 {
+                    true => "view.scroll-down",
+                    false => "view.scroll-up",
+                };
+                if let Some(px) = Self::smooth_pixels(name, f32::from(delta.y), host.view.rows) {
+                    // The mirror against the rail's actual position
+                    // first: the keyboard-follow scroll moves the list
+                    // without stepping it, and stepping from a stale
+                    // top jumps.
+                    let max = grouped_len.saturating_sub(1);
+                    let mirror = self.workspace.sidebar_top.get();
+                    let top = views::workspace::reconcile_top(
+                        &self.workspace.sidebar_scroll,
+                        mirror,
+                        crate::graph::ROW_H,
+                        max,
+                    );
+                    let acc = match top == mirror {
+                        // Another path moved the list: the banked
+                        // remainder belongs to the old position, so
+                        // this flick starts fresh.
+                        true => self.workspace.sidebar_px.get() + px,
+                        false => {
+                            self.workspace.sidebar_top.set(top);
+                            px
                         }
+                    };
+                    match views::workspace::wheel_step(top, acc, crate::graph::ROW_H, max) {
+                        Some((next, rest)) => {
+                            // Strict: the step already spent its
+                            // pixels, so the row lands on top even
+                            // when it is already visible. Non-strict
+                            // would sit still while the mirror walks
+                            // away from the window it claims to name.
+                            self.workspace
+                                .sidebar_scroll
+                                .scroll_to_item_strict(next, ScrollStrategy::Top);
+                            self.workspace.sidebar_top.set(next);
+                            self.workspace.sidebar_px.set(rest);
+                            moved |= next != top;
+                        }
+                        None => self.workspace.sidebar_px.set(acc),
                     }
                 }
             }
@@ -6589,40 +6438,9 @@ impl Render for DevShell {
             // priority-0 backdrop blocks the rest of the window without
             // covering the menu, so capture can leave overlay wheel ownership
             // alone without exposing the native list scroller underneath.
-            .children((self.open.is_some() || self.context.is_some()).then(menu::backdrop))
-            // The context menu itself. Its rows are the keymap's — projected
-            // when it was asked, over the one pane the click landed in — and
-            // its pick dispatches the row's *name*, so no literal command
-            // name reaches this file. The transparent priority-0 backdrop
-            // above already blocks the rest of the window for it.
-            .children(self.context.as_ref().map(|menu| {
-                let me = cx.entity().downgrade();
-                menu::context_menu(
-                    &menu.rows,
-                    &host.theme,
-                    &host.font,
-                    menu.at,
-                    window.viewport_size(),
-                    {
-                        let me = me.clone();
-                        move |name: &str, _: &mut Window, cx: &mut App| {
-                            _ = me.update(cx, |this, cx| this.context_pick(name, cx));
-                        }
-                    },
-                    {
-                        move |_: &mut Window, cx: &mut App| {
-                            _ = me.update(cx, |this, cx| {
-                                this.context = None;
-                                cx.notify();
-                            });
-                        }
-                    },
-                )
-            }))
+            .children(self.open.is_some().then(menu::backdrop))
             // The project menu, off the title that opened it: the recent
-            // repositories and the `Open other…` row. Beside the context
-            // menu rather than inside it — one floats at a pointer, the
-            // other under the strip, and neither knows the other stands.
+            // repositories and the `Open other…` row.
             .children(
                 (self.open == Some(Open::Project)).then(|| self.project_menu(&host, window, cx)),
             )
@@ -6658,19 +6476,11 @@ impl Render for DevShell {
                 // unneeded spelling a key comparison and three refcounts.
                 let leading = self.status_leading(cx);
                 // An error says how to leave, where it stands: `esc` dismisses,
-                // the message key opens the full text. Live keys only — a hint
-                // naming a dead key is the one lie a panel of keys must never
-                // tell.
+                // the message key opens the full text.
                 let exits = self
                     .error
                     .as_ref()
-                    .and_then(|_| {
-                        host.keys
-                            .live_keys_for("message.show", &self.modes)
-                            .into_iter()
-                            .next()
-                    })
-                    .map(|key| SharedString::from(format!("· esc dismiss · {key} full text")));
+                    .map(|_| SharedString::from("· esc dismiss · ` full text"));
                 match message {
                     Some((text, ink)) => div()
                         .flex_none()
@@ -6719,12 +6529,12 @@ impl Render for DevShell {
                         )
                         .child(
                             div()
-                                .id("workspace-shortcuts")
+                                .id("workspace-commands")
                                 .cursor_pointer()
-                                .child("Keyboard shortcuts  ?")
-                                .on_click(
-                                    cx.listener(|this, _, _, cx| this.run_command("help", cx)),
-                                ),
+                                .child("Commands  ⌘K")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.run_command("commands.palette", cx)
+                                })),
                         )
                         .into_any_element(),
                 }
@@ -6755,16 +6565,11 @@ impl Render for DevShell {
                             .child(load),
                     )
             }))
-            // The help overlay, over everything but the settings panel and the
-            // message: deferred, so it escapes the regions' paint order;
-            // occluding, so the rows under it get neither the clicks nor the
-            // wheel. Its rows come from the same projection the terminal
-            // draws, which is why neither client can drift from the other.
-            .children(
-                self.help
-                    .then(|| help::overlay(&config::host(cx), &self.modes, &self.help_scroll)),
-            )
-            // The message overlay, over even the help: it exists because the
+            // The Commands palette over everything but the message: the
+            // same deferred, occluding centered-panel shape as the commit
+            // dialog. It lists runnable named commands, not keys.
+            .children(self.palette_open.then(|| self.render_palette(window, cx)))
+            // The message overlay, over even the palette: it exists because the
             // band's one truncated line was not the whole of git's answer, so
             // the whole of the answer is the one thing it must show.
             .children(
@@ -7484,7 +7289,6 @@ fn open_main_window(launch: Launch, cx: &mut App) {
                 search_live: None,
                 over: Overrides::default(),
                 open: None,
-                context: None,
                 error: None,
                 error_is_load: false,
                 notice: None,
@@ -7498,13 +7302,13 @@ fn open_main_window(launch: Launch, cx: &mut App) {
                 last_fetch: None,
                 last_push: None,
                 status_memo: RefCell::new(None),
-                modes: Modes::new(),
-                pending: Vec::new(),
-                help: false,
-                help_scroll: ScrollHandle::default(),
+                palette_open: false,
+                palette_sel: 0,
+                palette_field: None,
+                palette_sub: None,
+                palette_query: String::new(),
                 focus,
                 focused: None,
-                seen_host: None,
                 ongoing: Cell::default(),
                 projects: Vec::new(),
                 session_key: session_key.clone(),
@@ -7521,7 +7325,6 @@ fn open_main_window(launch: Launch, cx: &mut App) {
             {
                 let shell = shell.clone();
                 shell.update(cx, |shell, cx| {
-                    shell.sync_modes(cx);
                     shell.sync_focus(cx);
                     // The workspace is the launch destination per the
                     // interaction contract: build the center, focus the
@@ -7825,18 +7628,16 @@ fn window_options(title: SharedString) -> WindowOptions {
 #[cfg(test)]
 mod tests {
     use super::{
-        bare_launch_view, config, input, open_recent, panes, settings_window, ContextMenu,
-        DevShell, GitError, Notice, Open, Pane, Refresh, Screen, Writes,
+        bare_launch_view, config, input, open_recent, panes, settings_window, DevShell, GitError,
+        Notice, Open, Pane, Refresh, Screen, Writes,
     };
     use crate::views::commits::Commits;
     use gitten_app::cli::{Source, View};
     use gitten_app::jobs::{Event as JobEvent, Generation, Job, Runner, Submitter};
-    use gitten_core::command::{Code, Key, Keymap, Modes, Resolve};
     use gitten_core::host::Host;
     use gitten_core::status::Status;
     use gitten_core::Commit;
     use gitten_git::{Pair, Repo};
-    use gpui::ScrollHandle;
     use gpui::{AppContext as _, TestAppContext};
     use std::cell::{Cell, RefCell};
     use std::path::PathBuf;
@@ -8228,7 +8029,6 @@ mod tests {
                 search_live: None,
                 over: Default::default(),
                 open: which,
-                context: None,
                 error: None,
                 error_is_load: false,
                 notice: None,
@@ -8241,14 +8041,14 @@ mod tests {
                 last_fetch: None,
                 last_push: None,
                 status_memo: RefCell::new(None),
-                modes: Modes::new(),
                 pending_commit_key: None,
-                pending: vec![vec![Key::char('g')]],
-                help: false,
-                help_scroll: ScrollHandle::default(),
+                palette_open: false,
+                palette_sel: 0,
+                palette_field: None,
+                palette_sub: None,
+                palette_query: String::new(),
                 focus: cx.focus_handle(),
                 focused: None,
-                seen_host: None,
                 ongoing: Cell::default(),
                 projects: Vec::new(),
                 session_key: String::new(),
@@ -8260,15 +8060,13 @@ mod tests {
 
     #[gpui::test]
     fn esc_closes_any_open_menu_and_touches_nothing_else(cx: &mut TestAppContext) {
-        // The project menu, standing over the title: one `esc` closes it,
-        // drops the half-typed chord with it, and reaches no further.
+        // The project menu, standing over the title: one `esc` closes it
+        // and reaches no further.
         let shell = shell(Some(Open::Project), cx);
         shell.update(cx, |s, cx| s.back(cx));
         shell.read_with(cx, |s, _| {
             assert!(s.open.is_none(), "the menu stayed open");
-            assert!(s.pending.is_empty(), "the half-typed chord survived");
             assert_eq!(s.panes.len(), 1, "esc closed the pane too");
-            assert!(!s.help, "esc reached past the menu");
         });
     }
 
@@ -8317,75 +8115,6 @@ mod tests {
     }
 
     #[gpui::test]
-    fn a_pick_dispatches_by_name_and_closes(cx: &mut TestAppContext) {
-        // The menu's pick is the wheel's dispatch, aimed at the pane the menu
-        // was opened over — never a client-side match — and it is one decision
-        // and not two: the menu does not outlive it.
-        let (shell, repo, _handle) = files_shell(cx);
-        shell.update(cx, |s, _| {
-            s.context = Some(ContextMenu {
-                pane: "files".into(),
-                row: Some(0),
-                at: gpui::point(gpui::px(20.), gpui::px(20.)),
-                rows: Vec::new(),
-            });
-        });
-        shell.update(cx, |s, cx| s.context_pick("files.stage", cx));
-        pump_write(&shell, cx);
-        assert_eq!(
-            repo.wrote(),
-            vec!["stage notes.md"],
-            "the pick dispatched the name over the menu's own pane"
-        );
-        shell.read_with(cx, |s, _| {
-            assert!(s.context.is_none(), "a pick is one decision, not two")
-        });
-    }
-
-    #[gpui::test]
-    fn a_keypress_dismisses_the_menu_before_resolving(cx: &mut TestAppContext) {
-        // A keyboard-first app must never make a key wait for a mouse
-        // surface: any press dismisses the menu first — and the *same* press
-        // still resolves, here the files pane's stage, which queues a write.
-        let (shell, repo, _handle) = files_shell(cx);
-        shell.update(cx, |s, _| {
-            s.context = Some(ContextMenu {
-                pane: "files".into(),
-                row: Some(0),
-                at: gpui::point(gpui::px(10.), gpui::px(10.)),
-                rows: Vec::new(),
-            });
-        });
-        let window = cx.add_empty_window();
-        window.update(|window, cx| {
-            shell.update(cx, |s, cx| {
-                s.on_key(
-                    &gpui::KeyDownEvent {
-                        keystroke: gpui::Keystroke {
-                            key: "space".into(),
-                            modifiers: gpui::Modifiers::default(),
-                            key_char: Some(" ".into()),
-                        },
-                        is_held: false,
-                        prefer_character_input: false,
-                    },
-                    window,
-                    cx,
-                )
-            });
-        });
-        shell.read_with(cx, |s, _| {
-            assert!(s.context.is_none(), "the menu is gone first");
-        });
-        pump_write(&shell, cx);
-        assert_eq!(
-            repo.wrote(),
-            vec!["stage notes.md"],
-            "the press resolved behind the dismissed menu"
-        );
-    }
-
-    #[gpui::test]
     fn the_lists_learn_focus_when_it_moves_and_not_in_render(cx: &mut TestAppContext) {
         // A row's bar is accent only in the pane holding the keyboard; the
         // flag that says so is written where focus moves, so a test can read
@@ -8402,7 +8131,6 @@ mod tests {
                     "second",
                 ),
             );
-            s.sync_modes(cx);
             s.sync_focus(cx);
         });
         let first = shell.read_with(cx, |s, _| match s.panes.get("commits") {
@@ -8443,7 +8171,6 @@ mod tests {
         shell.update(cx, |s, cx| s.run_command("commits.open-diff", cx));
         shell.read_with(cx, |s, _| {
             assert_eq!(s.spot, super::Spot::Main);
-            assert_eq!(s.modes.top(), "diff", "the diff owns the keys");
         });
         shell.update(cx, |s, cx| s.back(cx));
         shell.read_with(cx, |s, _| assert_eq!(s.spot, super::Spot::List));
@@ -8455,7 +8182,6 @@ mod tests {
                 "second",
                 Screen::commits(commits, Source::Fixtures, Generation::default(), "second"),
             );
-            s.sync_modes(cx);
         });
         for _ in 0..2 {
             shell.update(cx, |s, cx| s.back(cx));
@@ -8467,7 +8193,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn pane_commands_move_focus_and_rebuild_the_effective_modes(cx: &mut TestAppContext) {
+    fn pane_commands_move_focus(cx: &mut TestAppContext) {
         let shell = shell(None, cx);
         shell.update(cx, |shell, cx| {
             let commits = cx.new(|_| Commits::new(Vec::new(), Rc::new(Host::new())));
@@ -8475,27 +8201,14 @@ mod tests {
                 "second",
                 Screen::commits(commits, Source::Fixtures, Generation::default(), "second"),
             );
-            shell.sync_modes(cx);
         });
         shell.read_with(cx, |shell, app| {
             assert_eq!(shell.active_label(app).as_ref(), "second");
-            assert_eq!(shell.modes.top(), "commits");
         });
 
         shell.update(cx, |shell, cx| shell.run_command("pane.prev", cx));
         shell.read_with(cx, |shell, app| {
             assert_eq!(shell.active_label(app).as_ref(), "repo");
-            assert_eq!(shell.modes.as_slice(), &["global", panes::MODE, "commits"]);
-            let mut keys = Keymap::builtin();
-            keys.bind("commits", "ctrl-j", "view.down").unwrap();
-            assert_eq!(
-                keys.resolve(
-                    &shell.modes,
-                    &[Key::new(Code::Char('j'), true, false, false)]
-                ),
-                Resolve::Run("view.down"),
-                "the focused tenant did not override the pane container"
-            );
         });
 
         shell.update(cx, |shell, cx| shell.run_command("pane.next", cx));
@@ -8785,26 +8498,24 @@ mod tests {
             );
             // Registration focuses what it adds; a launch starts on the root.
             shell.panes.focus(0);
-            shell.sync_modes(cx);
         });
         shell.read_with(cx, |shell, _| {
             assert_eq!(shell.active_view_name(), "commits")
         });
 
-        // Named dispatch — the same path the `2` key resolves through. It
+        // Named dispatch — the same path Commands and menus run. It
         // swaps the list into the column and takes the keyboard with it.
         shell.update(cx, |shell, cx| shell.run_command("files.focus", cx));
         shell.read_with(cx, |shell, app| {
             assert_eq!(shell.panes.focused_name(), "files");
-            assert_eq!(shell.modes.top(), "files");
             assert_eq!(
                 shell.active_label(app).as_ref(),
                 "gitten (main) · 0 changed"
             );
         });
 
-        // And with no such resident — a fixture has no working tree — the key
-        // is answered with a sentence, not silence.
+        // And with no such resident — a fixture has no working tree — the
+        // command is answered with a sentence, not silence.
         bare.update(cx, |shell, cx| shell.run_command("files.focus", cx));
         bare.read_with(cx, |shell, _| {
             assert!(shell.notice.is_some(), "a missing pane went unsaid");
@@ -8812,14 +8523,10 @@ mod tests {
     }
 
     #[gpui::test]
-    fn native_input_owns_the_innermost_mode_until_it_closes(cx: &mut TestAppContext) {
+    fn native_input_owns_the_keyboard_until_it_closes(cx: &mut TestAppContext) {
         let shell = shell(None, cx);
         let input = cx.new(|cx| input::Input::new("message", "type", "draft", cx));
         shell.update(cx, |shell, cx| shell.open_input(input.clone(), cx));
-        assert_eq!(
-            shell.read_with(cx, |shell, _| shell.modes.top().to_string()),
-            input::MODE
-        );
         shell.update(cx, |shell, cx| shell.run_command("select.all", cx));
         assert_eq!(
             input.read_with(cx, |input, _| input.selected_text()),
@@ -8829,7 +8536,6 @@ mod tests {
         shell.update(cx, |shell, cx| shell.run_command("input.cancel", cx));
         shell.read_with(cx, |shell, _| {
             assert!(shell.input.is_none());
-            assert_eq!(shell.modes.top(), "commits");
         });
     }
 
@@ -8873,7 +8579,6 @@ mod tests {
                 "commits",
                 Screen::commits(view, Source::Fixtures, Generation::default(), "~/src"),
             );
-            shell.sync_modes(cx);
             shell.repo = Some((PathBuf::from("/recorded"), handle));
         });
         (shell, repo)
@@ -8893,7 +8598,6 @@ mod tests {
                 "commits",
                 Screen::commits(view, Source::Fixtures, Generation::default(), "~/src"),
             );
-            shell.sync_modes(cx);
         });
         shell
     }
@@ -8925,7 +8629,6 @@ mod tests {
         type_query(&shell, cx, "engine");
 
         shell.read_with(cx, |shell, _| {
-            assert_eq!(shell.modes.top(), input::MODE, "the field owns the keys");
             assert!(
                 matches!(shell.prompt, Some(super::Prompt::Search { .. })),
                 "{:?}",
@@ -8942,7 +8645,6 @@ mod tests {
         shell.update(cx, |shell, cx| shell.run_command("input.accept", cx));
         shell.read_with(cx, |shell, app| {
             assert!(shell.input.is_none());
-            assert_eq!(shell.modes.top(), "commits");
             assert_eq!(shell.active_label(app).as_ref(), "~/src · 15/30");
         });
         view.read_with(cx, |v, _| {
@@ -9120,7 +8822,6 @@ diff --git a/one.txt b/one.txt
                 "files",
                 Screen::files(files, Generation::default(), "files"),
             );
-            shell.sync_modes(cx);
         });
         shell.update(cx, |shell, cx| shell.run_command("view.bottom", cx));
 
@@ -9182,7 +8883,7 @@ diff --git a/one.txt b/one.txt
     }
 
     #[gpui::test]
-    fn keys_follow_the_region_the_list_moves_lists_and_j_scrolls_the_diff(cx: &mut TestAppContext) {
+    fn commands_follow_the_region_the_list_moves_lists_then_the_diff(cx: &mut TestAppContext) {
         let shell = commits_shell(cx);
         // The workspace owns key routing: entering builds the center, and
         // History hands the keyboard to the commits timeline. `view.down`
@@ -9208,7 +8909,6 @@ diff --git a/one.txt b/one.txt
         shell.update(cx, |shell, cx| shell.run_command("commits.open-diff", cx));
         shell.read_with(cx, |shell, _| {
             assert_eq!(shell.spot, super::Spot::Main);
-            assert_eq!(shell.modes.top(), "diff");
         });
 
         // ...and now `j` scrolls the center, leaving the list where it was.
@@ -9847,7 +9547,6 @@ diff --git a/one.txt b/one.txt
                 "files",
                 Screen::files(files, Generation::default(), "files"),
             );
-            shell.sync_modes(cx);
             shell.repo = Some((PathBuf::from("/recorded"), handle.clone()));
             cx.set_global(config::Active(Rc::new(Host::new())));
         });
@@ -9910,7 +9609,6 @@ diff --git a/one.txt b/one.txt
                 "stashes",
                 Screen::stashes(view, Generation::default(), "r · 2 parked"),
             );
-            shell.sync_modes(cx);
             shell.repo = Some((PathBuf::from("/recorded"), handle));
             cx.set_global(config::Active(Rc::new(Host::new())));
         });
@@ -9965,7 +9663,6 @@ diff --git a/one.txt b/one.txt
                 "diff",
             );
             shell.set_spot(super::Spot::Main, cx);
-            shell.sync_modes(cx);
             shell.repo = Some((PathBuf::from("/recorded"), handle));
             cx.set_global(config::Active(Rc::new(Host::new())));
         });
@@ -10030,7 +9727,6 @@ diff --git a/fresh.txt b/fresh.txt
                 "diff",
             );
             shell.set_spot(super::Spot::Main, cx);
-            shell.sync_modes(cx);
             shell.repo = Some((PathBuf::from("/recorded"), handle));
             cx.set_global(config::Active(Rc::new(Host::new())));
         });
@@ -10298,19 +9994,17 @@ diff --git a/fresh.txt b/fresh.txt
         let (shell, _repo) = stashes_shell(cx);
         // Registration left the keyboard on the stack; named dispatch gets
         // back there from anywhere.
-        shell.update(cx, |shell, cx| {
+        shell.update(cx, |shell, _cx| {
             shell.panes.focus(0);
-            shell.sync_modes(cx);
         });
         shell.update(cx, |shell, cx| shell.run_command("stashes.focus", cx));
         shell.read_with(cx, |shell, app| {
             assert_eq!(shell.panes.focused_name(), "stashes");
-            assert_eq!(shell.modes.top(), "stashes");
             assert_eq!(shell.active_label(app).as_ref(), "r · 2 parked");
         });
 
-        // And with no such resident — a fixture has no stash stack — the key
-        // is answered with a sentence, not silence.
+        // And with no such resident — a fixture has no stash stack — the
+        // command is answered with a sentence, not silence.
         bare.update(cx, |shell, cx| shell.run_command("stashes.focus", cx));
         bare.read_with(cx, |shell, _| {
             assert!(shell.notice.is_some(), "a missing pane went unsaid");
@@ -10324,11 +10018,6 @@ diff --git a/fresh.txt b/fresh.txt
         shell.update(cx, |shell, cx| shell.run_command("files.commit", cx));
         shell.read_with(cx, |shell, _| {
             assert!(shell.input.is_some(), "no field opened");
-            assert_eq!(
-                shell.modes.top(),
-                input::MODE,
-                "the field did not own the keyboard"
-            );
         });
 
         // Typed text, as the platform would have left it; the rest of this
@@ -10663,7 +10352,6 @@ diff --git a/fresh.txt b/fresh.txt
                 "files",
                 Screen::files(files, Generation::default(), "files"),
             );
-            shell.sync_modes(cx);
         });
         shell.update(cx, |shell, cx| shell.run_command("files.stage", cx));
         shell.read_with(cx, |shell, _| {
@@ -11071,7 +10759,7 @@ diff --git a/added.txt b/added.txt
                     .notice
                     .as_deref()
                     .unwrap_or_default()
-                    .contains("reset to abc000? s soft"),
+                    .contains("reset to abc000? Commands"),
                 "the question went unsaid: {:?}",
                 shell.notice
             );
@@ -11080,15 +10768,15 @@ diff --git a/added.txt b/added.txt
         pump_write(&shell, cx);
         assert_eq!(repo.wrote(), vec![format!("reset --soft {target}")]);
 
-        // The answer spent the question: the mode is gone, so `m` outside a
-        // standing question reaches nothing — `g` must open again first.
+        // The answer spent the question, so a strength outside a
+        // standing question reaches nothing — the menu must open again first.
         shell.update(cx, |shell, cx| shell.run_command("commits.reset-mixed", cx));
         std::thread::sleep(Duration::from_millis(50));
         shell.read_with(cx, |shell, _| {
-            assert_eq!(repo.wrote().len(), 1, "no strength fires without its g");
-            // And the orphaned letter does not execute and does not ask:
-            // the asking is `g`'s, and a letter that opened a question by
-            // itself would be two presses deciding a hard reset.
+            assert_eq!(repo.wrote().len(), 1, "no strength fires without its menu");
+            // And the orphaned answer does not execute and does not ask:
+            // the asking is the menu's, and an answer that opened a question
+            // by itself would be two presses deciding a hard reset.
             assert!(
                 shell
                     .notice
@@ -11108,7 +10796,7 @@ diff --git a/added.txt b/added.txt
                 format!("reset --soft {target}"),
                 format!("reset --mixed {target}")
             ],
-            "the second press of each strength is the yes"
+            "the second command of each strength is the yes"
         );
     }
 
@@ -11132,7 +10820,7 @@ diff --git a/added.txt b/added.txt
                     .notice
                     .as_deref()
                     .unwrap_or_default()
-                    .contains("reset to abc000? s soft · m mixed · h hard"),
+                    .contains("reset to abc000? Commands: soft · mixed · hard"),
                 "the question went unsaid: {:?}",
                 shell.notice
             );
@@ -11141,9 +10829,10 @@ diff --git a/added.txt b/added.txt
             assert_eq!(v.armed_sha(), Some("0".repeat(40)));
         });
 
-        // `h` answers it — and the whole production path runs: job queued by
-        // dispatch, drained by the same pump the window runs, generation
-        // bumped, panes re-acquired. The asking was g; the letter is the yes.
+        // The answering command runs the whole production path: job queued
+        // by dispatch, drained by the same pump the window runs, generation
+        // bumped, panes re-acquired. The asking was the menu; the answer is
+        // the yes.
         shell.update(cx, |shell, cx| shell.run_command("commits.reset-hard", cx));
         pump_write(&shell, cx);
         assert_eq!(
@@ -11236,7 +10925,6 @@ diff --git a/added.txt b/added.txt
                 "commits",
                 Screen::commits(view, Source::Fixtures, Generation::default(), "~/src"),
             );
-            shell.sync_modes(cx);
             shell.repo = Some((PathBuf::from("/recorded"), handle));
         });
         (shell, repo)
@@ -11329,7 +11017,6 @@ diff --git a/added.txt b/added.txt
                 "commits",
                 Screen::commits(view, Source::Fixtures, Generation::default(), "~/src"),
             );
-            shell.sync_modes(cx);
             shell.repo = Some((PathBuf::from("/recorded"), handle));
         });
 
@@ -11386,7 +11073,6 @@ diff --git a/added.txt b/added.txt
                 "branches",
                 Screen::branches(view, Generation::default(), label),
             );
-            shell.sync_modes(cx);
             shell.repo = Some((PathBuf::from("/recorded"), handle));
         });
         (shell, repo)
@@ -11515,7 +11201,6 @@ diff --git a/added.txt b/added.txt
         shell.update(cx, |shell, cx| shell.run_command("commits.new-tag", cx));
         shell.read_with(cx, |shell, _| {
             assert!(shell.input.is_some(), "no field opened");
-            assert_eq!(shell.modes.top(), input::MODE, "the field owns the keys");
             assert!(matches!(shell.prompt, Some(super::Prompt::TagName { .. })));
         });
 
@@ -11601,7 +11286,6 @@ diff --git a/added.txt b/added.txt
                 "commits",
                 Screen::commits(commits, Source::Fixtures, Generation::default(), "~/src"),
             );
-            shell.sync_modes(cx);
             shell.repo = Some((PathBuf::from("/recorded"), handle));
             files
         });
@@ -11660,7 +11344,6 @@ diff --git a/added.txt b/added.txt
                 "commits",
                 Screen::commits(commits, Source::Fixtures, Generation::default(), "~/src"),
             );
-            shell.sync_modes(cx);
             shell.repo = Some((PathBuf::from("/recorded"), handle));
             files
         });
@@ -11774,7 +11457,6 @@ diff --git a/added.txt b/added.txt
         shell.update(cx, |shell, cx| shell.run_command("files.amend", cx));
         shell.read_with(cx, |shell, _| {
             assert!(shell.input.is_some(), "no field opened");
-            assert_eq!(shell.modes.top(), input::MODE, "the field owns the keys");
         });
 
         // Typed text, as the platform would have left it; the real accept
@@ -11849,7 +11531,6 @@ diff --git a/added.txt b/added.txt
                 "branches",
                 Screen::branches(view, Generation::default(), "r · 2 local · 1 remote"),
             );
-            shell.sync_modes(cx);
             shell.repo = Some((PathBuf::from("/recorded"), handle.clone()));
             cx.set_global(config::Active(Rc::new(Host::new())));
         });
@@ -12212,7 +11893,6 @@ diff --git a/added.txt b/added.txt
                 "branches",
                 Screen::branches(view, Generation::default(), "branches"),
             );
-            shell.sync_modes(cx);
             shell.repo = Some((PathBuf::from("/recorded"), handle.clone()));
             cx.set_global(config::Active(Rc::new(Host::new())));
         });
@@ -12301,11 +11981,10 @@ diff --git a/added.txt b/added.txt
             assert_ne!(shell.active_view_name(), "branches");
         });
 
-        // Named dispatch — the same path the `3` key resolves through.
+        // Named dispatch — the same path Commands and menus run.
         shell.update(cx, |shell, cx| shell.run_command("branches.focus", cx));
         shell.read_with(cx, |shell, app| {
             assert_eq!(shell.panes.focused_index(), 1);
-            assert_eq!(shell.modes.top(), "branches");
             assert_eq!(
                 shell.active_label(app).as_ref(),
                 "r · 2 local · 1 remote",
