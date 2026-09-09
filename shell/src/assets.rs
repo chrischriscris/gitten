@@ -39,6 +39,7 @@ impl AssetSource for Assets {
             "gitten/search.svg" => icon!("search"),
             "gitten/file.svg" => icon!("file"),
             "gitten/chevron.svg" => icon!("chevron"),
+            "gitten/palette.svg" => icon!("palette"),
             _ => return gpui_component_assets::Assets.load(path),
         };
         Ok(Some(bytes))
@@ -66,6 +67,7 @@ mod tests {
             ("gitten/search.svg", b"circle".as_slice()),
             ("gitten/file.svg", b"path".as_slice()),
             ("gitten/chevron.svg", b"path".as_slice()),
+            ("gitten/palette.svg", b"circle".as_slice()),
         ] {
             let bytes = Assets.load(path).expect("loads").expect("present");
             assert!(

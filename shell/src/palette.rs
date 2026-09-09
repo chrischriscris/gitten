@@ -37,10 +37,10 @@ impl crate::DevShell {
     /// per open would drop the subscription that mirrors its text.
     pub(crate) fn open_palette(&mut self, cx: &mut Context<Self>) {
         if self.palette_field.is_none() {
-            let field = cx.new(|cx| input::Input::new("commands", "Type a command…", "", cx));
-            field.update(cx, |field, _| {
-                field.set_exits(Some("enter".into()), Some("esc".into()))
-            });
+            let field = cx.new(|cx| input::Input::new("", "Search commands…", "", cx));
+            // Embedded: the reference's rounded search box. The footer names
+            // the keys, so the field draws no exits of its own.
+            field.update(cx, |field, _| field.set_embedded());
             let sub = cx.subscribe(&field, |this: &mut Self, _, event, cx| {
                 if let input::Event::Edited(text) = event {
                     this.palette_query = text.clone();
@@ -118,18 +118,24 @@ impl crate::DevShell {
         let visible: Vec<_> = rows.iter().take(VISIBLE_ROWS).collect();
         let sel = self.palette_sel.min(visible.len().saturating_sub(1));
         let me = cx.entity().downgrade();
+        let close = modal::close_button(&host, "palette-close")
+            .on_click({
+                let me = me.clone();
+                move |_, _, cx| {
+                    _ = me.update(cx, |this, cx| this.close_palette(cx));
+                }
+            })
+            .into_any_element();
         modal::centered(
             &host,
             modal::Width::Exact(560.0),
             vec![
-                div()
-                    .text_color(rgb(c.dim))
-                    .child("Commands")
-                    .into_any_element(),
+                modal::heading(&host, "Commands", Some(close)).into_any_element(),
                 self.palette_field
                     .clone()
                     .map(|f| f.into_any_element())
                     .unwrap_or_else(|| div().into_any_element()),
+                div().h(px(10.0)).flex_none().into_any_element(),
                 div()
                     .flex()
                     .flex_col()
@@ -141,11 +147,12 @@ impl crate::DevShell {
                             .flex()
                             .items_start()
                             .gap_2()
+                            .py(px(10.0))
                             .px_2()
-                            .rounded(px(crate::chrome::RADIUS))
+                            .rounded(px(5.0))
                             .bg(rgb(match i == sel {
                                 true => c.selection_bg,
-                                false => c.title_bg,
+                                false => c.bg,
                             }))
                             .cursor_pointer()
                             .child(
@@ -172,10 +179,7 @@ impl crate::DevShell {
                             })
                     }))
                     .into_any_element(),
-                div()
-                    .text_color(rgb(c.faint))
-                    .child("type to filter · ↑↓ move · enter runs · esc leaves")
-                    .into_any_element(),
+                modal::hint(&host, "type to filter · ↑↓ move · enter runs · esc leaves"),
             ],
         )
     }

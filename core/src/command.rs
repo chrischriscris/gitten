@@ -329,6 +329,9 @@ impl Keymap {
         // Global and not diff-only: a palette is the whole window's, and the
         // commit graph is drawn out of the same one. Shifted, because cycling a
         // theme is a thing done twice a month and `t` is worth more than that.
+        // `theme.picker` is registered beside it for a client with a picker —
+        // the desktop lists it in Commands and opens it from the title strip —
+        // but the shared binding stays the cycle, which every client answers.
         bind(GLOBAL, "T", "theme.cycle");
         // The command palette, global because it lists the whole window's
         // commands. Control, because the platform modifier owns its keys and
@@ -1588,6 +1591,11 @@ impl Commands {
                 Some("move"),
             ),
             ("patch.clear", "empty the patch clipboard", Some("clear patch")),
+            (
+                "theme.picker",
+                "choose a theme from every registered palette",
+                Some("themes"),
+            ),
             ("theme.cycle", "the next theme", None),
             (
                 "commits.open-diff",

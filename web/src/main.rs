@@ -1,7 +1,8 @@
-//! `gitten-web` — acquire in the terminal, read in a browser.
+//! `gitten-web` — acquire in the terminal, read over loopback.
 //!
 //! The arguments are every other client's, because they come from the same
-//! place: see `gitten_app::cli`. What this adds is `--port`.
+//! place: see `gitten_app::cli`. What this adds is `--port`. There is no page;
+//! the routes are the agent's door, documented in `docs/agent-web.md`.
 
 use gitten_app::acquire::Data as Loaded;
 use gitten_app::cli::{self, View};
@@ -16,7 +17,7 @@ use std::sync::Mutex;
 const EXTRA: &str = "  --port N       listen on N instead of 7423
 
   Acquisition, the differ, the intraline pass, the highlighter and the wrap all
-  run here, in this process, on this machine. The browser draws.
+  run here, in this process, on this machine. The routes answer with rows.
 ";
 
 /// Not 8080: a port collision with whatever else is being developed is a
@@ -25,7 +26,7 @@ const DEFAULT_PORT: u16 = 7423;
 
 fn main() {
     let mut start = Startup::new("gitten-web", View::Diff)
-        .blurb("gitten in a browser tab, served from this terminal")
+        .blurb("gitten's state over loopback, served from this terminal")
         .extra(EXTRA);
 
     // Taken before the shared parse sees it, so `--port` may appear anywhere on
@@ -46,7 +47,7 @@ fn main() {
     let which = started.view;
     let label = started.loaded.label.clone();
 
-    // One `prepare` pass, the same call every other client makes. The browser
+    // One `prepare` pass, the same call every other client makes. A client
     // gets its output and redoes none of it.
     let data = match started.loaded.data {
         Loaded::Diff(files) => Data::Diff(Mutex::new(Doc::build(prepare(
@@ -65,9 +66,8 @@ fn main() {
     // type with a promise nothing keeps.
     let state = Rc::new(State::new(label.clone(), started.host, data));
 
-    // Printed, never opened. A browser window appearing on its own interrupts
-    // whoever is at the keyboard — the same reason `./dev` is a rebuild and not
-    // a launch.
+    // Printed, never opened. Printing a URL is not launching anything — the
+    // same reason `./dev` is a rebuild and not a launch.
     //
     // **The URL is the last thing printed**, and that is not a layout
     // preference. A terminal that turns URLs into links takes everything up to
@@ -79,7 +79,7 @@ fn main() {
         false => "",
     };
     println!("gitten · {} · {label}{build}", which.name());
-    println!("  http://127.0.0.1:{port}/");
+    println!("  http://127.0.0.1:{port}/api/meta?cols=0");
 
     let serving = state.clone();
     if let Err(e) = http::serve(port, move |req| serving.route(req)) {

@@ -4,11 +4,11 @@
 //! [`cli::parse`](crate::cli::parse) and a view. It uses the host's own
 //! `Differs`, which is the point: *which algorithm ran* is a configured choice
 //! and this is the one place it is made, so `[diff] algorithm` in `gitten.toml`
-//! means the same thing in a window, a browser and a terminal.
+//! means the same thing in a window, a terminal and an agent's command line.
 //!
 //! It returns **`Vec<FileDiff>`, not prepared rows.** Every client wants
 //! something different one stage later — the shell keeps the parsed diff so a
-//! layout change can rebuild, the browser prepares immediately and holds a
+//! layout change can rebuild, the web API prepares immediately and holds a
 //! window of rows, the terminal does both — and `prepare` is one call away in
 //! `core`. Stopping here is what keeps this from being a fourth opinion about
 //! what a client needs.

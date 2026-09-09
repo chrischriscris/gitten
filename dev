@@ -3,7 +3,7 @@
 #
 #   ./dev                            what this says
 #   ./dev tui       diff . HEAD~2..HEAD
-#   ./dev desktop   commits
+#   ./dev gui       commits
 #   ./dev web       diff --fixtures
 #   ./dev dump      commits ~/Projects/git 600     one frame, no takeover
 #   ./dev check                                    everything headless
@@ -29,7 +29,7 @@
 # It lives in `[profile.release]` in Cargo.toml, so `bundle` and ./export share
 # the same artifacts instead of dirtying them by dropping the flag.
 #
-# `desktop` and `web` rebuild and relaunch on every save. `tui` does not, and
+# `gui` and `web` rebuild and relaunch on every save. `tui` does not, and
 # cannot: it owns the terminal's stdin, so it cannot be backgrounded for a
 # watcher to sit in front of. Quit it with `q` and press up-enter — the rebuild
 # is the same 2.5 s either way. `./dev dump` is the watchable one, because a
@@ -70,7 +70,7 @@ usage() {
 # Everything a client is built out of. `find -newer` walks these, so keep it to
 # source: a new crate that is not here will not trigger a rebuild, and that is
 # the failure mode to remember.
-WATCH=(core/src core/examples git/src app/src shell/src tui/src web/src web/ui)
+WATCH=(core/src core/examples git/src app/src shell/src tui/src web/src)
 
 build() { # build <crate>
   local crate=$1 log
@@ -155,11 +155,11 @@ watch_run() { # watch_run <crate> <binary> [args...]
 }
 
 case "$WHAT" in
-  desktop|shell|gui)
+  gui)
     watch_run gitten-shell "target/$PROFILE/gitten-shell" "$@"
     ;;
 
-  web|browser)
+  web|api)
     watch_run gitten-web "target/$PROFILE/gitten-web" "$@"
     ;;
 

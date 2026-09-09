@@ -26,10 +26,11 @@ the extension host, command dispatch, the mode stack. If a keystroke can trigger
 a command, `cli/` and an extension must reach it through the same path. One
 implementation, three doors.
 
-The doors are real now — a GPUI window, a terminal and a browser — and they are
-the cheap check on this. Anything two of them need is a bug until it is in
-`core`: the row flattening, the order table, the token-versus-span merge and the
-graph's branch colours were each written twice before they were written once.
+The doors are real now — a GPUI window, a terminal and a loopback agent API —
+and they are the cheap check on this. Anything two of them need is a bug until
+it is in `core`: the row flattening, the order table, the token-versus-span merge
+and the graph's branch colours were each written twice before they were written
+once.
 
 **A client is drawing and input, and nothing else.** Everything before it is
 shared: `gitten-git` acquires, `gitten-app` holds `gitten.toml` and the command line,
@@ -37,8 +38,8 @@ shared: `gitten-git` acquires, `gitten-app` holds `gitten.toml` and the command 
 client nobody else will write — which is why the config parser living behind GPUI
 was a bug and not a layout choice.
 
-**The desktop app is the product.** A terminal client is planned and comes later;
-the browser one is a proof and not a plan. **A feature asked for without a client
+**The desktop app is the product.** A terminal client comes after it; the loopback
+agent API is a door and not a plan. **A feature asked for without a client
 named means the GPUI window** — build it there, and stop.
 
 That is not in tension with the paragraph above; it is the reason for it. The
@@ -267,9 +268,9 @@ table — so a `Wrap` decides where a line breaks and nothing else.
 ```sh
 ./dev                               what it does, and the rest of the flags
 ./dev tui     diff . HEAD~2..HEAD   the terminal
-./dev desktop commits               the window: rebuild + relaunch on save,
+./dev gui     commits               the window: rebuild + relaunch on save,
                                     landing back on the same row
-./dev web     diff --fixtures       a browser tab; prints a URL, opens nothing
+./dev web     diff --fixtures       the agent API; prints a URL, opens nothing
 ./dev dump    commits ~/src 600     one frame on stdout, timing on stderr.
                                     COLS, ROWS, LAYOUT, WRAP, THEME, AT, FRAMES
 ./dev check                         everything headless
@@ -285,7 +286,7 @@ iterate in. **The frame timings are meaningless in a debug build** — a differe
 much slower binary, and both clients say so. What is still worth watching is the
 row counts, the cell counts and the load breakdown.
 
-`desktop` and `web` relaunch on every save; `tui` cannot, because it owns the
+`gui` and `web` relaunch on every save; `tui` cannot, because it owns the
 terminal's stdin and there is nothing to put in front of it. Quit with `q` and
 press up-enter. `./dev dump` is the watchable one.
 

@@ -569,7 +569,12 @@ fn apply_theme(host: &mut Host, value: &toml::Value, warn: &mut Vec<String>) {
                         host.themes.names().join(", ")
                     ));
                 }
+                // A palette defined here has no house label, so the picker
+                // reads the name it was given rather than the one it was
+                // built on top of.
                 host.theme.name = name.to_string();
+                host.theme.label = name.to_string();
+                host.theme.family.clear();
             }
             None => warn.push("config: theme.name must be a string".into()),
         }
@@ -579,6 +584,16 @@ fn apply_theme(host: &mut Host, value: &toml::Value, warn: &mut Vec<String>) {
         match key.as_str() {
             // Read above, before anything it is the base for.
             "name" => {}
+            // Display metadata, and the only strings in this table: a picker
+            // reads them, and a palette renamed here keeps its own words.
+            "label" => match v.as_str() {
+                Some(s) => theme.label = s.to_string(),
+                None => warn.push("config: theme.label must be a string".into()),
+            },
+            "family" => match v.as_str() {
+                Some(s) => theme.family = s.to_string(),
+                None => warn.push("config: theme.family must be a string".into()),
+            },
             "min_contrast" => match number(v) {
                 // 1.0 is "no floor at all", 21.0 is black on white. Outside that
                 // the contrast resolver has nothing to aim at.
@@ -810,6 +825,8 @@ pub fn dump(host: &Host) -> String {
         t.name,
         host.themes.names().join(", ")
     ));
+    out.push_str(&format!("label = {:?}\n", t.label));
+    out.push_str(&format!("family = {:?}\n", t.family));
     out.push_str(&format!("min_contrast = {:?}\n", t.min_contrast));
     out.push_str(&format!("min_furniture = {:?}\n", t.min_furniture));
     out.push_str(&format!("lanes = [{}]\n", hex_list(&t.lanes)));
@@ -1317,27 +1334,22 @@ mod tests {
 
     #[test]
     fn a_theme_written_in_the_file_is_registered_under_its_name() {
-        // Which is what puts it in the picker beside the shipped eight: the
+        // Which is what puts it in the picker beside the shipped set: the
         // frontend lists a registry, so a palette somebody wrote by hand has to
         // be *in* one to be reachable at all.
         let mut h = host();
         let text = "[theme]\nname = \"solarized-ish\"\n\n[theme.diff]\nadded_bg = \"#073642\"\n";
         let warn = apply(&mut h, text);
         assert!(warn.is_empty(), "{warn:?}");
-        assert_eq!(
-            h.themes.names(),
-            vec![
-                "dark",
-                "light",
-                "slate",
-                "gruvbox",
-                "catppuccin",
-                "tokyo-night",
-                "rose-pine",
-                "guide",
-                "solarized-ish"
-            ]
-        );
+        let builtin = gitten_core::theme::Themes::builtin();
+        let mut expected = builtin.names();
+        expected.push("solarized-ish");
+        assert_eq!(h.themes.names(), expected);
+        // A hand-written palette has no house label; the picker reads the
+        // name rather than the theme it was built on top of.
+        let mine = h.themes.get("solarized-ish").unwrap();
+        assert_eq!(mine.label, "solarized-ish");
+        assert!(mine.family.is_empty());
         assert_eq!(
             h.themes.get("solarized-ish").map(|t| t.diff.added_bg),
             Some(0x073642)
@@ -1357,17 +1369,8 @@ mod tests {
         assert!(warn.is_empty(), "{warn:?}");
         assert_eq!(
             h.themes.names(),
-            vec![
-                "dark",
-                "light",
-                "slate",
-                "gruvbox",
-                "catppuccin",
-                "tokyo-night",
-                "rose-pine",
-                "guide"
-            ],
-            "a ninth entry appeared"
+            gitten_core::theme::Themes::builtin().names(),
+            "correcting a built-in added an entry"
         );
         assert_eq!(
             h.themes.get("slate").map(|t| t.chrome.accent),

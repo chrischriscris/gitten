@@ -11,6 +11,7 @@ mod session;
 mod settings;
 mod settings_window;
 mod stats;
+mod theme_picker;
 mod views;
 
 use gitten_app::acquire::{Data, Loaded};
@@ -200,10 +201,10 @@ const EXTRA: &str = "  `,` opens the settings: the presentation (unified, side-b
   where a line too wide for the window breaks (off, word, char), the diff
   algorithm (histogram, patience, myers), how much whitespace has to match
   (exact, trailing, change, all — git's default, --ignore-space-at-eol, -b and
-  -w), the theme (dark, light, slate, and whatever gitten.toml adds), and the
-  rest of the live knobs. Changes apply now and save to gitten.toml. `s`
-  cycles the presentation, `w` the wrap and `T` the theme — all three through
-  `[keys]` in gitten.toml, where `?` lists everything.
+  -w), the theme (the gitten set, the guide-v2 set, and whatever gitten.toml
+  adds), and the rest of the live knobs. Changes apply now and save to
+  gitten.toml. `s` cycles the presentation, `w` the wrap and `T` the theme —
+  all three through `[keys]` in gitten.toml, where `?` lists everything.
 
   The repository title is itself a control: clicking it (or `o`) opens the
   recent repositories to switch between in place, and `O` takes a path
@@ -1313,6 +1314,15 @@ struct DevShell {
     palette_field: Option<Entity<input::Input>>,
     palette_sub: Option<Subscription>,
     palette_query: String,
+    /// The theme picker: the same shape as the palette — an open flag, a
+    /// selection into the filtered cards, and a filter field built once — but
+    /// it stays open across a pick so several palettes can be tried against
+    /// the diff behind the scrim. See [`theme_picker`].
+    theme_picker_open: bool,
+    theme_picker_sel: usize,
+    theme_picker_field: Option<Entity<input::Input>>,
+    theme_picker_sub: Option<Subscription>,
+    theme_picker_query: String,
     /// The window's one focusable element: this shell itself. Key events reach a
     /// listener through the focus path, so something has to hold focus, and one
     /// handle owned here means the views never have to know input exists.
@@ -4130,6 +4140,7 @@ impl DevShell {
                 settings_window::open(cx.entity(), cx);
             }
             "back" => self.back(cx),
+            "theme.picker" => self.open_theme_picker(cx),
             "theme.cycle" => self.cycle_theme(cx),
             "input.accept" => self.close_input(true, cx),
             "input.cancel" => self.close_input(false, cx),
@@ -4321,6 +4332,10 @@ impl DevShell {
     /// lighter. A selection is inside a list, so it goes after the region
     /// switch; the diff's own selection stays until its rows are replaced.
     fn back(&mut self, cx: &mut Context<Self>) {
+        if self.theme_picker_open {
+            self.close_theme_picker(cx);
+            return;
+        }
         if self.palette_open {
             self.close_palette(cx);
             return;
@@ -5228,6 +5243,35 @@ impl DevShell {
         let key = ev.keystroke.key.as_str();
         let mods = &ev.keystroke.modifiers;
         let clean = !mods.control && !mods.alt && !mods.platform && !mods.function;
+        // The theme picker stands over the workspace on the palette's terms —
+        // arrows move, Enter applies and stays, Esc leaves — but a pick does
+        // not close it, so the arrows and Enter can be pressed again on the
+        // next candidate.
+        if self.theme_picker_open {
+            match key {
+                _ if key == "escape" && clean => {
+                    cx.stop_propagation();
+                    self.close_theme_picker(cx);
+                    return;
+                }
+                _ if key == "enter" && clean && !mods.shift => {
+                    cx.stop_propagation();
+                    self.run_theme_picker_selection(cx);
+                    return;
+                }
+                _ if key == "up" && clean && !mods.shift => {
+                    cx.stop_propagation();
+                    self.theme_picker_step(-1, cx);
+                    return;
+                }
+                _ if key == "down" && clean && !mods.shift => {
+                    cx.stop_propagation();
+                    self.theme_picker_step(1, cx);
+                    return;
+                }
+                _ => return,
+            }
+        }
         // The palette stands over the workspace and owns the keyboard the
         // way a field does: arrows move, Enter runs, Esc leaves — anything
         // else types into its filter.
@@ -6048,6 +6092,7 @@ impl DevShell {
             let dim = rgb(host.theme.dim_on(theme::Surface::Context));
             let weak = cx.entity().downgrade();
             let cancel = weak.clone();
+            let close = weak.clone();
             let button = |id: &'static str, label: &'static str, lit: bool| {
                 div()
                     .id(id)
@@ -6070,6 +6115,7 @@ impl DevShell {
                     .child(label)
             };
             let mut message: Vec<AnyElement> = vec![div()
+                .text_size(px(13.0))
                 .text_color(rgb(c.fg))
                 .child(SharedString::from(draft.summary.clone()))
                 .into_any_element()];
@@ -6081,45 +6127,47 @@ impl DevShell {
                         .into_any_element(),
                 );
             }
+            message.push(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(dim)
+                    .child(SharedString::from(format!(
+                        "{staged_len} {} \u{00b7} {staged_total} {} staged",
+                        match staged_len {
+                            1 => "file",
+                            _ => "files",
+                        },
+                        match staged_total {
+                            1 => "hunk",
+                            _ => "hunks",
+                        },
+                    )))
+                    .into_any_element(),
+            );
+            let close = modal::close_button(&host, "ws-commit-close")
+                .on_click(move |_, _, cx| {
+                    _ = close.update(cx, |this, cx| this.cancel_commit_confirm(cx));
+                })
+                .into_any_element();
             modal::centered(
                 &host,
                 modal::Width::Max(560.0),
                 vec![
-                    div()
-                        .text_color(rgb(c.fg))
-                        .child("Commit staged changes")
-                        .into_any_element(),
+                    modal::heading(&host, "Commit staged changes", Some(close)).into_any_element(),
                     div()
                         .flex()
                         .gap(chrome::gap_s(&host.font))
+                        .mb(px(16.0))
                         .text_color(dim)
                         .child("Branch:")
                         .child(div().text_color(rgb(c.fg)).child(branch))
                         .into_any_element(),
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_y(px(4.0))
-                        .children(message)
-                        .into_any_element(),
-                    div()
-                        .text_color(dim)
-                        .child(SharedString::from(format!(
-                            "{staged_len} {} \u{00b7} {staged_total} {} staged",
-                            match staged_len {
-                                1 => "file",
-                                _ => "files",
-                            },
-                            match staged_total {
-                                1 => "hunk",
-                                _ => "hunks",
-                            },
-                        )))
-                        .into_any_element(),
+                    modal::preview(&host, message),
                     div()
                         .flex()
                         .justify_end()
                         .gap(chrome::gap_m(&host.font))
+                        .mt(px(20.0))
                         .child(button("ws-commit-cancel", "Cancel", false).on_click(
                             move |_, _, cx| {
                                 _ = cancel.update(cx, |this, cx| this.cancel_commit_confirm(cx));
@@ -6216,6 +6264,31 @@ impl Render for DevShell {
             };
             view.read(cx).head_info()
         });
+
+        // Themes: the picker's mouse door, the reference's `.theme-toggle` — a
+        // square palette glyph to the left of Commands. One name —
+        // `theme.picker` — for this button, the command list and whatever key
+        // a config binds, so the doors cannot drift.
+        let theme_button = {
+            let me = me.clone();
+            let ink = host.theme.dim_on(theme::Surface::Title);
+            div()
+                .id("theme-button")
+                .debug_selector(|| "theme-button".to_string())
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(28.0))
+                .rounded(px(chrome::RADIUS))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(c.raised)))
+                .on_click(move |_, _, cx| {
+                    _ = me.update(cx, |this, cx| this.run_command("theme.picker", cx));
+                })
+                .child(chrome::icon("gitten/palette.svg", 15.0, ink))
+                .into_any_element()
+        };
 
         // Commands: the palette's mouse door. One name —
         // `commands.palette` — for this button, the menu adapter and
@@ -6503,6 +6576,7 @@ impl Render for DevShell {
                     // clicks that land between them, so a stray click on the
                     // title bar does not fall through to whatever is under it.
                     .child(div().flex_grow(1.0))
+                    .child(theme_button)
                     .child(commands_button)
                     .children(push_button),
             )
@@ -6684,6 +6758,10 @@ impl Render for DevShell {
             // The Commands palette over everything but the message: the
             // same deferred, occluding centered-panel shape as the commit
             // dialog. It lists runnable named commands, not keys.
+            .children(
+                self.theme_picker_open
+                    .then(|| self.render_theme_picker(window, cx)),
+            )
             .children(self.palette_open.then(|| self.render_palette(window, cx)))
             // The message overlay, over even the palette: it exists because the
             // band's one truncated line was not the whole of git's answer, so
@@ -6692,18 +6770,30 @@ impl Render for DevShell {
                 self.show_message
                     .then_some(self.error.as_ref())
                     .flatten()
-                    .map(|error| message_overlay(error, &host)),
+                    .map(|error| {
+                        let me = cx.entity().downgrade();
+                        let close = modal::close_button(&host, "message-close")
+                            .on_click(move |_, _, cx| {
+                                _ = me.update(cx, |this, cx| {
+                                    this.show_message = false;
+                                    cx.notify();
+                                });
+                            })
+                            .into_any_element();
+                        message_overlay(error, &host, Some(close))
+                    }),
             );
         root
     }
 }
 
-/// The error's whole answer, word-wrapped, over everything. The heading is
-/// git's own first line in the error's ink; the body is everything git said,
-/// argv prefix included — the band's one truncated line is the glance, this is
-/// the reading. No `whitespace_nowrap`: a long answer wraps, because a panel
-/// that clips its tail is the band with more room.
-fn message_overlay(error: &GitError, host: &Host) -> AnyElement {
+/// The error's whole answer, word-wrapped, over everything. The heading names
+/// the panel; the glance is git's own first line in the error's ink, and the
+/// body is everything git said, argv prefix included — the band's one truncated
+/// line is the glance, this is the reading. No `whitespace_nowrap`: a long
+/// answer wraps, because a panel that clips its tail is the band with more
+/// room.
+fn message_overlay(error: &GitError, host: &Host, close: Option<AnyElement>) -> AnyElement {
     // The box around the answer — scrim, border, paint order — is the shared
     // centered panel's, the way the help panel's is. What is here is only the
     // glance and the record.
@@ -6711,14 +6801,19 @@ fn message_overlay(error: &GitError, host: &Host) -> AnyElement {
         host,
         modal::Width::Max(720.0),
         vec![
-            // The glance, then the record. No `whitespace_nowrap`: a long
-            // answer wraps, because a panel that clips its tail is the
-            // band with more room.
+            modal::heading(host, "Message", close).into_any_element(),
             div()
+                .flex_none()
+                .text_size(px(13.0))
                 .text_color(rgb(host.theme.chrome.error))
                 .child(error.summary.clone())
                 .into_any_element(),
-            error.full.clone().into_any_element(),
+            div()
+                .min_h_0()
+                .overflow_hidden()
+                .child(error.full.clone())
+                .into_any_element(),
+            modal::hint(host, "esc dismiss"),
         ],
     )
 }
@@ -7423,6 +7518,11 @@ fn open_main_window(launch: Launch, cx: &mut App) {
                 palette_field: None,
                 palette_sub: None,
                 palette_query: String::new(),
+                theme_picker_open: false,
+                theme_picker_sel: 0,
+                theme_picker_field: None,
+                theme_picker_sub: None,
+                theme_picker_query: String::new(),
                 focus,
                 focused: None,
                 ongoing: Cell::default(),
@@ -8163,6 +8263,11 @@ mod tests {
                 palette_field: None,
                 palette_sub: None,
                 palette_query: String::new(),
+                theme_picker_open: false,
+                theme_picker_sel: 0,
+                theme_picker_field: None,
+                theme_picker_sub: None,
+                theme_picker_query: String::new(),
                 focus: cx.focus_handle(),
                 focused: None,
                 ongoing: Cell::default(),
@@ -8213,6 +8318,38 @@ mod tests {
                 1,
                 "the second open duplicated the window"
             );
+        });
+    }
+
+    #[gpui::test]
+    fn picking_a_theme_keeps_the_picker_open(cx: &mut TestAppContext) {
+        // The reference dismisses its picker on a choice; this window does not,
+        // because trying several palettes against the diff behind the scrim is
+        // the whole reason the picker exists.
+        let shell = shell(None, cx);
+        let observed = shell.clone();
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.set_global(config::Active(Rc::new(Host::new())));
+            cx.set_global(config::Chosen(None));
+        });
+        observed.update(&mut *cx, |s, cx| s.run_command("theme.picker", cx));
+        let index = observed.read_with(cx, |s, cx| {
+            assert!(s.theme_picker_open, "the picker did not open");
+            s.theme_picker_cards(cx)
+                .iter()
+                .position(|card| card.name == "github-dark")
+                .expect("github-dark is registered")
+        });
+        observed.update(&mut *cx, |s, cx| s.choose_theme_at(index, cx));
+        observed.read_with(cx, |s, cx| {
+            assert!(s.theme_picker_open, "choosing closed the picker");
+            assert_eq!(config::host(cx).theme.name, "github-dark");
+        });
+        // And esc is still the way out.
+        observed.update(&mut *cx, |s, cx| s.back(cx));
+        observed.read_with(cx, |s, _| {
+            assert!(!s.theme_picker_open, "esc left the picker standing");
         });
     }
 

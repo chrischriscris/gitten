@@ -70,8 +70,8 @@ fn line_kind_name(k: LineKind) -> &'static str {
     }
 }
 
-/// The face, for both views. A client measures its own advance from the font
-/// the browser actually resolved — see `app.js` — and takes the rest of it.
+/// The face, for both views. A client measures its own advance from the font it
+/// actually resolved and takes the rest of it.
 fn font(out: &mut String, host: &Host) {
     object(out, |o, f| {
         field_str(o, f, "family", &host.font.family);
@@ -226,10 +226,11 @@ pub fn meta(out: &mut String, doc: &Doc, host: &Host, label: &str) {
 /// One run of a line, as the client draws it.
 ///
 /// The text is sliced here and not handed over as byte offsets, on purpose.
-/// [`Run::at`] is in bytes and a JavaScript string is UTF-16, so offsets mean
-/// every consumer converts and the one that forgets breaks on exactly the lines
-/// a diff of anything non-English is made of. Slicing also means the browser
-/// does a `for` over pieces instead of a sweep per row per frame.
+/// [`Run::at`] is in bytes and a consumer's string may be UTF-16 or anything
+/// else, so offsets mean every consumer converts and the one that forgets
+/// breaks on exactly the lines a diff of anything non-English is made of.
+/// Slicing also means a client does a `for` over pieces instead of a sweep per
+/// row per frame.
 ///
 /// The `surface` a [`Run`] carries is dropped: the row already said its kind
 /// and `w` says which words changed, so the client resolves the background from

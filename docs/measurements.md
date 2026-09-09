@@ -890,17 +890,17 @@ garbage — it did, at first, and made both languages look catastrophic.
 ### The ratios a theme is built to
 
 ```sh
-cargo run -q -p gitten-core --example contrast --release          # all seven
+cargo run -q -p gitten-core --example contrast --release          # every palette
 cargo run -q -p gitten-core --example contrast --release light
 ```
 
 A floor keeps a palette legible; *hierarchy* is what a reader learns, and the
-hierarchy is a set of ratios rather than a set of colours. So the second through
-seventh palettes were ported from the first by number — pick the hue, solve for the tint
-that lands on dark's figure. Every row below is the same contrast function used on
-the render path, against that theme's own context row unless it says otherwise:
+hierarchy is a set of ratios rather than a set of colours. So the ported palettes
+were built from the first by number — pick the hue, solve for the tint that lands
+on dark's figure. Every row below is the same contrast function used on the render
+path, against that theme's own context row unless it says otherwise:
 
-| | dark | light | slate | gruvbox | catppuccin | tokyo-night | rose-pine |
+| | dark | light | slate | gruvbox | catppuccin-mocha | tokyo-night | rose-pine |
 |---|---|---|---|---|---|---|---|
 | `file_bg` | 1.18 | 1.18 | 1.19 | 1.27 | 1.30 | 1.18 | 1.23 |
 | `hunk_bg` | 1.09 | 1.05 | 1.05 | 1.01 | 1.06 | 1.06 | 1.04 |
@@ -918,10 +918,11 @@ the render path, against that theme's own context row unless it says otherwise:
 
 Building them is not free and is not on any path that matters: `Theme::dark()` is
 **16 µs** release, almost all of it `rebuild` resolving 12 classes across 8
-surfaces, and `Host::new()` — which now builds eight themes, seven catalogued and
-one active — is **270 µs**. That is what a theme pick costs, because a pick is a
-rebuild of the host from the file. Measured with a 200-iteration loop over each
-constructor.
+surfaces, and `Host::new()` — which builds the hand-built eight plus the active
+one — was **270 µs** when there were that many. The guide-v2 eleven are derived
+by `Theme::from_guide`, so they add constructors and not new ratios; the floor
+tests run over the whole registry, which is what keeps that true. Measured with a
+200-iteration loop over each constructor.
 
 Two numbers could not be carried across, and both are the same point about a light
 background. **The accent is 5.2:1 rather than 9.1:1** — contrast against paper is

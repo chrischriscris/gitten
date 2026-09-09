@@ -1,6 +1,6 @@
 # The terminal frontend
 
-`gitten-tui`. The third door, after the GPUI window and the browser.
+`gitten-tui`. A door, after the GPUI window.
 
 It exists to be the cheap check on the boundary. `docs/architecture.md` names the
 test — *a second frontend needs no logic of its own* — and a terminal is the
@@ -40,9 +40,9 @@ version.
 Everything on the left had at least two implementations before, or — for
 `command` — none that was shared at all. The window now dispatches through
 `command` and builds its rows from `core::rows`, so both are canonical in every
-client but `gitten-web`, which still flattens its own rows and runs — a browser
-tab is the one place the copies survive, and they are worth *knowing about*
-rather than worth fixing. See [Still to do](#still-to-do).
+client. `gitten-web`'s `rows.rs` is the wiring that keeps a break-table rebuild
+and the index built over it together, and nothing more. See
+[Still to do](#still-to-do).
 
 ## The one thing a `Rows` implementation owns
 

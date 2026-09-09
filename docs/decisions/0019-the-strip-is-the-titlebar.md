@@ -54,7 +54,7 @@ the other end of the same sentence.
 
 Both are invisible until the window opens, and neither is covered by a test — the
 strip's geometry is a number in `window_options` and the scrollbar's colour lives
-in another crate's global. `./dev desktop` is the check.
+in another crate's global. `./dev gui` is the check.
 
 If a titlebar ever needs to be taller than the traffic lights want, `TITLE_H` and
 the `(TITLE_H - 12) / 2` in `window_options` are the two numbers that have to move

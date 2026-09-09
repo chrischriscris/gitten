@@ -20,8 +20,8 @@ pub struct Log {
     /// The whole list gets this one width, unlike the GPUI client which gives
     /// each row its own. Not a disagreement about taste — a disagreement about
     /// what a row *is*: the window can scroll a container wider than itself, so
-    /// a wide merge row pushes only its own subject across. A browser row is a
-    /// fixed-width line, so a per-row gutter starts the subject in a different
+    /// a wide merge row pushes only its own subject across. A row on the wire is
+    /// a fixed-width line, so a per-row gutter starts the subject in a different
     /// column on every line and the eye has nothing to scan down. The terminal
     /// reaches the same answer for the same reason.
     pub lanes: usize,

@@ -51,8 +51,8 @@ report app cargo test -q -p gitten-app
 # protocol and untracked status were tested by nothing that anybody ran. Its
 # tests build their own scratch repositories, so they are as headless as the rest.
 report git cargo test -q -p gitten-git
-# The browser door. Headless too — every test in it is a payload or a row
-# index, and neither needs a socket.
+# The loopback agent door. Headless too — every test in it is a payload or a
+# row index, and neither needs a socket.
 report web cargo test -q -p gitten-web
 # The terminal door, and the only frontend whose *drawing* is tested: its screen
 # is a cell buffer, so "this row is a removal, red on dark red, with the changed

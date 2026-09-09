@@ -1,30 +1,24 @@
-//! gitten in a browser tab, served from the terminal you started it in.
+//! The loopback agent API: gitten's state as JSON on `127.0.0.1`.
 //!
 //! Everything above drawing runs here, natively: acquisition spawns `git` the
 //! way it always has, and `core` runs the differ, the intraline pass, the
-//! highlighter and the wrap. What crosses to the browser is
+//! highlighter and the wrap. What crosses the wire is
 //! [`gitten_core::prepared`] cut into windows of rows — which is what
 //! `Prepared`'s own docs describe as "ready for whatever is going to draw them",
 //! and this is the third thing to take them up on after the GPUI view and
 //! `core/examples/paint.rs`.
 //!
 //! It follows that nothing in here needs a wasm target and nothing in `core`
-//! had to change. The cost is on the other side: the browser reimplements the
-//! drawing, because a `Rows` returns a UI element and that registry is a
-//! client's. See `docs/clients.md` for exactly where that line falls.
-//!
-//! # Two views, one page
-//!
-//! `/` serves the same document for a diff and for a commit list; which one it
-//! is arrives in `meta` and the script branches on it. A second page would be a
-//! second copy of the virtual list, the theme and the keys.
+//! had to change. There is no page: the browser document that used to prove the
+//! boundary held has been removed, and `gitten-tui` and `cli/` carry that proof
+//! now. What is left is the agent's door — `GET` for rows, meta, commits, keys,
+//! config and health, and one `POST /api/dispatch` for the cursor. The routes
+//! are documented in `docs/agent-web.md`.
 //!
 //! The commit graph crosses the wire as `gitten_core::graph`'s **plan** — which
 //! halves of which lanes exist, which curve pairs with which, which branch is
-//! which colour — and the browser turns each half into one SVG path. It is the
-//! same plan the window paints as Bézier curves and the terminal paints as box
-//! characters, so all three agree about the shape of history and only the
-//! arithmetic differs. See [`log::Log`].
+//! which colour — so a reader that draws SVG paths and the window's Bézier
+//! curves come from the same numbers. See [`log::Log`].
 
 pub mod api;
 pub mod http;
@@ -39,10 +33,6 @@ use http::{Request, Response};
 use log::Log;
 use rows::Doc;
 use std::sync::Mutex;
-
-const INDEX: &str = include_str!("../ui/index.html");
-const CSS: &str = include_str!("../ui/app.css");
-const JS: &str = include_str!("../ui/app.js");
 
 /// The narrowest and widest column budgets a *client* may be asked for.
 ///
@@ -67,8 +57,8 @@ pub struct State {
     pub data: Data,
     /// The agent's cursor: what `POST /api/dispatch` moves.
     ///
-    /// The browser has none of this — it keeps its own scroll position and asks
-    /// for windows of rows — so one viewport per process is enough for the same
+    /// A client that draws its own height never needs this — it asks for
+    /// windows of rows — so one viewport per process is enough for the same
     /// reason one `Doc` is: this serves a single reader. Behind a `Mutex`
     /// because a dispatch mutates it, like a reflow mutates the `Doc`.
     view: Mutex<Viewport>,
@@ -76,10 +66,10 @@ pub struct State {
 
 /// How many rows one screenful is before the agent says otherwise.
 ///
-/// The browser never asks — it draws its own height — so this is only the
-/// opening value for `POST /api/dispatch`, replaceable per request with
-/// `args.height`. Forty rows is a terminal screen, the unit every `page`
-/// command in `core` already thinks in.
+/// A client that draws its own height never asks, so this is only the opening
+/// value for `POST /api/dispatch`, replaceable per request with `args.height`.
+/// Forty rows is a terminal screen, the unit every `page` command in `core`
+/// already thinks in.
 const DISPATCH_HEIGHT: usize = 40;
 
 /// What a dispatch that names a real command but no headless meaning is told.
@@ -154,13 +144,6 @@ impl State {
             );
         }
         match (req.path.as_str(), &self.data) {
-            // One page for both views. Which one it is arrives in `meta`, and
-            // the script branches on it — a second page would be a second copy
-            // of the virtual list, the theme and the keys.
-            ("/", _) => Response::html(INDEX),
-            ("/app.css", _) => Response::css(CSS),
-            ("/app.js", _) => Response::js(JS),
-
             ("/api/meta", Data::Diff(doc)) => {
                 let mut doc = doc.lock().unwrap_or_else(|p| p.into_inner());
                 self.reflow(&mut doc, req);
@@ -388,16 +371,16 @@ fn file_status(doc: &Doc, at: usize) -> String {
 /// of nothing, and where to do it instead.
 fn unavailable(command: &str) -> Response {
     let hint = match command {
-        "quit" => "close the tab; Ctrl-C the terminal that started this server",
+        "quit" => "Ctrl-C the terminal that started this server",
         "help" => "GET /api/keys is the help screen, as data",
         "view.left" | "view.right" => {
-            "the web view wraps text instead of scrolling it sideways — see ?wrap= and ?cols="
+            "this door wraps text instead of scrolling it sideways — see ?wrap= and ?cols="
         }
         "diff.cycle-wrap" => {
             "pass ?wrap= and ?cols= on the rows request instead — the names are at GET /api/config"
         }
         "diff.cycle-layout" => {
-            "the browser draws its own presentation; there is no server layout to cycle"
+            "the presentation belongs to the client drawing it; there is no server layout to cycle"
         }
         "theme.cycle" => {
             "the palette rides in every meta payload; pick client-side or restart with another gitten.toml theme"
@@ -476,7 +459,7 @@ mod tests {
     }
 
     /// `Request` builds from a target the way the server does, so a test asks
-    /// for exactly what a browser would.
+    /// for exactly what a client would.
     fn get(state: &State, target: &str) -> Response {
         let (path, query) = target.split_once('?').unwrap_or((target, ""));
         state.route(&Request::new(path, query))
@@ -500,13 +483,14 @@ mod tests {
     }
 
     #[test]
-    fn the_page_and_its_assets_are_served() {
+    fn the_page_is_gone_and_the_api_remains() {
         let s = diff_state();
+        // The document and its assets were removed: the crate is the agent's
+        // door now, not a browser client.
         for path in ["/", "/app.css", "/app.js"] {
-            let r = get(&s, path);
-            assert_eq!(r.status, 200, "{path}");
-            assert!(!r.body.is_empty(), "{path} is empty");
+            assert_eq!(get(&s, path).status, 404, "{path} is still served");
         }
+        assert_eq!(get(&s, "/api/health").status, 200);
     }
 
     #[test]
@@ -569,8 +553,6 @@ mod tests {
         assert!(out.contains("\"subject\":\"root\""));
         assert!(out.contains("\"initials\":\"AL\""));
         assert_eq!(get(&s, "/api/rows").status, 404);
-        // The page is the same page: which view it is arrives in `meta`.
-        assert_eq!(get(&s, "/").status, 200);
         let meta = body(get(&s, "/api/meta"));
         assert!(meta.contains("\"kind\":\"commits\""), "{meta}");
         assert!(meta.contains("\"theme\":"), "the commits view got no theme");

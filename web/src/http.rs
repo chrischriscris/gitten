@@ -1,12 +1,12 @@
-//! A web server for one reader on loopback.
+//! An HTTP server for one reader on loopback.
 //!
 //! Blocking, a thread per connection, `GET` plus one `POST`, no body parsing
 //! beyond the dispatch command. That is not minimalism for its own sake: the
-//! whole traffic pattern is one browser asking for windows of rows over
-//! localhost plus an agent moving a cursor, which is neither concurrent nor
-//! slow, and an async runtime would be the largest dependency in the repository
-//! by two orders of magnitude to serve it. `shell` has three dependencies and
-//! `core` has none; this has none either.
+//! whole traffic pattern is one agent asking for windows of rows over
+//! localhost and moving a cursor, which is neither concurrent nor slow, and an
+//! async runtime would be the largest dependency in the repository by two
+//! orders of magnitude to serve it. `shell` has three dependencies and `core`
+//! has none; this has none either.
 //!
 //! What it is *not* is a server for the internet. It binds loopback, and the
 //! things it therefore does not do — TLS, auth, request limits beyond a header
@@ -18,20 +18,19 @@
 //! # Loopback is not the boundary it looks like
 //!
 //! Binding `127.0.0.1` keeps the *network* out. It does not keep a *browser*
-//! out, and a browser is the one client this has. Any page the person is
-//! visiting can point its own hostname at 127.0.0.1 and come back through the
-//! user's own browser, at which point the same-origin policy is on the
-//! attacker's side and every route here answers with the contents of a working
-//! tree. That is DNS rebinding, it needs no privileged position on the network,
-//! and the only thing that stops it is refusing a request whose `Host` is not
-//! one this server could legitimately have been reached by — see
+//! out, and a browser is exactly what can reach this server. Any page the
+//! person is visiting can point its own hostname at 127.0.0.1 and come back
+//! through the user's own browser, at which point the same-origin policy is on
+//! the attacker's side and every route here answers with the contents of a
+//! working tree. That is DNS rebinding, it needs no privileged position on the
+//! network, and the only thing that stops it is refusing a request whose `Host`
+//! is not one this server could legitimately have been reached by — see
 //! [`addressed_to_us`].
 //!
-//! Two headers do the rest, and they are on every response rather than on the
-//! HTML because the cost of forgetting one is the whole working tree:
-//! `Content-Security-Policy` keeps injected markup from reaching a third-party
-//! origin even if something downstream is escaped wrong, and `nosniff` stops a
-//! diff of an HTML file being re-interpreted as one.
+//! Two headers do the rest, and they are on every response because the cost of
+//! forgetting one is the whole working tree: `Content-Security-Policy` keeps a
+//! document that did manage to read this from reaching a third-party origin,
+//! and `nosniff` stops a diff of an HTML file being re-interpreted as one.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -39,8 +38,8 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::mpsc;
 use std::time::Duration;
 
-/// Longest request head accepted, headers included. A browser sends about 600
-/// bytes; anything past this is not a browser and gets a `431` rather than a
+/// Longest request head accepted, headers included. A client sends about 600
+/// bytes; anything past this is not a client and gets a `431` rather than a
 /// buffer that grows until the process dies.
 ///
 /// The same cap bounds a `POST` body: a dispatch is a command name and four
@@ -48,7 +47,8 @@ use std::time::Duration;
 const MAX_HEAD: usize = 16 * 1024;
 
 /// Idle timeout on a kept-alive connection. Long enough that scrolling never
-/// pays a reconnect, short enough that closing a tab does not leave threads.
+/// pays a reconnect, short enough that a client that stops asking does not
+/// leave threads behind.
 const IDLE: Duration = Duration::from_secs(90);
 
 pub struct Request {
@@ -146,11 +146,9 @@ pub struct Response {
     pub body: Vec<u8>,
     /// Whether the client may cache this.
     ///
-    /// Nothing does. The stylesheet and the script are `include_str!`d into the
-    /// binary, so they change exactly when the binary does — and a cached copy
-    /// then survives the rebuild that was meant to replace it, which reads as
-    /// "the fix did nothing" and costs an hour. Two small files over loopback
-    /// per page load is not a cost worth that.
+    /// Nothing does. Every answer is state read out of a live process, so a
+    /// cached copy would outlive the request that produced it and read as
+    /// "the fix did nothing".
     pub cache: bool,
 }
 
@@ -160,33 +158,6 @@ impl Response {
             status: 200,
             content_type: "application/json; charset=utf-8",
             body: body.into_bytes(),
-            cache: false,
-        }
-    }
-
-    pub fn html(body: &str) -> Self {
-        Self {
-            status: 200,
-            content_type: "text/html; charset=utf-8",
-            body: body.as_bytes().to_vec(),
-            cache: false,
-        }
-    }
-
-    pub fn css(body: &str) -> Self {
-        Self {
-            status: 200,
-            content_type: "text/css; charset=utf-8",
-            body: body.as_bytes().to_vec(),
-            cache: false,
-        }
-    }
-
-    pub fn js(body: &str) -> Self {
-        Self {
-            status: 200,
-            content_type: "text/javascript; charset=utf-8",
-            body: body.as_bytes().to_vec(),
             cache: false,
         }
     }
@@ -215,17 +186,13 @@ fn reason(status: u16) -> &'static str {
     }
 }
 
-/// What the page is allowed to do, which is very little.
+/// What a document that read this is allowed to do, which is very little.
 ///
-/// `default-src 'none'` and then back only what the document actually uses: its
-/// own script and stylesheet, `fetch` to its own origin, and inline `style=`
-/// attributes — which every row carries, because a token's colour is resolved
-/// per surface and arrives as data. No inline *script* is needed; the page has
-/// none.
-///
-/// `connect-src 'self'` is the one that matters most. Injected script that
-/// cannot reach another origin cannot post a working tree to it, so this is what
-/// keeps an escaping bug from being an exfiltration bug.
+/// This server has no page any more, so on a JSON response the policy is inert.
+/// It stays on every answer as defence in depth: if a document is ever served
+/// again, `default-src 'none'` with `connect-src 'self'` is what keeps injected
+/// script from reaching a third-party origin — and an escaping bug from being
+/// an exfiltration bug.
 const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
                    connect-src 'self'; base-uri 'none'; form-action 'none'";
 
@@ -239,7 +206,7 @@ const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self' 'unsa
 /// at all, and nothing else.
 ///
 /// A request with no `Host` at all is refused too. HTTP/1.1 requires one, every
-/// browser sends one, and something that does not is not the client this serves.
+/// client sends one, and something that does not is not the client this serves.
 fn addressed_to_us(head: &str, port: u16) -> bool {
     let Some(host) = header(head, "host") else {
         return false;
@@ -276,7 +243,7 @@ fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
 ///
 /// # Why the handler never moves
 ///
-/// Connections get a thread each — a browser opens several and keeps them alive,
+/// Connections get a thread each — a client opens several and keeps them alive,
 /// so serving them one after another would have the second wait out the first's
 /// idle timeout. But `handler` stays on the thread that called `serve` and every
 /// request is posted to it over a channel.
@@ -315,7 +282,7 @@ where
     //
     // A panic reachable from routing — a third-party `Wrap` or `Highlighter`
     // bug, an index slip — would otherwise unwind out of `serve` and end the
-    // process, stalling every browser tab. Catch it here and answer 500 with no
+    // process, stalling every client. Catch it here and answer 500 with no
     // internal detail: this thread is the whole server, so its death is the
     // server's, and one bad request is not the others' to pay for.
     for job in jobs {
@@ -442,10 +409,10 @@ fn connection(stream: TcpStream, post: &mpsc::Sender<Job>, port: u16) -> std::io
 enum Head {
     /// A complete request head, up to and including the blank line.
     Got(String),
-    /// A clean close, which is what a browser does to an idle keep-alive
+    /// A clean close, which is what a client does to an idle keep-alive
     /// connection and is not an error.
     Closed,
-    /// Past [`MAX_HEAD`]. Not a browser.
+    /// Past [`MAX_HEAD`]. Not a client.
     TooLarge,
 }
 
@@ -624,7 +591,7 @@ mod tests {
         }
         // A port that is not ours is somebody else's server being proxied at us.
         assert!(!addressed_to_us(&head("127.0.0.1:9999"), 7423));
-        // HTTP/1.1 requires a Host; something without one is not a browser.
+        // HTTP/1.1 requires a Host; something without one is not a client.
         assert!(!addressed_to_us("GET / HTTP/1.0\r\n\r\n", 7423));
     }
 
@@ -645,15 +612,9 @@ mod tests {
 
     #[test]
     fn every_response_carries_the_policy_and_nosniff() {
-        // On all of them, not just the HTML: a JSON route that forgets is the
-        // one an injected script would use.
-        for r in [
-            Response::json("{}".into()),
-            Response::html("<p>"),
-            Response::css("a{}"),
-            Response::js("0"),
-            Response::status(404, "no"),
-        ] {
+        // On all of them, not just the JSON: a route that forgets is the one an
+        // injected script would use.
+        for r in [Response::json("{}".into()), Response::status(404, "no")] {
             let head = head_of(&r);
             assert!(
                 head.contains("X-Content-Type-Options: nosniff"),
@@ -667,7 +628,7 @@ mod tests {
             );
             assert!(head.contains("default-src 'none'"), "{}", r.content_type);
         }
-        // No inline script anywhere in the page, so none is allowed.
+        // No inline script is ever served, so none is allowed.
         assert!(!CSP.contains("script-src 'self' 'unsafe-inline'"));
     }
 
