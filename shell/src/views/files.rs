@@ -632,9 +632,9 @@ impl Files {
         self.changed
     }
 
-    /// The refresh's per-path `(staged, total)` hunk counts — the inspector
-    /// and the status bar read this beside the rows, never the repository.
-    #[allow(dead_code)] // STUB(phase3-resume): read by inspector and status bar.
+    /// The refresh's per-path `(staged, total)` hunk counts — the status
+    /// bar reads this beside the rows, never the repository. (The
+    /// inspector reads the same numbers through [`staged_summary`].)
     pub(crate) fn counts(&self) -> &Rc<HashMap<Vec<u8>, (u32, u32)>> {
         &self.counts
     }

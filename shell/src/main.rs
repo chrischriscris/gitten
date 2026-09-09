@@ -1598,10 +1598,14 @@ struct DevShell {
     /// recency, stamped in [`DevShell::drain_jobs`] by job name. `None` is
     /// "never this session", said as "never" rather than a blank, because
     /// a count with no recency beside it reads as current.
-    #[allow(dead_code)] // STUB(phase3-resume): stamped on job finish, read by status segments.
     last_fetch: Option<std::time::Instant>,
-    #[allow(dead_code)] // STUB(phase3-resume): stamped on job finish, read by status segments.
     last_push: Option<std::time::Instant>,
+    /// Spelled status-bar leading segments beside the inputs they were
+    /// spelled from — stamps, staged total, remote, branch label.
+    /// Recomputed when any input moves; every other frame clones three
+    /// refcounts. A frame formats nothing: the bar is drawn at rest for
+    /// long stretches, and a stale minute heals on the next frame.
+    status_memo: RefCell<Option<(StatusMemoKey, Vec<SharedString>)>>,
     /// Startup logging, and nothing else: whether [`start::mark`] has already
     /// stamped the first render. One bool read per frame afterwards.
     first_render: Cell<bool>,
@@ -1805,6 +1809,76 @@ impl SearchPane {
         }
     }
 }
+
+/// The status bar's recency scale: under a minute is news, under an hour
+/// counts in minutes, after that in hours. Floored, never rounded up —
+/// "1m ago" at sixty seconds, not fifty-nine claiming two.
+fn ago_text(secs: u64) -> String {
+    match secs {
+        0..60 => "just now".into(),
+        60..3600 => format!("{}m ago", secs / 60),
+        _ => format!("{}h ago", secs / 3600),
+    }
+}
+
+/// The bar's single sync sentence: whichever of fetch and push ran last
+/// this session wins — a push that landed a minute ago is newer news than
+/// a fetch from an hour back. Nothing ran yet reads as an honest absence,
+/// not a blank. `now` rides along so tests can hold the clock still.
+fn sync_text(
+    fetch: Option<std::time::Instant>,
+    push: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> SharedString {
+    // `None` sorts below every `Some`: push wins when it exists and is
+    // newer, or when fetch never ran at all.
+    if push > fetch {
+        let at = push.expect("compared Some");
+        return format!(
+            "Last push {}",
+            ago_text(now.saturating_duration_since(at).as_secs())
+        )
+        .into();
+    }
+    match fetch {
+        None => "Never fetched".into(),
+        Some(at) => format!(
+            "Last fetched {}",
+            ago_text(now.saturating_duration_since(at).as_secs())
+        )
+        .into(),
+    }
+}
+
+/// The Push button's label from the loaded upstream distance: `None` is
+/// unknowable — upstream gone, never fetched — and reads as an em-dash,
+/// never `0`, which would invite a useless push.
+fn push_label(ahead: Option<u32>) -> SharedString {
+    match ahead {
+        None => "Push \u{2014}".into(),
+        Some(0) => "Published".into(),
+        Some(n) => format!("Push {n}").into(),
+    }
+}
+
+/// The staging count's noun: the one case the plural would embarrass.
+fn staging_text(staged: u32) -> SharedString {
+    match staged {
+        1 => "1 staged hunk".into(),
+        n => format!("{n} staged hunks").into(),
+    }
+}
+
+/// The status-bar memo's key: the stamps, the staged total, the remote,
+/// the branch label. Everything a frame's spelling depends on, and
+/// nothing it does not.
+type StatusMemoKey = (
+    Option<std::time::Instant>,
+    Option<std::time::Instant>,
+    u32,
+    SharedString,
+    Option<SharedString>,
+);
 
 impl DevShell {
     /// The screen commands act on: the focused list, or the diff, by where
@@ -3428,6 +3502,18 @@ impl DevShell {
                             field.update(cx, |field, cx| field.set_text(String::new(), cx));
                         }
                     }
+                    // Sync recency for the status bar's leading segments: a
+                    // clean finish only. A refusal leaves the previous
+                    // recency standing beside the band's verbatim error —
+                    // stamping it would claim a push happened that did
+                    // not. `pull` fetches before it merges, so it stamps
+                    // the fetch side; `push …` names carry their remote
+                    // and branch, matched by prefix.
+                    if name == "pull" || name.starts_with("fetch") {
+                        self.last_fetch = Some(Instant::now());
+                    } else if name.starts_with("push ") {
+                        self.last_push = Some(Instant::now());
+                    }
                     if generation > self.generation {
                         self.generation = generation;
                         self.refresh_stale(cx);
@@ -4902,6 +4988,56 @@ impl DevShell {
             });
         }
         self.workspace.fields_key = key;
+    }
+
+    /// The status bar's fixed leading segments — sync recency, remote,
+    /// staging count — spelled from loaded state, never a git call. The
+    /// memo holds the inputs beside the spelling: stamps, staged total,
+    /// remote, branch label. Anything moves and the three re-spell;
+    /// otherwise the frame clones three refcounts.
+    fn status_leading(&self, cx: &mut Context<Self>) -> Vec<SharedString> {
+        let staged: u32 = match self.panes.get("files") {
+            Some(Screen::Files { view, .. }) => view
+                .read(cx)
+                .counts()
+                .values()
+                .map(|(staged, _)| staged)
+                .sum(),
+            _ => 0,
+        };
+        let head = self.panes.get("branches").and_then(|screen| {
+            let Screen::Branches { view, .. } = screen else {
+                return None;
+            };
+            view.read(cx).head_info()
+        });
+        // No upstream, no remote to name: the em-dash says unknowable,
+        // the way the Push button's does. A remotes read per frame is
+        // what a second git call would cost, and the bar is not worth one.
+        let remote = head
+            .as_ref()
+            .and_then(|info| info.remote.clone())
+            .unwrap_or_else(|| "\u{2014}".into());
+        let branch = head.as_ref().map(|info| info.label.clone());
+        let key = (
+            self.last_fetch,
+            self.last_push,
+            staged,
+            remote.clone(),
+            branch.clone(),
+        );
+        if let Some((ref memo_key, ref spelled)) = *self.status_memo.borrow() {
+            if *memo_key == key {
+                return spelled.clone();
+            }
+        }
+        let spelled = vec![
+            sync_text(self.last_fetch, self.last_push, Instant::now()),
+            remote,
+            staging_text(staged),
+        ];
+        *self.status_memo.borrow_mut() = Some((key, spelled.clone()));
+        spelled
     }
 
     /// The inspector's staged truth, straight off the files pane's refresh:
@@ -6823,6 +6959,87 @@ impl Render for DevShell {
                 .into_any_element()
         };
 
+        // Commands: the palette's mouse door. One name —
+        // `commands.palette` — for this button, the menu adapter and
+        // `cmd-k`, so the three cannot drift into three behaviors.
+        let commands_button = {
+            let me = me.clone();
+            div()
+                .id("commands-button")
+                .debug_selector(|| "commands-button".to_string())
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px((ch * 0.7).round()))
+                .h(px(CHIP_H))
+                .px(chrome::gap_l(&host.font))
+                .bg(rgb(c.raised))
+                .border_1()
+                .border_color(rgb(c.border))
+                .rounded(px(chrome::RADIUS))
+                .text_size(px((f.size * chrome::TOPBAR_TEXT_SCALE).round()))
+                .text_color(rgb(c.fg))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(c.keycap)).border_color(rgb(c.faint)))
+                .on_click(move |_, _, cx| {
+                    _ = me.update(cx, |this, cx| this.run_command("commands.palette", cx));
+                })
+                .child("Commands")
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(rgb(host.theme.dim_on(theme::Surface::Title)))
+                        .child("\u{2318}K"),
+                )
+                .into_any_element()
+        };
+
+        // Push: `repo.push`'s mouse door, labeled from the loaded upstream
+        // distance — never a fresh read. `None` is unknowable and keeps
+        // its em-dash; `Some(0)` is published and goes inert, because a
+        // button that sent nothing would be the lie. Anything else sends
+        // through the keyboard verb, whose refusals land verbatim in the
+        // band — detached HEAD included, which is why it stays live.
+        let push_button = self
+            .panes
+            .get("branches")
+            .and_then(|screen| {
+                let Screen::Branches { view, .. } = screen else {
+                    return None;
+                };
+                view.read(cx).head_info()
+            })
+            .map(|info| {
+                let live = !(info.branch && info.ahead == Some(0));
+                let mut button = div()
+                    .id("push-button")
+                    .debug_selector(|| "push-button".to_string())
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .h(px(CHIP_H))
+                    .px(chrome::gap_l(&host.font))
+                    .bg(rgb(c.raised))
+                    .border_1()
+                    .border_color(rgb(c.border))
+                    .rounded(px(chrome::RADIUS))
+                    .text_size(px((f.size * chrome::TOPBAR_TEXT_SCALE).round()));
+                button = match live {
+                    true => {
+                        let me = me.clone();
+                        button
+                            .text_color(rgb(c.fg))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(c.keycap)).border_color(rgb(c.faint)))
+                            .on_click(move |_, _, cx| {
+                                _ = me.update(cx, |this, cx| this.run_command("repo.push", cx));
+                            })
+                    }
+                    false => button.text_color(rgb(host.theme.dim_on(theme::Surface::Title))),
+                };
+                button.child(push_label(info.ahead)).into_any_element()
+            });
+
         let error = self.error.as_ref().map(|e| e.summary.clone());
         let notice = self.notice.clone();
         let running = self.running.as_ref().map(|(label, at)| {
@@ -6958,7 +7175,13 @@ impl Render for DevShell {
                     // reason; this one is HEAD's dot, in the same accent
                     // the list gives HEAD's row.
                     .children(head_chip.map(|info| {
+                        let me = me.clone();
+                        // The base half's ink, spelled once here for the
+                        // chip and the `from` below it.
+                        let dim = rgb(host.theme.dim_on(theme::Surface::Title));
                         div()
+                            .id("branch-control")
+                            .debug_selector(|| "branch-control".to_string())
                             .flex_none()
                             .flex()
                             .items_center()
@@ -6971,6 +7194,15 @@ impl Render for DevShell {
                             .rounded(px(chrome::RADIUS))
                             .text_size(px((f.size * chrome::TOPBAR_TEXT_SCALE).round()))
                             .whitespace_nowrap()
+                            // The chip is a control, not a label: a click
+                            // focuses the branches pane through the same
+                            // name the `3` key resolves to.
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(c.keycap)).border_color(rgb(c.faint)))
+                            .on_click(move |_, _, cx| {
+                                _ = me
+                                    .update(cx, |this, cx| this.run_command("branches.focus", cx));
+                            })
                             // Both halves were spelled at prepare; a
                             // frame clones two refcounts.
                             .children(info.branch.then(|| {
@@ -6982,6 +7214,17 @@ impl Render for DevShell {
                                     .bg(rgb(c.accent))
                             }))
                             .child(div().flex_none().text_color(rgb(c.fg)).child(info.chip))
+                            // The base the branch reads as `from`: spelled
+                            // halves, no per-frame format — the name above
+                            // and these two ride the same dim the strip
+                            // resolves its secondary text in.
+                            .children(info.base.map(|base| {
+                                div()
+                                    .flex_none()
+                                    .text_color(dim)
+                                    .child(" from ")
+                                    .child(base)
+                            }))
                             .children(info.drift.map(|drift| {
                                 // Each arrow in its own ink — ↑ outgoing in the
                                 // staged green, ↓ incoming in the unstaged red —
@@ -7022,10 +7265,12 @@ impl Render for DevShell {
                         // and the accent alone is unmistakable.
                         div().flex_none().text_color(rgb(c.accent)).child("debug")
                     }))
-                    // Pushes the settings button to the right edge and takes the
+                    // Pushes the right-edge controls off the title and takes the
                     // clicks that land between them, so a stray click on the
                     // title bar does not fall through to whatever is under it.
                     .child(div().flex_grow(1.0))
+                    .child(commands_button)
+                    .children(push_button)
                     .child(settings_button),
             )
             // The two regions in one row: the left stack, the diff. A fixture
@@ -7150,6 +7395,12 @@ impl Render for DevShell {
                     true => "PROMPT".into(),
                     false => which.to_uppercase().into(),
                 };
+                // The bar's fixed left-half segments, spelled from loaded
+                // state and memoized on their inputs: the hints shrink by
+                // exactly what they spend, and the bar reads the same
+                // spelling. Computed for both branches — the memo makes an
+                // unneeded spelling a key comparison and three refcounts.
+                let leading = self.status_leading(cx);
                 let (hints, truncated) = match (&message, self.input.is_some()) {
                     (Some(_), _) | (None, true) => (Vec::new(), false),
                     (None, false) => {
@@ -7158,10 +7409,7 @@ impl Render for DevShell {
                             &host,
                             &self.modes,
                             which,
-                            // TODO(phase3-status): thread the bar's fixed leading
-                            // segments (sync state, remote, staging count) here;
-                            // empty until the status-segments work lands.
-                            chrome::hints_budget(&host, width, &badge, &[]),
+                            chrome::hints_budget(&host, width, &badge, &leading),
                         )
                     }
                 };
@@ -7204,11 +7452,15 @@ impl Render for DevShell {
                                 .child(e)
                         }))
                         .into_any_element(),
-                    // TODO(phase3-status): leading segments, as above.
-                    None => {
-                        chrome::status_bar(&host, badge, &[], &hints, truncated, chrome::version())
-                            .into_any_element()
-                    }
+                    None => chrome::status_bar(
+                        &host,
+                        badge,
+                        &leading,
+                        &hints,
+                        truncated,
+                        chrome::version(),
+                    )
+                    .into_any_element(),
                 }
             })
             .children(overlay.map(|(frames, rows, heap, load)| {
@@ -7985,6 +8237,7 @@ fn open_main_window(launch: Launch, cx: &mut App) {
                 pending_commit_key: None,
                 last_fetch: None,
                 last_push: None,
+                status_memo: RefCell::new(None),
                 modes: Modes::new(),
                 pending: Vec::new(),
                 help: false,
@@ -8324,6 +8577,62 @@ mod tests {
 
     fn args(line: &str) -> Vec<String> {
         line.split_whitespace().map(String::from).collect()
+    }
+
+    #[test]
+    fn status_recency_spells_the_guide_copy() {
+        // The bar's single sync sentence, with the clock held still:
+        // guide copy on both sides, newest stamp wins, absence is said.
+        use super::{ago_text, sync_text};
+        assert_eq!(ago_text(0), "just now");
+        assert_eq!(ago_text(59), "just now");
+        assert_eq!(ago_text(60), "1m ago");
+        assert_eq!(ago_text(3599), "59m ago");
+        assert_eq!(ago_text(3600), "1h ago");
+        let now = Instant::now();
+        assert_eq!(sync_text(None, None, now).to_string(), "Never fetched");
+        let old = now - Duration::from_secs(3700);
+        assert_eq!(
+            sync_text(Some(old), None, now).to_string(),
+            "Last fetched 1h ago"
+        );
+        assert_eq!(
+            sync_text(Some(now - Duration::from_secs(150)), None, now).to_string(),
+            "Last fetched 2m ago"
+        );
+        let fresh = now - Duration::from_secs(30);
+        assert_eq!(
+            sync_text(Some(old), Some(fresh), now).to_string(),
+            "Last push just now"
+        );
+        // Fetch-only history never borrows the push sentence, and a push
+        // with no fetch behind it still says push.
+        assert_eq!(
+            sync_text(Some(old), Some(old - Duration::from_secs(60)), now).to_string(),
+            "Last fetched 1h ago"
+        );
+        assert_eq!(
+            sync_text(None, Some(fresh), now).to_string(),
+            "Last push just now"
+        );
+    }
+
+    #[test]
+    fn push_label_never_invents_zero() {
+        // Unknowable is an em-dash, in-sync is a state, anything else a
+        // count — `0` would invite a push that sends nothing.
+        use super::push_label;
+        assert_eq!(push_label(None).to_string(), "Push \u{2014}");
+        assert_eq!(push_label(Some(0)).to_string(), "Published");
+        assert_eq!(push_label(Some(2)).to_string(), "Push 2");
+    }
+
+    #[test]
+    fn staging_count_spells_its_singular() {
+        use super::staging_text;
+        assert_eq!(staging_text(0).to_string(), "0 staged hunks");
+        assert_eq!(staging_text(1).to_string(), "1 staged hunk");
+        assert_eq!(staging_text(5).to_string(), "5 staged hunks");
     }
 
     #[test]
@@ -8672,6 +8981,7 @@ mod tests {
                 commit_confirm: false,
                 last_fetch: None,
                 last_push: None,
+                status_memo: RefCell::new(None),
                 modes: Modes::new(),
                 pending_commit_key: None,
                 pending: vec![vec![Key::char('g')]],
@@ -8814,6 +9124,7 @@ mod tests {
                 commit_confirm: false,
                 last_fetch: None,
                 last_push: None,
+                status_memo: RefCell::new(None),
                 modes: Modes::new(),
                 pending_commit_key: None,
                 pending: Vec::new(),
@@ -12813,6 +13124,11 @@ diff --git a/added.txt b/added.txt
         pump_write(&shell, cx);
         assert_eq!(repo.wrote(), vec!["fetch --all"]);
         assert_eq!(repo.counts(), (0, 1));
+        // The clean finish stamps the bar's recency — fetch side only.
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.last_fetch.is_some());
+            assert!(shell.last_push.is_none());
+        });
         // ...the finish names itself in the band...
         shell.read_with(cx, |shell, _| {
             assert_eq!(shell.notice.as_ref().map(Notice::text), Some("fetched"));
@@ -12848,6 +13164,8 @@ diff --git a/added.txt b/added.txt
                 shell.notice.as_ref().map(Notice::text),
                 Some("pushed origin main")
             );
+            // ...and the push stamps its own side of the recency.
+            assert!(shell.last_push.is_some());
         });
         let line = main_upstream_line(&shell, cx);
         assert!(!line.contains('↑'), "{line}");

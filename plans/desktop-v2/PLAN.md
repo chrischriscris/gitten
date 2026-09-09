@@ -198,3 +198,39 @@ DONE:
 STILL STUBBED (resume-B): status-bar leading segments + job-finish
 timestamps; toolbar branch control, Push + `ahead`, Commands button;
 visual QA.
+
+## Phase 3-resume-B (landed): toolbar + status
+
+Commit `desktop-v2 phase3-resume-B: toolbar + status`: shell 402 (incl. 3
+new spelling tests + pump-test stamp asserts), core 498, app 155;
+`cargo check` zero warnings; `cargo fmt --check` + `cargo clippy
+--workspace --all-targets -- -D warnings` clean.
+
+DONE:
+
+- Job-finish stamps in `drain_jobs` (Ok arm only): `pull`/`fetch*` →
+  `last_fetch`, `push *` → `last_push`. A refusal stamps nothing — the
+  previous recency stands beside the band's verbatim error.
+- Status bar leading segments via memoized `status_leading` (key: stamps,
+  staged total, remote, branch label; frames otherwise clone three
+  refcounts): single sync sentence (newest stamp wins; `Never fetched`
+  when neither ran), remote from loaded upstream or em-dash (no per-frame
+  git call — the single-remote fallback stays a recon note), staging
+  count from `files::counts()` (consuming its STUB marker). Both
+  `TODO(phase3-status)` markers consumed; `hints_budget` shrinks by the
+  segments it already knew how to cost.
+- Toolbar: branch chip is now `branch-control` (click → `branches.focus`)
+  with dim `from <base>` beside the name; `commands-button` (→ same
+  `commands.palette` as cmd-k + menu adapter); `push-button` (→ same
+  `repo.push`; `None` → `Push —`, `Some(0)` → inert dim `Published`,
+  else `Push N`; detached stays live so its refusal surfaces verbatim).
+  All ids unique with `debug_selector`s; no new dropdowns (no
+  deferred/occlude needed — palette/notice reuse existing dialog paths).
+- Zero `STUB(phase3-resume)` / `TODO(phase3-status)` markers remain.
+
+STILL STUBBED (Phase 4): selection-preserving Unified/Split toggle,
+per-hunk Stage buttons, sidebar wheel follow + full gesture audit,
+responsive rules, contrast resolution on all 11 surfaces, system-font
+vs mono decision. Visual QA so far is headless (code re-read for ids,
+focus paths, memo discipline); `./dev dump` is TUI-only and the desktop
+window was not launched per project rules.
