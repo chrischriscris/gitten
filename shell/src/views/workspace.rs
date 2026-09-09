@@ -20,6 +20,7 @@ use super::files::Section;
 use crate::input::Input;
 use gitten_core::status::PathBytes;
 use gpui::{Entity, Subscription, UniformListScrollHandle};
+use std::cell::Cell;
 
 /// The destination header's height: title, real counts, working-copy status.
 pub const HEADER_H: f32 = 76.0;
@@ -87,6 +88,16 @@ pub struct Workspace {
     /// pane's *cursor* but pans its own rows: grouped space has its own
     /// addresses, so the stack list's handle cannot serve it.
     pub sidebar_scroll: UniformListScrollHandle,
+    /// Sub-row wheel remainder for the rail above: trackpad deltas smaller
+    /// than one row accumulate here until they spend. Beside the handle it
+    /// feeds, zeroed whenever a step clamps against a bound.
+    pub sidebar_px: Cell<f32>,
+    /// Mirror of the rail's top index, stepped beside every `scroll_to_item`
+    /// above. The handle's own top getter is test-gated upstream
+    /// (`#[cfg(any(test, feature = "test-support"))]`), so production reads
+    /// this instead. It desyncs when the list scrolls by another path
+    /// (scrollbar-thumb drag); the resume pass owns reconciling that.
+    pub sidebar_top: Cell<usize>,
     /// The inspector's two fields, built once on first entry and refilled
     /// from the draft store whenever the repository changes. Owned here —
     /// beside the center view they serve — rather than in the modal prompt
@@ -113,6 +124,8 @@ impl Default for Workspace {
             request: 0,
             last: None,
             sidebar_scroll: UniformListScrollHandle::new(),
+            sidebar_px: Cell::new(0.0),
+            sidebar_top: Cell::new(0),
             summary: None,
             description: None,
             fields_key: None,

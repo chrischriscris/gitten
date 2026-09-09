@@ -2404,12 +2404,6 @@ impl DevShell {
                 return;
             }
         }
-        let Some(writes) = self.writes() else {
-            // The fixture and patch sources were refused above, so this is
-            // the one case left: the window itself has no repository open.
-            self.set_notice("no repository is open");
-            return;
-        };
         let view = view.clone();
         let host = config::host(cx);
         // Meet the list where its last drag left it, like every reader of the
@@ -2418,6 +2412,33 @@ impl DevShell {
         let row = view.read(cx).cursor_row_id();
         let Some((path, hunk)) = view.read(cx).current_hunk() else {
             self.set_notice("the keyboard is not on a hunk");
+            return;
+        };
+        // The two-press arm lives in the shared tail, after the creation
+        // refusal: arming first would set a live question on a hunk no verb
+        // can serve (an untracked file's), and a standing question that can
+        // never be spent is worse than a refusal.
+        self.submit_hunk_patch(command, &path, &hunk, cx, Some((view, row)));
+    }
+
+    /// The shared tail of every hunk write — the keyboard's verb and the
+    /// workspace strip's button alike: the creation refusal, the discard
+    /// two-press, patch synthesis, and the one `Write` constructor per verb.
+    /// Gates about *where* (which screen, which side) stay with the callers;
+    /// everything about *what* (the patch, the job) is here, once, so a
+    /// button and a keypress cannot stage different bytes. The optional armer
+    /// carries the keyboard's row for the discard ask-twice; `None` (the
+    /// strip never discards) counts as already armed and runs.
+    fn submit_hunk_patch(
+        &mut self,
+        command: &str,
+        path: &str,
+        hunk: &gitten_core::Hunk,
+        cx: &mut Context<Self>,
+        arm: Option<(Entity<views::diff::Diff>, (u16, u32))>,
+    ) {
+        let Some(writes) = self.writes() else {
+            self.set_notice("no repository is open");
             return;
         };
         // A hunk whose every line is an addition *looks* like a creation —
@@ -2451,19 +2472,22 @@ impl DevShell {
             });
             return;
         }
-        // DESTRUCTIVE asks twice, on the same spot.
-        if command == "diff.discard-hunk"
-            && !view.update(cx, |d, _| d.confirm_or_arm_discard_hunk(row))
-        {
-            self.set_question(format!(
-                "discard this hunk of {path}? press again to confirm"
-            ));
-            return;
-        }
+        // DESTRUCTIVE asks twice, on the same spot — after the refusal
+        // above, so the question is only ever asked where it can be spent.
         if command == "diff.discard-hunk" {
+            let armed = match &arm {
+                Some((view, row)) => view.update(cx, |d, _| d.confirm_or_arm_discard_hunk(*row)),
+                None => true,
+            };
+            if !armed {
+                self.set_question(format!(
+                    "discard this hunk of {path}? press again to confirm"
+                ));
+                return;
+            }
             self.notice = None; // the question is spent; the running band speaks next
         }
-        let patch = gitten_core::patch::emit(&path, &[&hunk]);
+        let patch = gitten_core::patch::emit(path, &[hunk]);
         let built = match command {
             "diff.stage-hunk" => gitten_app::verbs::Write::stage_patch(&writes.repo, patch),
             "diff.unstage-hunk" => gitten_app::verbs::Write::unstage_patch(&writes.repo, patch),
@@ -2477,6 +2501,47 @@ impl DevShell {
             }
             Err(e) => self.set_notice(e),
         }
+    }
+
+    /// The workspace hunk strip's verb: stage (or unstage) one hunk of the
+    /// file the center shows, addressed by the button's row — never the
+    /// keyboard's. The side on screen decides the verb through the same
+    /// preview key the center loaded from: a staged twin unstages, every
+    /// other side stages. Untracked files keep the whole-file refusal, and
+    /// git's own refusal still says why — all through
+    /// [`DevShell::submit_hunk_patch`], the keyboard's own tail.
+    fn workspace_stage_hunk(&mut self, path: String, hunk_no: usize, cx: &mut Context<Self>) {
+        let Some(center) = self.workspace.center.clone() else {
+            return;
+        };
+        // The strip and the preview must agree: a button for a file the
+        // center has since left would stage bytes nobody is looking at.
+        let staged_side = match &self.workspace.last {
+            Some((section, previewed, _)) if previewed.as_bytes() == path.as_bytes() => {
+                matches!(section, views::files::Section::Staged)
+            }
+            _ => {
+                self.set_notice("the preview moved under the hunk strip");
+                return;
+            }
+        };
+        let Some(hunk) = center.read(cx).hunk_content(&path, hunk_no) else {
+            self.set_notice("that hunk is gone — the file changed under the strip");
+            return;
+        };
+        // Staging moves the sides, so the preview re-aims the way the
+        // dispatch tail re-aims it after every keyboard verb.
+        self.submit_hunk_patch(
+            match staged_side {
+                true => "diff.unstage-hunk",
+                false => "diff.stage-hunk",
+            },
+            &path,
+            &hunk,
+            cx,
+            None,
+        );
+        self.sync_workspace_preview(cx);
     }
 
     /// `files.stash`: park what the tracked working tree holds on the stash
@@ -5681,24 +5746,24 @@ impl DevShell {
         if self.help || self.open.is_some() || self.context.is_some() {
             return;
         }
-        // The workspace center is not a Screen, so the capture handler meets
-        // it before the stack/main hit test below — whose stale main bounds
-        // would otherwise eat the gesture and scroll a hidden list. The
-        // locked delta pans/scrolls the center directly; any other resolved
-        // command dispatches by name, and the view.* names land on the
-        // center through the workspace door in `run_command_from`.
-        // (Phase 4 owns the full gesture audit, including the sidebar rail.)
+        // The workspace owns the whole middle while it is up, so the
+        // capture handler meets its three regions before the stack/main
+        // hit test below — whose bounds are stale (hidden lists), and
+        // would otherwise eat the gesture and scroll what nobody sees.
+        // The locked delta pans/scrolls the region directly; the gesture
+        // lock (`OngoingScroll`) lives for the whole gesture, never
+        // per-event, so a diagonal flick cannot drift the rows.
         if self.workspace.enabled {
+            let mut ongoing = self.ongoing.get();
+            let delta = views::diff::locked(
+                ev.delta.pixel_delta(window.line_height()),
+                ev.modifiers.shift,
+                &mut ongoing,
+                ev.touch_phase,
+            );
+            self.ongoing.set(ongoing);
             if let Some(center) = self.workspace.center.clone() {
                 if center.read(cx).list_bounds().contains(&ev.position) {
-                    let mut ongoing = self.ongoing.get();
-                    let delta = views::diff::locked(
-                        ev.delta.pixel_delta(window.line_height()),
-                        ev.modifiers.shift,
-                        &mut ongoing,
-                        ev.touch_phase,
-                    );
-                    self.ongoing.set(ongoing);
                     let mut moved = false;
                     if !delta.x.is_zero() {
                         moved |= center.read(cx).pan_pixels(-f32::from(delta.x));
@@ -5717,6 +5782,8 @@ impl DevShell {
                         let modes = self.stack_for(Some(&self.main), cx);
                         if let Resolve::Run(name) = host.keys.resolve(&modes, &[key]) {
                             let name = name.to_string();
+                            // The view.* names land on the center through
+                            // the workspace door in `run_command_from`.
                             match Self::smooth_pixels(&name, f32::from(delta.y), host.view.rows) {
                                 Some(px) => {
                                     moved |= center.update(cx, |v, _| v.scroll_pixels(px, &host));
@@ -5735,6 +5802,88 @@ impl DevShell {
                     return;
                 }
             }
+            // The sidebar rail: the wheel pans the grouped list on its own
+            // handle (`workspace.sidebar_scroll`) — the stack list's handle
+            // addresses hidden rows, so the glance must never fall through
+            // to it. Pixels accumulate to whole rail rows (uniform ROW_H
+            // items, so a trackpad's small deltas add up instead of dying
+            // to rounding); the keyboard stays where it was. Any resolved
+            // name that is not a smooth scroll is a cursor verb, ignored on
+            // a glance the way an unbound key is.
+            //
+            // The rect mirrors `workspace_body`'s geometry — title bar and
+            // destination header above, status bar below, the spec width
+            // rule on the left — the one place besides composition that
+            // names those numbers.
+            let vp = window.viewport_size();
+            let rail = views::workspace::sidebar_width(f32::from(vp.width));
+            let in_sidebar = f32::from(ev.position.x) >= 0.0
+                && f32::from(ev.position.x) < rail
+                && f32::from(ev.position.y) >= TITLE_H + views::workspace::HEADER_H
+                && f32::from(ev.position.y) < f32::from(vp.height) - chrome::STATUS_H;
+            if in_sidebar {
+                let mut moved = false;
+                if !delta.y.is_zero() {
+                    let modes = match self.panes.get("files") {
+                        Some(files) => self.stack_for(Some(files), cx),
+                        None => Modes::new(),
+                    };
+                    let grouped_len = match self.panes.get("files") {
+                        Some(Screen::Files { view, .. }) => view.read(cx).grouped().rows.len(),
+                        _ => 0,
+                    };
+                    let host = self.fresh_host(cx);
+                    let key = Key::new(
+                        match f32::from(delta.y) > 0.0 {
+                            true => Code::WheelUp,
+                            false => Code::WheelDown,
+                        },
+                        ev.modifiers.control,
+                        ev.modifiers.alt,
+                        false,
+                    );
+                    if let Resolve::Run(name) = host.keys.resolve(&modes, &[key]) {
+                        let name = name.to_string();
+                        if let Some(px) =
+                            Self::smooth_pixels(&name, f32::from(delta.y), host.view.rows)
+                        {
+                            let acc = self.workspace.sidebar_px.get() + px;
+                            // Positive pixels scrolled up: towards lower
+                            // indices, the center's own sign convention.
+                            let step = (-acc / crate::graph::ROW_H).trunc() as isize;
+                            if step != 0 {
+                                let top = self.workspace.sidebar_top.get() as isize;
+                                let max = grouped_len.saturating_sub(1) as isize;
+                                let next = (top + step).clamp(0, max);
+                                self.workspace
+                                    .sidebar_scroll
+                                    .scroll_to_item(next as usize, ScrollStrategy::Top);
+                                self.workspace.sidebar_top.set(next as usize);
+                                self.workspace.sidebar_px.set(match next == top {
+                                    // Clamped against a bound: forget the
+                                    // remainder, or the first flick back
+                                    // jumps by the stored distance.
+                                    true => 0.0,
+                                    false => acc + step as f32 * crate::graph::ROW_H,
+                                });
+                                moved |= next != top;
+                            } else {
+                                self.workspace.sidebar_px.set(acc);
+                            }
+                        }
+                    }
+                }
+                cx.stop_propagation();
+                if moved {
+                    cx.notify();
+                }
+                return;
+            }
+            // The inspector, the destination header and the chrome scroll
+            // natively or not at all: the stack underneath is hidden, and
+            // falling through would scroll a list nobody sees. Returning
+            // unconsumed leaves text inputs their own pan.
+            return;
         }
         // Over one region's rows or the other's, and not over the title bar
         // or a dropdown above them. The wheel is a glance, not a commitment:
@@ -6199,9 +6348,9 @@ impl DevShell {
                         .child(name)
                         // Presentation state, not app dispatch: the toggle
                         // names one of the registry entries this very view
-                        // published. (Carrying the selection across the
-                        // switch is Phase 4; the registry rebuild keeps the
-                        // reading position today.)
+                        // published. The rebuild keeps the reading position
+                        // and carries the selection by content (see
+                        // `snapshot_selection`); an unresolvable end drops it.
                         .on_click(move |_, _, cx| {
                             let host = config::host(cx);
                             center.update(cx, |v, cx| v.set_layout(i, &host, cx));
@@ -6235,6 +6384,72 @@ impl DevShell {
                     .children(totals)
                     .child(toggle),
             );
+        // The hunk strip: one stage/unstage chip per hunk of the shown
+        // file, each bound to its own (path, hunk) through
+        // `hunk_for_row` — the button's row, never the keyboard's. The
+        // verb follows the side on screen (staged twin unstages, every
+        // other side stages); untracked files keep the whole-file refusal
+        // through the shared submit path. Hidden unless the preview key
+        // and the loaded file agree: a strip for a stale file would stage
+        // bytes nobody is looking at.
+        let me_hunk = cx.entity().downgrade();
+        let hunk_strip: Option<AnyElement> = match &self.workspace.last {
+            Some((section, previewed, _)) => {
+                let staged_side = matches!(section, views::files::Section::Staged);
+                let shown: Vec<(String, usize)> = center
+                    .read(cx)
+                    .loaded_hunks()
+                    .into_iter()
+                    .filter(|(path, _)| previewed.as_bytes() == path.as_bytes())
+                    .collect();
+                match shown.as_slice() {
+                    [(path, hunks)] if *hunks > 0 => Some(
+                        div()
+                            .flex_none()
+                            .flex()
+                            .flex_row()
+                            .flex_wrap()
+                            .items_center()
+                            .gap(chrome::gap_s(&host.font))
+                            .px(px(12.0))
+                            .py(px(4.0))
+                            .border_b_1()
+                            .border_color(rgb(c.border))
+                            .children((0..*hunks).map(|n| {
+                                let path = path.clone();
+                                let me_hunk = me_hunk.clone();
+                                div()
+                                    .id(("ws-hunk", n))
+                                    .flex_none()
+                                    .px(chrome::gap_s(&host.font))
+                                    .py(px(2.0))
+                                    .rounded(px(chrome::RADIUS))
+                                    .cursor_pointer()
+                                    .bg(rgb(c.bg))
+                                    .text_color(rgb(host.theme.dim_on(theme::Surface::Title)))
+                                    .hover(|s| s.bg(rgb(c.raised)).text_color(rgb(c.fg)))
+                                    .child(SharedString::from(format!(
+                                        "{} hunk {}",
+                                        match staged_side {
+                                            true => "Unstage",
+                                            false => "Stage",
+                                        },
+                                        n + 1,
+                                    )))
+                                    .on_click(move |_, _, cx| {
+                                        _ = me_hunk.update(cx, |this, cx| {
+                                            this.workspace_stage_hunk(path.clone(), n, cx)
+                                        });
+                                    })
+                                    .into_any_element()
+                            }))
+                            .into_any_element(),
+                    ),
+                    _ => None,
+                }
+            }
+            None => None,
+        };
         let center_pane = div()
             .id("workspace-center")
             .debug_selector(|| "workspace-center".to_string())
@@ -6246,6 +6461,7 @@ impl DevShell {
             .overflow_hidden()
             .capture_any_mouse_down(cx.listener(|this, _, _, cx| this.set_spot(Spot::Main, cx)))
             .child(center_header)
+            .children(hunk_strip)
             .child(
                 div()
                     .min_h_0()

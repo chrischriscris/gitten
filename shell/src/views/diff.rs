@@ -1243,6 +1243,49 @@ impl Diff {
         Some((path.to_string(), file.hunks.get(hunk_no)?.clone()))
     }
 
+    /// The hunk visual row `visual` belongs to: `(path, hunk)`, resolved
+    /// through the same [`Rows::hunk_at`] map [`Diff::current_hunk`] reads —
+    /// so a per-hunk button bound to its row and a keypress on that row
+    /// always name the same hunk. `None` for headers, split holes and rows
+    /// past the end. The workspace's hunk strip enumerates the loaded
+    /// file's hunks directly (an order scan per frame is what the strip
+    /// must never pay); this is the address space those buttons live in,
+    /// pinned by test, and live in the tests, which is what it is here
+    /// for. A binary crate does not count a test as a use.
+    #[allow(dead_code)]
+    pub fn hunk_for_row(&self, visual: usize) -> Option<(String, usize)> {
+        let r = *self.order.get(visual)?;
+        let renderers = self.renderers.borrow();
+        let (path, hunk_no) = renderers.get(r.owner as usize)?.hunk_at(r.index as usize)?;
+        Some((path.to_string(), hunk_no))
+    }
+
+    /// The hunk itself for an explicit address — what the workspace's hunk
+    /// strip stages without touching the keyboard. The button's row resolved
+    /// through [`Diff::hunk_for_row`], looked up here: the same file list
+    /// [`Diff::current_hunk`] reads, so both doors stage the same bytes.
+    /// `None` when the file or the hunk number is gone — a staging write
+    /// landed between the strip's frame and the click.
+    pub fn hunk_content(&self, path: &str, hunk_no: usize) -> Option<gitten_core::Hunk> {
+        self.files
+            .iter()
+            .find(|f| f.path == path)?
+            .hunks
+            .get(hunk_no)
+            .cloned()
+    }
+
+    /// The files on screen with their hunk counts, in load order: what the
+    /// workspace's hunk strip lists without re-reading the repository. A
+    /// neighbour of [`Diff::file_summary`], which names the one file under
+    /// the keyboard — this names every file the strip can offer a button for.
+    pub fn loaded_hunks(&self) -> Vec<(String, usize)> {
+        self.files
+            .iter()
+            .map(|f| (f.path.clone(), f.hunks.len()))
+            .collect()
+    }
+
     /// Where the keyboard is, as the pane header names it. `None` when nothing
     /// on screen answers: an empty diff, a cursor past the end, or a row the
     /// presentation drew outside both vocabularies — a rendered document's
@@ -1587,16 +1630,24 @@ impl Diff {
     /// the half with tests.
     fn apply_layout(&mut self, index: usize, host: &Host) {
         let fraction = self.view.get().progress();
+        // Snapshot the selection as content before the rows it addresses die:
+        // row indices belong to the presentation being replaced, but the
+        // hunk a caret sat in survives it.
+        let carried = self
+            .sel
+            .clone()
+            .and_then(|sel| snapshot_selection(&sel, &self.renderers.borrow()));
         self.current = index;
-        // Every row about to be replaced, so a selection anchored to one of them
-        // would be pointing at whatever now has its index. There is no honest
-        // way to carry a selection across two presentations of the same diff —
-        // a replace pair is one row here and two there — so it goes.
         self.sel = None;
         // An armed discard rides the same logic: the row it was asked about
         // is about to have a different meaning.
         self.armed_hunk = None;
         let built = arrange(&self.prepared, host, &self.layouts, index);
+        // Resolve-or-drop: a carried end that names no row in the new order
+        // — a hole, a single-text presentation asked for a second column —
+        // takes the whole selection with it rather than half a highlight.
+        // Costs one order scan on a toggle, never per frame.
+        self.sel = carried.and_then(|c| restore_selection(&c, &built.renderers, &built.order));
         self.order = Rc::new(built.order);
         *self.renderers.borrow_mut() = built.renderers;
         self.widest = built.widest;
@@ -1617,6 +1668,177 @@ impl Diff {
         // when the list has measured what it now holds.
         self.defer_show(v);
     }
+}
+
+/// One end of a selection carried across a layout change as content, not
+/// rows: row indices die with the presentation that numbered them, but the
+/// hunk a caret sat in survives it — the same change, whatever shape its
+/// rows took. A replace pair is one split row and two unified ones, so a
+/// within-hunk offset cannot travel; the row's own text can, and does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CarriedCaret {
+    kind: CarriedRow,
+    /// Byte offset into the row's own text. Clamped into the found row on
+    /// restore — the new presentation may draw the same line shorter.
+    off: usize,
+}
+
+/// What a carried caret stood on: a hunk row, or a file-header row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CarriedRow {
+    /// The file, the hunk number, and the row's own text — the line's
+    /// identity when two presentations shape one hunk differently.
+    Hunk {
+        path: String,
+        hunk: usize,
+        text: String,
+    },
+    /// A file header: nobody's hunk, but it still names its file — what a
+    /// select-all's ends stand on in a multi-file diff.
+    Header { path: String },
+}
+
+/// A whole selection as content addresses, both ends plus the single part
+/// they share — a selection never spans a split divider (see
+/// [`gitten_core::select`]), so ends that would land in different parts
+/// drop it rather than half a highlight.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CarriedSelection {
+    part: u16,
+    anchor: CarriedCaret,
+    head: CarriedCaret,
+}
+
+/// The selection as content addresses, or `None` when there is no honest
+/// way back: an end on a row no presentation can name — a rendered
+/// document's body, a split hole, a gap between hunks. Snapshot against
+/// the renderers being replaced; restore against the ones replacing them.
+/// Snapshot-time only, never per frame: two trait calls per end.
+fn snapshot_selection(sel: &Selection, renderers: &[Box<dyn Rows>]) -> Option<CarriedSelection> {
+    fn caret(at: &Caret, part: u16, renderers: &[Box<dyn Rows>]) -> Option<CarriedCaret> {
+        let (owner, index) = at.row;
+        let rows = renderers.get(owner as usize)?;
+        let index = index as usize;
+        let kind = match rows.hunk_at(index) {
+            Some((path, hunk)) => CarriedRow::Hunk {
+                path: path.to_string(),
+                hunk,
+                text: rows.selectable(index, part).unwrap_or("").to_string(),
+            },
+            None if rows.is_header(index) => CarriedRow::Header {
+                path: rows.selectable(index, 0).unwrap_or("").to_string(),
+            },
+            None => return None,
+        };
+        Some(CarriedCaret { kind, off: at.off })
+    }
+    Some(CarriedSelection {
+        part: sel.part(),
+        anchor: caret(sel.anchor(), sel.part(), renderers)?,
+        head: caret(sel.head(), sel.part(), renderers)?,
+    })
+}
+
+/// The carried ends back onto rows of the new order, or `None` when either
+/// end names nothing there. One order scan per end on a toggle, never per
+/// frame: [`Selection::resolve`] rebuilds the visual cache the render path
+/// reads, so a failed resolve drops rather than leaves stale ranges.
+fn restore_selection(
+    carried: &CarriedSelection,
+    renderers: &[Box<dyn Rows>],
+    order: &[RowRef],
+) -> Option<Selection> {
+    /// The row a carried end lands on: the first row in draw order whose
+    /// hunk (or header path) matches and which holds the carried line in
+    /// *any* part. The caret itself never leaves the selection's column —
+    /// a unified addition lives in split's right cell, but a part-0
+    /// selection over that pair row still covers its left cell, so the
+    /// row is found by line presence and read in the carried part. The
+    /// one remap: a non-zero part into a row whose parts all read the
+    /// same text is a single-text presentation, which highlights part 0
+    /// only (see [`selected`]) — landing in part 1 would select nothing.
+    fn find(
+        target: &CarriedCaret,
+        part: u16,
+        renderers: &[Box<dyn Rows>],
+        order: &[RowRef],
+    ) -> Option<(u16, RowId, usize)> {
+        for r in order {
+            let (owner, index) = r.logical();
+            let rows = renderers.get(owner as usize)?;
+            let index = index as usize;
+            let matches = match &target.kind {
+                CarriedRow::Hunk { path, hunk, .. } => rows
+                    .hunk_at(index)
+                    .is_some_and(|(p, n)| p == path && n == *hunk),
+                CarriedRow::Header { path } => {
+                    rows.is_header(index) && rows.selectable(index, 0) == Some(path.as_str())
+                }
+            };
+            if !matches {
+                continue;
+            }
+            let want = match &target.kind {
+                CarriedRow::Hunk { text, .. } => text.as_str(),
+                CarriedRow::Header { path } => path.as_str(),
+            };
+            // Either cell holding the line finds the row: a shared context
+            // line reads the same in both, so this only matters when the
+            // cells differ — a unified addition lives in split's right cell
+            // while the caret never leaves the selection's column.
+            // (Presentations draw at most two columns; 0 and 1 cover every
+            // row either door can build.)
+            if [0, 1]
+                .iter()
+                .any(|&p| rows.selectable(index, p) == Some(want))
+            {
+                let single = part != 0 && rows.selectable(index, 0) == rows.selectable(index, part);
+                let landed = match single {
+                    true => 0,
+                    false => part,
+                };
+                return Some((landed, (owner, index as u32), target.off));
+            }
+        }
+        None
+    }
+    /// The carried offset into the found row's text: clamped into it and
+    /// backed up to a character boundary, the same snap
+    /// [`Selected::range`] applies on the way out — the new presentation
+    /// may draw the same line shorter, or its characters may have moved.
+    fn clamp(off: usize, text: &str) -> usize {
+        let mut off = off.min(text.len());
+        while off > 0 && !text.is_char_boundary(off) {
+            off -= 1;
+        }
+        off
+    }
+    let text_of = |row: RowId, part: u16| -> &str {
+        let (owner, index) = row;
+        renderers
+            .get(owner as usize)
+            .and_then(|r| r.selectable(index as usize, part))
+            .unwrap_or("")
+    };
+    let (apart, arow, aoff) = find(&carried.anchor, carried.part, renderers, order)?;
+    let (hpart, hrow, hoff) = find(&carried.head, carried.part, renderers, order)?;
+    if apart != hpart {
+        return None;
+    }
+    let mut sel = Selection::new(
+        apart,
+        Caret {
+            row: arow,
+            off: clamp(aoff, text_of(arow, apart)),
+            at: 0..0,
+        },
+    );
+    sel.extend(Caret {
+        row: hrow,
+        off: clamp(hoff, text_of(hrow, hpart)),
+        at: 0..0,
+    });
+    sel.resolve(order).then_some(sel)
 }
 
 /// What one pass of stages 3–5 produces.
@@ -3983,9 +4205,10 @@ diff --git a/a.rs b/a.rs
     }
 
     #[test]
-    fn a_selection_survives_a_reflow_and_dies_with_a_layout_change() {
+    fn a_selection_survives_a_reflow_and_crosses_a_layout_change() {
         // The two halves of the rule: a wrap is the same diff at a different
-        // width, and a layout is a different diff of the same repository.
+        // width, and a layout is the same diff in different rows — carried
+        // by content, never by row index.
         let host = Host::new();
         let mut diff = Diff::with_layouts(parse_unified_diff(LONG), &host, Layouts::builtin());
         diff.reflow(width_for(200, &host), &host);
@@ -3996,9 +4219,25 @@ diff --git a/a.rs b/a.rs
         assert!(diff.sel.is_some(), "a resize threw the selection away");
         assert_eq!(diff.selection(), text, "the same bytes, at a new width");
 
+        // Row counts legitimately differ across presentations — a replace
+        // pair is two unified rows and one split one — so what travels is
+        // the set of hunks under the highlight, never a new one.
+        let covered: Vec<_> = diff
+            .sel
+            .as_ref()
+            .expect("a selection is standing")
+            .rows()
+            .map(|i| diff.hunk_for_row(i))
+            .collect();
+        assert!(!covered.is_empty());
         diff.apply_layout(1, &host);
-        assert!(diff.sel.is_none(), "the rows are somebody else's now");
-        assert_eq!(diff.selection(), "");
+        let carried = diff.sel.as_ref().expect("the selection crossed layouts");
+        let crossed: Vec<_> = carried.rows().map(|i| diff.hunk_for_row(i)).collect();
+        assert!(!crossed.is_empty(), "the crossing emptied the highlight");
+        assert!(
+            crossed.iter().all(|h| covered.contains(h)),
+            "the rows are somebody else's now: {crossed:?} not in {covered:?}"
+        );
     }
 
     #[test]
@@ -4955,11 +5194,24 @@ diff --git a/b.md b/b.md
             "the cursor landed on a different logical row"
         );
 
-        // The other half of the rule still holds: an actual presentation
-        // change still drops the selection.
+        // The other half of the rule: an actual presentation change carries
+        // the selection by content rather than dropping it — the same
+        // (path, hunk) under the highlight, on the new presentation's rows.
+        // What still drops is an end no presentation can name back (a hole,
+        // a rendered document's body), never a stale row index.
+        let covered: Vec<_> = diff
+            .sel
+            .as_ref()
+            .map(|sel| sel.rows().map(|i| diff.hunk_for_row(i)).collect::<Vec<_>>())
+            .expect("a selection is standing");
         diff.apply_layout(1, &host);
-        assert!(
-            diff.sel.is_none(),
+        let carried = diff.sel.as_ref().expect("the selection crossed layouts");
+        assert_eq!(
+            carried
+                .rows()
+                .map(|i| diff.hunk_for_row(i))
+                .collect::<Vec<_>>(),
+            covered,
             "a layout change kept a selection anchored to somebody else's rows"
         );
     }
@@ -5990,5 +6242,91 @@ diff --git a/two.txt b/two.txt
         assert!(!d.confirm_or_arm_discard_hunk(id));
         assert!(d.confirm_or_arm_discard_hunk(id));
         assert!(!d.confirm_or_arm_discard_hunk(id));
+    }
+
+    #[test]
+    fn a_selection_survives_a_layout_round_trip() {
+        // A selection inside one shared line round-trips exactly — content
+        // addresses, not row indices — while an armed discard still dies
+        // on the switch. A selection spanning both sides of a replace pair
+        // cannot round-trip byte-for-byte (one split row, two unified
+        // ones, one column): it stays visible on the same hunk instead.
+        let host = Rc::new(Host::new());
+        let mut d = Diff::with_layouts(parse_unified_diff(THREE_HUNKS), &host, Layouts::builtin());
+        with_height(&mut d, 20);
+        // Row 2 is hunk 0's ` alpha` context line, shared by both columns.
+        assert_eq!(hunk_at_row(&d, 2).as_deref(), Some("one.txt#0"));
+        let mut start = Selection::new(0, Caret::new(d.order[2].logical(), 1, 2));
+        start.extend(Caret::new(d.order[2].logical(), 3, 2));
+        assert!(start.resolve(&d.order));
+        d.sel = Some(start.clone());
+
+        // Armed against row 3: the toggle spends the question, not the
+        // selection.
+        let armed = d.order[3].logical();
+        assert!(!d.confirm_or_arm_discard_hunk(armed), "first press asks");
+
+        d.apply_layout(1, &host);
+        assert!(d.armed_hunk.is_none(), "the arm died with the rows");
+        let sel = d.sel.clone().expect("the selection crossed to split");
+        assert_eq!(sel.part(), 0);
+        assert_eq!(d.selection(), "lp", "the same bytes of the shared line");
+        d.apply_layout(0, &host);
+        assert_eq!(d.sel, Some(start), "the round trip restores the carets");
+
+        // Rows 3 and 4 are hunk 0's `-beta` / `+BETA` pair: one pair row
+        // in split, two lines in unified. The selection stays on the hunk
+        // in both directions rather than dropping.
+        let mut across = Selection::new(0, Caret::new(d.order[3].logical(), 1, 3));
+        across.extend(Caret::new(d.order[4].logical(), 4, 4));
+        assert!(across.resolve(&d.order));
+        d.sel = Some(across);
+        for layout in [1, 0] {
+            d.apply_layout(layout, &host);
+            let sel = d.sel.clone().expect("the pair selection survived");
+            assert!(!sel.rows().is_empty());
+            for i in sel.rows() {
+                assert_eq!(
+                    d.hunk_for_row(i),
+                    Some(("one.txt".to_string(), 0)),
+                    "row {i} left the hunk"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn button_row_and_keyboard_name_the_same_hunk() {
+        // Every visual row, in both presentations: the hunk strip's
+        // `hunk_for_row` (the button's address) and `current_hunk` with the
+        // keyboard parked there (the keypress's address) name the same file
+        // and the same hunk contents — or both name nothing.
+        let host = Rc::new(Host::new());
+        let mut d = Diff::with_layouts(parse_unified_diff(THREE_HUNKS), &host, Layouts::builtin());
+        with_height(&mut d, 20);
+        for layout in [0, 1] {
+            d.apply_layout(layout, &host);
+            for i in 0..d.order.len() {
+                let mut v = d.view.get();
+                v.go_to(i);
+                d.view.set(v);
+                match d.hunk_for_row(i) {
+                    Some((path, no)) => {
+                        let (cpath, hunk) = d.current_hunk().expect("the keyboard names it too");
+                        assert_eq!(path, cpath, "row {i}: same file");
+                        let file = d.files.iter().find(|f| f.path == path).expect("loaded");
+                        assert_eq!(
+                            file.hunks.get(no),
+                            Some(&hunk),
+                            "row {i}: same hunk contents"
+                        );
+                    }
+                    None => assert!(
+                        d.current_hunk().is_none(),
+                        "row {i}: the keyboard must name nothing either"
+                    ),
+                }
+            }
+        }
     }
 }

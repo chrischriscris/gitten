@@ -234,3 +234,36 @@ responsive rules, contrast resolution on all 11 surfaces, system-font
 vs mono decision. Visual QA so far is headless (code re-read for ids,
 focus paths, memo discipline); `./dev dump` is TUI-only and the desktop
 window was not launched per project rules.
+
+## Phase 4A status (stabilize run on top of 24c4a78)
+
+DONE:
+
+- Selection-preserving toggle: `Selection::head()` accessor
+  (`core/src/select.rs`) + `CarriedCaret`/`CarriedSelection` snapshot and
+  `restore_selection` in `views/diff.rs`, with round-trip tests
+  (`a_selection_survives_a_reflow_and_crosses_a_layout_change`,
+  `a_selection_survives_a_layout_round_trip`).
+- Per-hunk buttons: `hunk_for_row` / `hunk_content` / `loaded_hunks`
+  (`views/diff.rs`) + shared `submit_hunk_patch` tail and
+  `workspace_stage_hunk` (`main.rs`), with the
+  `button_row_and_keyboard_name_the_same_hunk` test proving button and
+  keypress address the same hunk.
+- Gesture audit / sidebar wheel follow: sub-row remainder (`sidebar_px`)
+  plus clamp stepping through `scroll_to_item` in the workspace wheel
+  path. The handle's own top-index getter is test-gated upstream, so the
+  rail carries a `sidebar_top` mirror stepped beside every programmatic
+  scroll.
+- Stabilizer repair (compile + one red test): the 4A refactor had moved
+  the discard two-press arm ahead of the untracked-file creation refusal,
+  so `diff.discard-hunk` armed a live question on an unservable hunk.
+  The arm now lives in `submit_hunk_patch` after the refusal (keyboard
+  passes its row, the strip passes `None` — it never discards), restoring
+  the original refuse-before-arm order.
+
+STILL OWING (resume pass): the `sidebar_top` mirror desyncs on
+scrollbar-thumb drags (native scrolls bypass it) and `ScrollStrategy::Top`
+is non-strict, so a step whose target is already visible spends the
+remainder without moving; both need the resume's reconcile-or-strict
+decision. No `STUB(phase4-resume)` markers were needed — everything
+committed compiles and is tested.
