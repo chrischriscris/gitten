@@ -1048,14 +1048,50 @@ impl Screen {
 #[derive(Clone, Debug)]
 enum Notice {
     Info(String),
-    Question(String),
+    Question { text: String, answers: Vec<Answer> },
+}
+
+/// One clickable answer to a standing question: the label the band draws
+/// and the command name clicking runs. Clicking is running the name — the
+/// same arm/execute logic, cursor-move disarm, and verbatim errors as the
+/// palette path — so answers stay names, never closures.
+#[derive(Clone, Debug)]
+struct Answer {
+    label: &'static str,
+    command: &'static str,
+}
+
+/// The clickable answers a standing question offers, by the command
+/// that asked it. Every entry is a name the palette runs: same-command
+/// answers re-arm or execute through the view's own arm logic, and the
+/// reset menu's three strengths answer through their own names. A
+/// command with no entry asks text-only — the band still shows the
+/// sentence, and Esc still dismisses it.
+fn question_answers(command: &str) -> &'static [(&'static str, &'static str)] {
+    match command {
+        "diff.discard-hunk" => &[("Discard", "diff.discard-hunk")],
+        "files.discard" => &[("Discard", "files.discard")],
+        "branches.delete" => &[("Delete", "branches.delete")],
+        "stashes.drop" => &[("Drop", "stashes.drop")],
+        "commits.reset-menu" => &[
+            ("Soft", "commits.reset-soft"),
+            ("Mixed", "commits.reset-mixed"),
+            ("Hard", "commits.reset-hard"),
+        ],
+        "commits.squash-up" => &[("Squash", "commits.squash-up")],
+        "commits.fixup-up" => &[("Fixup", "commits.fixup-up")],
+        "commits.drop-commit" => &[("Drop", "commits.drop-commit")],
+        "commits.rebase-onto" => &[("Rebase", "commits.rebase-onto")],
+        _ => &[],
+    }
 }
 
 impl Notice {
     /// The band's sentence, whichever of the two it is.
     fn text(&self) -> &str {
         match self {
-            Notice::Info(text) | Notice::Question(text) => text,
+            Notice::Info(text) => text,
+            Notice::Question { text, .. } => text,
         }
     }
 }
@@ -1628,8 +1664,13 @@ impl DevShell {
 
     /// An armed question — the sentence a second press spends, asked once in
     /// the band and answered by the next press or a move of the cursor.
+    /// Answers start empty; the dispatch attaches them from the command
+    /// that asked, so every button is a name the palette could run.
     fn set_question(&mut self, message: impl Into<String>) {
-        self.notice = Some(Notice::Question(message.into()));
+        self.notice = Some(Notice::Question {
+            text: message.into(),
+            answers: Vec::new(),
+        });
     }
 
     fn open_input(&mut self, input: Entity<input::Input>, cx: &mut Context<Self>) {
@@ -4039,7 +4080,28 @@ impl DevShell {
     /// The client's own commands first, then the screen's. That order is what
     /// lets a screen override `back` one day without this file having to know.
     fn run_command(&mut self, command: &str, cx: &mut Context<Self>) {
+        // A question asked below carries no answers of its own — the asking
+        // verb only knows its sentence — so the dispatch attaches them from
+        // the command that asked. Buttons are then a view of the notice:
+        // same names the palette runs, vanishing with it.
+        let had_question = matches!(self.notice, Some(Notice::Question { .. }));
+        let before = self.notice.as_ref().map(|n| n.text().to_string());
         self.run_command_from(command, None, cx);
+        let fresh = match &self.notice {
+            Some(Notice::Question { text, answers }) if answers.is_empty() => {
+                !had_question || before.as_deref() != Some(text.as_str())
+            }
+            _ => false,
+        };
+        if fresh {
+            let answers: Vec<Answer> = question_answers(command)
+                .iter()
+                .map(|&(label, command)| Answer { label, command })
+                .collect();
+            if let Some(Notice::Question { answers: slot, .. }) = &mut self.notice {
+                *slot = answers;
+            }
+        }
     }
 
     /// [`DevShell::run_command`] with the pane the event came *over*. The
@@ -4277,6 +4339,21 @@ impl DevShell {
             return;
         }
         if self.open.take().is_some() {
+            cx.notify();
+            return;
+        }
+        // A standing question dismisses before anything it overlaid: Esc
+        // is "never mind", and the Cancel button beside the question runs
+        // this same path. The commits timeline disarms with its text, as
+        // before; every other view's arm is row-anchored and lapses on a
+        // cursor move, so answering again re-arms honestly.
+        if matches!(self.notice, Some(Notice::Question { .. })) {
+            if let Some(Screen::Commits { view, .. }) = self.active() {
+                if view.read(cx).armed() {
+                    view.update(cx, |v, _| v.disarm());
+                }
+            }
+            self.notice = None;
             cx.notify();
             return;
         }
@@ -6454,6 +6531,18 @@ impl Render for DevShell {
             // what was tried since. A prompt empties the hints honestly —
             // its field owns the keyboard and speaks for itself.
             .child({
+                // The question's answers, when the sentence on screen is a
+                // question and not an error: one button per answer plus
+                // Cancel. Clicking runs the same names the palette would —
+                // the arm/execute logic, disarm, and errors are the
+                // command's own — and Cancel runs back, the Esc path.
+                // Read before `message` below moves `error`.
+                let answers: &[Answer] = match (&error, &notice) {
+                    (None, Some(Notice::Question { answers, .. })) => answers,
+                    _ => &[],
+                };
+                let questioning =
+                    error.is_none() && matches!(notice, Some(Notice::Question { .. }));
                 let message = error
                     .map(|e| (e, c.error))
                     // A question takes the error's ink and not this: quiet is
@@ -6465,7 +6554,7 @@ impl Render for DevShell {
                                 text.as_str().into(),
                                 host.theme.dim_on(theme::Surface::Status),
                             ),
-                            Notice::Question(text) => (text.as_str().into(), c.error),
+                            Notice::Question { text, .. } => (text.as_str().into(), c.error),
                         })
                     })
                     .or_else(|| running.map(|n| (n, host.theme.dim_on(theme::Surface::Status))));
@@ -6495,6 +6584,33 @@ impl Render for DevShell {
                         .text_color(rgb(host.theme.dim_on(theme::Surface::Status)))
                         .text_size(px((host.font.size * chrome::STATUS_TEXT_SCALE).round()))
                         .child(div().min_w_0().truncate().text_color(rgb(ink)).child(text))
+                        // The answers, when the sentence is a question: action
+                        // ink for the doing, furniture ink for the leaving.
+                        // Each id names its row so a second answer never
+                        // steals the first one's clicks.
+                        .children(answers.iter().enumerate().map(|(i, answer)| {
+                            let command = answer.command;
+                            div()
+                                .id(SharedString::from(format!("band-answer-{i}")))
+                                .flex_none()
+                                .cursor_pointer()
+                                .text_color(rgb(c.accent))
+                                .child(answer.label)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.run_command(command, cx);
+                                }))
+                        }))
+                        .children(questioning.then(|| {
+                            div()
+                                .id("band-cancel")
+                                .flex_none()
+                                .cursor_pointer()
+                                .text_color(rgb(host.theme.quiet_on(c.status_bg)))
+                                .child("Cancel")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.run_command("back", cx);
+                                }))
+                        }))
                         // An error says how to leave, in the faint ink of
                         // furniture: the summary is the sentence, this is the
                         // small print. No live key, no piece — the help
@@ -10407,6 +10523,56 @@ diff --git a/fresh.txt b/fresh.txt
         shell.update(cx, |shell, cx| shell.run_command("files.discard", cx));
         pump_write(&shell, cx);
         assert_eq!(repo.wrote(), vec!["discard notes.md"]);
+    }
+
+    #[gpui::test]
+    fn standing_questions_carry_clickable_answers(cx: &mut TestAppContext) {
+        // The band button must name the armed command: clicking is running
+        // it through the same dispatch the palette uses.
+        let (shell, _repo, _handle) = files_shell(cx);
+        shell.update(cx, |shell, cx| shell.run_command("files.discard", cx));
+        let answers = shell.read_with(cx, |shell, _| match &shell.notice {
+            Some(Notice::Question { answers, .. }) => answers.clone(),
+            other => panic!("no standing question: {other:?}"),
+        });
+        assert_eq!(
+            answers
+                .iter()
+                .map(|answer| (answer.label, answer.command))
+                .collect::<Vec<_>>(),
+            [("Discard", "files.discard")],
+        );
+
+        // The reset menu arms three strengths, each its own command.
+        let (history, _repo) = history_shell(cx);
+        history.update(cx, |shell, cx| shell.run_command("commits.reset-menu", cx));
+        let answers = history.read_with(cx, |shell, _| match &shell.notice {
+            Some(Notice::Question { answers, .. }) => answers.clone(),
+            other => panic!("no standing question: {other:?}"),
+        });
+        assert_eq!(
+            answers
+                .iter()
+                .map(|answer| (answer.label, answer.command))
+                .collect::<Vec<_>>(),
+            [
+                ("Soft", "commits.reset-soft"),
+                ("Mixed", "commits.reset-mixed"),
+                ("Hard", "commits.reset-hard"),
+            ],
+        );
+    }
+
+    #[gpui::test]
+    fn back_dismisses_a_standing_question(cx: &mut TestAppContext) {
+        // Cancel is back is Esc: the sentence leaves, nothing runs. The
+        // arm lapses with the row, so answering again re-arms honestly.
+        let (shell, repo, _handle) = files_shell(cx);
+        shell.update(cx, |shell, cx| shell.run_command("files.discard", cx));
+        shell.update(cx, |shell, cx| shell.run_command("back", cx));
+        shell.read_with(cx, |shell, _| assert!(shell.notice.is_none()));
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(repo.wrote().is_empty());
     }
 
     #[gpui::test]

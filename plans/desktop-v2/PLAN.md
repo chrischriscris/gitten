@@ -450,10 +450,32 @@ TUI/CLI untouched — the registry, bindings, and keymaps still serve them.
   `commands.palette` is a real filter dialog (toolbar button, Ctrl-K,
   macOS Cmd-K menu adapter).
 - Confirmation flows (discard two-press, reset answers) still run through
-  named commands, so the palette answers them — but no clickable dialog
-  buttons exist yet. Flagged follow-up, not silently kept.
+  named commands, so the palette answers them — and the band now answers
+  them too (see confirm-buttons record below).
 - Reverted out of scope: a `vercel` theme + mock restyle the run produced
   unasked (`core/`, `app/`, `artifacts/`, `docs/` restored verbatim).
 - Tests: command-key driving + help/context-menu tests deleted with
   reason; focus/esc/search/commit/tag/reset/discard behavior kept via
   `run_command`; reset copy updated to match.
+
+## Confirm buttons (landed): standing questions answer by click
+
+The status band renders one button per answer beside a standing question
+plus Cancel. shell 373 (incl. 2 new) · app 155 · core 498 green; fmt +
+workspace clippy `-D warnings` clean. `core`/`app` untouched.
+
+- `Notice::Question` carries `answers: Vec<Answer>` (label + command
+  name, both `&'static str`) beside the text; `text()`/`Deref` unchanged
+  so text-matching tests were untouched.
+- `run_command` attaches answers from the asking command via
+  `question_answers` (discard-hunk/file, branch delete, stash drop,
+  squash/fixup/drop-commit, rebase-onto answer themselves; reset-menu
+  arms soft/mixed/hard). Freshness-guarded: only a newly-asked,
+  still-answerless question is annotated, so stale text never gains
+  another command's buttons. Unmapped commands ask text-only.
+- Cancel runs `back` — the Esc path — and `back` now dismisses a standing
+  question (clearing its text and disarming the commits timeline, as Esc
+  already disarmed it). Clicking an answer === running that command:
+  same arm/execute, cursor-move disarm, verbatim errors.
+- No copy changes: "press again" names no key, and Esc is a kept native
+  key, so every question text still reads true.
