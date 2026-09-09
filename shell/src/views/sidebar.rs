@@ -19,6 +19,7 @@ use super::files::{Entry, Files, GroupedRow};
 use super::workspace::Destination;
 use crate::chrome::{self, empty_line, list_row, path_spans, section_label};
 use crate::graph::ROW_H;
+use gitten_core::groups::StageFraction;
 use gitten_core::theme::Surface;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
@@ -97,7 +98,21 @@ pub(crate) fn render_sidebar(deps: &SidebarDeps, cx: &mut App) -> AnyElement {
                             return empty_line(&host, SharedString::from(""));
                         };
                         let current = vp == cursor;
-                        let staged = f.section == super::files::Section::Staged;
+                        // The box is the fraction, not the section: a staged
+                        // twin reads Full and draws checked, an unstaged twin
+                        // reads Partial and draws the remainder mark, anything
+                        // else draws empty. All three dispatch the same
+                        // `files.stage` name — the act behind it stages a
+                        // twin's remainder and unstages a whole — so the box
+                        // and the keyboard never disagree about one row.
+                        let box_fill = matches!(f.fraction, StageFraction::Full { .. });
+                        let partial = matches!(f.fraction, StageFraction::Partial { .. });
+                        let fraction_note: Option<SharedString> = match f.fraction {
+                            StageFraction::Partial { staged, total } => {
+                                Some(SharedString::from(format!("{staged}/{total}")))
+                            }
+                            _ => None,
+                        };
                         let files_click = files.clone();
                         let files_stage = files.clone();
                         let stage_cmd = dispatch.clone();
@@ -105,21 +120,30 @@ pub(crate) fn render_sidebar(deps: &SidebarDeps, cx: &mut App) -> AnyElement {
                         let preview_row = dispatch.clone();
                         let row = list_row(&host, current, focused, ROW_H)
                             .child(
-                                // The stage checkbox: filled in accent when the
-                                // row's side is staged, an empty box otherwise.
-                                // Partial state and hunk fractions are Phase 3.
+                                // The stage checkbox: checked when the row's
+                                // side is fully staged, a remainder mark over
+                                // a `staged/total` fraction when partially
+                                // staged, an empty box otherwise. Plain text
+                                // marks only — no icon-font codepoint the
+                                // configured face may not carry.
                                 div()
                                     .id(("ws-stage", i))
                                     .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
                                     .w(px(14.0))
                                     .h(px(14.0))
                                     .rounded(px(3.0))
                                     .border_1()
-                                    .border_color(rgb(match staged {
+                                    .border_color(rgb(match box_fill {
                                         true => host.theme.chrome.accent,
                                         false => host.theme.chrome.faint,
                                     }))
-                                    .when(staged, |d| d.bg(rgb(host.theme.chrome.accent)))
+                                    .when(box_fill, |d| d.bg(rgb(host.theme.chrome.accent)))
+                                    .when(partial, |d| {
+                                        d.text_color(rgb(host.theme.chrome.fg)).child("\u{2212}")
+                                    })
                                     .cursor_pointer()
                                     .on_mouse_down(
                                         MouseButton::Left,
@@ -145,6 +169,13 @@ pub(crate) fn render_sidebar(deps: &SidebarDeps, cx: &mut App) -> AnyElement {
                                 },
                                 false,
                             )))
+                            .children(fraction_note.map(|note| {
+                                div()
+                                    .flex_none()
+                                    .text_color(rgb(host.theme.dim_on(Surface::Context)))
+                                    .child(note)
+                                    .into_any_element()
+                            }))
                             .child(
                                 div()
                                     .flex_none()

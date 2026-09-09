@@ -305,6 +305,15 @@ pub struct HeadInfo {
     /// spelled, not numbers, so the strip paints each in its own ink
     /// without allocating per frame.
     pub drift: Option<Drift>,
+    /// The upstream branch's short name (`main`), for the toolbar's
+    /// `from <base>` half — spelled once here so the strip clones a
+    /// refcount per frame. `None` with no upstream, which is also when
+    /// [`HeadInfo::ahead`] is unknowable.
+    pub base: Option<SharedString>,
+    /// The remote the upstream lives on (`origin`), for the status bar —
+    /// what a push addresses and a fetch updates, spelled beside the
+    /// branch rather than re-derived per frame.
+    pub remote: Option<SharedString>,
 }
 
 /// The title chip's dim half, spelled once at flatten: `↑2` and `↓0` as
@@ -344,6 +353,8 @@ fn head_info(head: Option<&HeadState>, local: &[Branch]) -> Option<HeadInfo> {
                 label,
                 ahead: None,
                 behind: None,
+                base: None,
+                remote: None,
             })
         }
         HeadState::Branch { .. } => local.iter().find(|b| b.head).map(|b| {
@@ -357,6 +368,14 @@ fn head_info(head: Option<&HeadState>, local: &[Branch]) -> Option<HeadInfo> {
                 label,
                 ahead,
                 behind,
+                base: b
+                    .upstream
+                    .as_ref()
+                    .map(|u| SharedString::from(u.branch.to_string_lossy().into_owned())),
+                remote: b
+                    .upstream
+                    .as_ref()
+                    .map(|u| SharedString::from(u.remote.to_string_lossy().into_owned())),
             }
         }),
     }
@@ -1684,6 +1703,8 @@ mod tests {
                     up: "↑1".into(),
                     down: "↓2".into(),
                 }),
+                base: Some("main".into()),
+                remote: Some("origin".into()),
             }),
             "the numbers core measured, verbatim — and the chip spelled once"
         );
@@ -1703,6 +1724,8 @@ mod tests {
             "a vanished ref measures to nothing"
         );
         assert_eq!(hi.drift, None, "and the chip invents no zeros for it");
+        assert_eq!(hi.base.as_deref(), Some("main"));
+        assert_eq!(hi.remote.as_deref(), Some("origin"));
     }
 
     #[test]

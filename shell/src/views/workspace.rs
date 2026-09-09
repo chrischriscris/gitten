@@ -17,6 +17,7 @@
 
 use super::diff::Diff;
 use super::files::Section;
+use crate::input::Input;
 use gitten_core::status::PathBytes;
 use gpui::{Entity, UniformListScrollHandle};
 
@@ -86,6 +87,21 @@ pub struct Workspace {
     /// pane's *cursor* but pans its own rows: grouped space has its own
     /// addresses, so the stack list's handle cannot serve it.
     pub sidebar_scroll: UniformListScrollHandle,
+    /// The inspector's two fields, built once on first entry and refilled
+    /// from the draft store whenever the repository changes. Owned here —
+    /// beside the center view they serve — rather than in the modal prompt
+    /// slot, which spends its field on accept while these survive it.
+    #[allow(dead_code)]
+    // STUB(phase3-resume): built on first workspace entry, refilled from drafts.
+    pub summary: Option<Entity<Input>>,
+    #[allow(dead_code)]
+    // STUB(phase3-resume): built on first workspace entry, refilled from drafts.
+    pub description: Option<Entity<Input>>,
+    /// Which repository key the fields were last filled for. A switch
+    /// refills them from that repository's draft instead of leaking the
+    /// previous one's unsent words across.
+    #[allow(dead_code)] // STUB(phase3-resume): tracks which repo the fields were filled for.
+    pub fields_key: Option<String>,
 }
 
 impl Default for Workspace {
@@ -97,6 +113,9 @@ impl Default for Workspace {
             request: 0,
             last: None,
             sidebar_scroll: UniformListScrollHandle::new(),
+            summary: None,
+            description: None,
+            fields_key: None,
         }
     }
 }

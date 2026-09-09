@@ -14,6 +14,7 @@
 use super::{accept_deferred_scroll, vertical_scrollbar, DeferredScrollbar, PendingScroll};
 use crate::chrome::{empty_line, list_row, path_spans, section_label};
 use crate::graph::ROW_H;
+use gitten_core::groups::StageFraction;
 use gitten_core::host::Host;
 use gitten_core::status::{Change, ConflictKind, PathBytes, Status};
 use gitten_core::theme::{Rgb, Surface};
@@ -21,7 +22,7 @@ use gitten_core::view::Viewport;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use std::cell::Cell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 /// One flat row of the pane: a section heading or one file.
@@ -64,6 +65,26 @@ pub(crate) struct FileEntry {
     pub mark: Mark,
     /// The letter(s) themselves, git's own spelling: `A`, `M`, `UU`, `?`.
     pub letters: &'static str,
+    /// How much of this path the index holds, decided once at flatten from
+    /// the hunk counts the refresh read — never per frame. Staged rows are
+    /// `Full` by section; unstaged twins read their `(staged, total)`; rows
+    /// with no count behind them are `Unstaged`, the file-level truth the
+    /// counts refine. The sidebar's checkbox and the inspector's fractions
+    /// both read this, so the two never disagree about one path.
+    pub fraction: StageFraction,
+}
+
+/// One staged path for the inspector's summary: where it is, what to call
+/// it, and how many of its hunks the index holds out of how many the refresh
+/// counted. `(0, 0)` is a skipped side read, not an empty stage — the row
+/// still lists, because the status read said the file is staged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // STUB(phase3-resume): read by the inspector's staged summary.
+pub(crate) struct StagedFile {
+    pub(crate) dir: SharedString,
+    pub(crate) name: SharedString,
+    pub(crate) path_text: SharedString,
+    pub(crate) hunks: (u32, u32),
 }
 
 /// The four questions a status panel asks, in draw order.
@@ -194,12 +215,34 @@ pub(crate) struct Prepared {
     /// The distinct-path count the label spells, kept so the pane can hand it
     /// to the header without recounting — see [`Files::changed`].
     pub(crate) changed: usize,
+    /// Per-path `(staged, total)` hunk counts, by raw path bytes — the
+    /// inspector's staged summary and the status bar's staged total read
+    /// this rather than re-reading the repository. Built beside the status
+    /// read on the refresh thread; moved here so the pane owns one copy.
+    pub(crate) counts: HashMap<Vec<u8>, (u32, u32)>,
 }
 
 /// Flattens a status into display rows: one heading per non-empty section,
 /// then that section's files, in [`Section::all`] order.
-pub(crate) fn flatten(status: &Status) -> Vec<Entry> {
+///
+/// `counts` is the refresh's per-path `(staged, total)` hunk map — see
+/// [`Prepared::counts`]. A staged row is `Full` by section (the row *is* the
+/// staged side); an unstaged twin reads its pair and derives
+/// [`StageFraction`]; anything without a count behind it is file-level
+/// `Unstaged`, which is the truth before any side was read.
+pub(crate) fn flatten(status: &Status, counts: &HashMap<Vec<u8>, (u32, u32)>) -> Vec<Entry> {
     use Entry::*;
+    let fraction = |section: Section, path: &PathBytes| match section {
+        Section::Staged => match counts.get(path.as_bytes()) {
+            Some(&(staged, _)) => StageFraction::Full { total: staged },
+            None => StageFraction::Full { total: 0 },
+        },
+        Section::Unstaged => match counts.get(path.as_bytes()) {
+            Some(&(staged, total)) => gitten_core::groups::stage_fraction(staged, total),
+            None => StageFraction::Unstaged { total: 0 },
+        },
+        Section::Untracked | Section::Conflicts => StageFraction::Unstaged { total: 0 },
+    };
     let mut rows = Vec::new();
     for section in Section::all() {
         let files: Vec<FileEntry> = match section {
@@ -208,7 +251,14 @@ pub(crate) fn flatten(status: &Status) -> Vec<Entry> {
                 .iter()
                 .map(|e| {
                     let mark = Mark::of(e.change);
-                    file(section, &e.path, e.old_path.as_ref(), mark, mark.letter())
+                    file(
+                        section,
+                        &e.path,
+                        e.old_path.as_ref(),
+                        mark,
+                        mark.letter(),
+                        fraction(section, &e.path),
+                    )
                 })
                 .collect(),
             Section::Unstaged => status
@@ -216,13 +266,29 @@ pub(crate) fn flatten(status: &Status) -> Vec<Entry> {
                 .iter()
                 .map(|e| {
                     let mark = Mark::of(e.change);
-                    file(section, &e.path, None, mark, mark.letter())
+                    file(
+                        section,
+                        &e.path,
+                        None,
+                        mark,
+                        mark.letter(),
+                        fraction(section, &e.path),
+                    )
                 })
                 .collect(),
             Section::Untracked => status
                 .untracked
                 .iter()
-                .map(|e| file(section, &e.path, None, Mark::Untracked, "?"))
+                .map(|e| {
+                    file(
+                        section,
+                        &e.path,
+                        None,
+                        Mark::Untracked,
+                        "?",
+                        fraction(section, &e.path),
+                    )
+                })
                 .collect(),
             Section::Conflicts => status
                 .conflicts
@@ -234,6 +300,7 @@ pub(crate) fn flatten(status: &Status) -> Vec<Entry> {
                         None,
                         Mark::Conflict,
                         conflict_letters(e.state),
+                        fraction(section, &e.path),
                     )
                 })
                 .collect(),
@@ -256,6 +323,7 @@ fn file(
     old_path: Option<&PathBytes>,
     mark: Mark,
     letters: &'static str,
+    fraction: StageFraction,
 ) -> FileEntry {
     let path_text = path.to_string_lossy().into_owned();
     let (dir, name) = gitten_core::path::split_dir_name(&path_text);
@@ -271,6 +339,7 @@ fn file(
         renamed_from: old_path.map(|p| format!("← {}", p.to_string_lossy()).into()),
         mark,
         letters,
+        fraction,
     }
 }
 
@@ -280,9 +349,13 @@ fn file(
 ///
 /// The count is **distinct paths**: one file edited, staged and edited again
 /// sits in two lists and is still one change to a person.
-pub(crate) fn prepare(status: Status, describe: &str) -> Prepared {
+pub(crate) fn prepare(
+    status: Status,
+    describe: &str,
+    counts: HashMap<Vec<u8>, (u32, u32)>,
+) -> Prepared {
     let t = std::time::Instant::now();
-    let rows = flatten(&status);
+    let rows = flatten(&status, &counts);
     let mut seen = HashSet::new();
     let changed = rows
         .iter()
@@ -299,6 +372,7 @@ pub(crate) fn prepare(status: Status, describe: &str) -> Prepared {
         rows,
         label: format!("{describe} · {changed} changed"),
         changed,
+        counts,
     }
 }
 
@@ -474,6 +548,10 @@ pub struct Files {
     /// header prints. A property of the data, decided by [`prepare`] once and
     /// read for free however often a frame wants it.
     changed: usize,
+    /// The refresh's per-path `(staged, total)` hunk counts — the inspector's
+    /// staged summary and the status bar's staged total read this, never the
+    /// repository. Replaced whole on every refresh beside the rows.
+    counts: Rc<HashMap<Vec<u8>, (u32, u32)>>,
     /// The directory-grouped projection the workspace sidebar draws — the
     /// same rows, gathered by directory. Rebuilt wherever `visible` is:
     /// construction, refresh, filter change. Never per frame.
@@ -512,7 +590,12 @@ impl Files {
     }
 
     pub(crate) fn from_prepared(prepared: Prepared) -> Self {
-        let Prepared { rows, changed, .. } = prepared;
+        let Prepared {
+            rows,
+            changed,
+            counts,
+            ..
+        } = prepared;
         // Row 0 is always a heading when there is anything at all; the cursor
         // opens on the first file under it.
         let visible = Rc::new(Vec::from_iter(0..rows.len()));
@@ -534,6 +617,7 @@ impl Files {
             focused: false,
             menu_row: Cell::new(None),
             changed,
+            counts: Rc::new(counts),
         }
     }
 
@@ -547,6 +631,45 @@ impl Files {
     /// title label; reading it costs nothing per frame.
     pub fn changed(&self) -> usize {
         self.changed
+    }
+
+    /// The refresh's per-path `(staged, total)` hunk counts — the inspector
+    /// and the status bar read this beside the rows, never the repository.
+    #[allow(dead_code)] // STUB(phase3-resume): read by inspector and status bar.
+    pub(crate) fn counts(&self) -> &Rc<HashMap<Vec<u8>, (u32, u32)>> {
+        &self.counts
+    }
+
+    /// Staged files with their `(staged, total)` hunk counts, in flatten
+    /// order: the inspector's staged summary, sharing the rows' own numbers
+    /// rather than re-deriving them. A staged path the side reads skipped
+    /// keeps its file-level truth — `(0, 0)` — so the row still lists.
+    #[allow(dead_code)] // STUB(phase3-resume): read by the inspector's staged summary.
+    pub(crate) fn staged_summary(&self) -> Vec<StagedFile> {
+        self.data
+            .iter()
+            .filter_map(|row| match row {
+                Entry::File(f) if f.section == Section::Staged => Some(StagedFile {
+                    dir: f.dir.clone(),
+                    name: f.name.clone(),
+                    path_text: f.path_text.clone(),
+                    hunks: self
+                        .counts
+                        .get(f.path.as_bytes())
+                        .copied()
+                        .unwrap_or((0, 0)),
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Staged hunks across every staged path — the status bar's count and
+    /// the inspector's total. A sum over the refresh's map, so one frame
+    /// reads one cached number per path and no side twice.
+    #[allow(dead_code)] // STUB(phase3-resume): read by the inspector's Commit gate.
+    pub(crate) fn staged_hunks(&self) -> u32 {
+        self.counts.values().map(|(staged, _)| staged).sum()
     }
 
     /// How many rows the list draws — the shown ones, a query having
@@ -611,7 +734,7 @@ impl Files {
     /// falls back to clamping, like a commit list whose sha left the log.
     #[cfg(test)]
     fn replace(&mut self, status: Status, host: &Host) {
-        self.replace_prepared(prepare(status, ""), host);
+        self.replace_prepared(prepare(status, "", HashMap::new()), host);
     }
 
     pub(crate) fn replace_prepared(&mut self, prepared: Prepared, host: &Host) {
@@ -634,8 +757,14 @@ impl Files {
             Some(Entry::File(f)) => Some((f.section, f.path.clone())),
             _ => None,
         };
-        let Prepared { rows, changed, .. } = prepared;
+        let Prepared {
+            rows,
+            changed,
+            counts,
+            ..
+        } = prepared;
         self.changed = changed;
+        self.counts = Rc::new(counts);
         self.data = Rc::new(rows);
 
         // The new rows under the *current* query — a refresh must not drop
@@ -1185,11 +1314,13 @@ mod tests {
     // By name, not a glob: `use gpui::*` in the parent shadows `#[test]` with
     // GPUI's own attribute macro and every test in here fails to expand.
     use super::{conflict_letters, flatten, prepare, Entry, Files, Mark, Section, Status};
+    use gitten_core::groups::StageFraction;
     use gitten_core::host::Host;
     use gitten_core::status::{
         Change, ConflictEntry, ConflictKind, Kind, PathBytes, StagedEntry, Submodule,
         UnstagedEntry, UntrackedEntry,
     };
+    use std::collections::HashMap;
     use std::rc::Rc;
 
     fn staged(path: &str, change: Change) -> StagedEntry {
@@ -1228,7 +1359,7 @@ mod tests {
 
     /// Headings and paths in draw order — the shape the tests read.
     fn outline(status: &Status) -> Vec<String> {
-        flatten(status)
+        flatten(status, &HashMap::new())
             .iter()
             .map(|e| match e {
                 Entry::Heading { count, section } => {
@@ -1243,7 +1374,7 @@ mod tests {
     /// files as `section:path` — the section rides along because twins
     /// share a path and a heading.
     fn grouped_outline(status: &Status) -> Vec<String> {
-        let rows = flatten(status);
+        let rows = flatten(status, &HashMap::new());
         let visible: Vec<usize> = (0..rows.len()).collect();
         let grouped = super::build_grouped(&rows, &visible);
         grouped
@@ -1287,7 +1418,7 @@ mod tests {
 
     #[test]
     fn grouped_cursor_addresses_survive_the_projection() {
-        let rows = flatten(&sample_status());
+        let rows = flatten(&sample_status(), &HashMap::new());
         let visible: Vec<usize> = (0..rows.len()).collect();
         let grouped = super::build_grouped(&rows, &visible);
         // Every visible file position resolves to the grouped row naming
@@ -1317,7 +1448,7 @@ mod tests {
     /// A pane over one status, as a refresh would leave it. The label carries
     /// no repository name, which is what the caller would pass.
     fn files(status: Status) -> Files {
-        Files::from_prepared(prepare(status, ""))
+        Files::from_prepared(prepare(status, "", HashMap::new()))
     }
 
     fn sample_status() -> Status {
@@ -1397,7 +1528,7 @@ mod tests {
 
     #[test]
     fn a_conflict_row_carries_its_two_letter_state_and_a_path_keeps_its_bytes() {
-        let rows = flatten(&sample_status());
+        let rows = flatten(&sample_status(), &HashMap::new());
         let merged = rows.iter().find_map(|e| match e {
             Entry::File(f) if f.section == Section::Conflicts => Some(f),
             _ => None,
@@ -1424,7 +1555,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let rows = flatten(&s);
+        let rows = flatten(&s, &HashMap::new());
         let Entry::File(f) = &rows[1] else {
             panic!("row 1 is the file under the heading");
         };
@@ -1432,7 +1563,7 @@ mod tests {
         // without building a string for it.
         assert_eq!(f.renamed_from.as_deref(), Some("← before.rs"));
         // And a plain modification carries none.
-        let Entry::File(m) = &flatten(&sample_status())[1] else {
+        let Entry::File(m) = &flatten(&sample_status(), &HashMap::new())[1] else {
             panic!();
         };
         assert!(m.renamed_from.is_none());
@@ -1449,7 +1580,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let rows = flatten(&s);
+        let rows = flatten(&s, &HashMap::new());
         let Entry::File(f) = &rows[1] else {
             panic!("row 1 is the file under the heading");
         };
@@ -1682,7 +1813,7 @@ mod tests {
 
     #[test]
     fn the_label_counts_what_changed_and_the_load_line_says_how_long_it_took() {
-        let prepared = prepare(sample_status(), "gitten (main)");
+        let prepared = prepare(sample_status(), "gitten (main)", HashMap::new());
         // Five entries, four paths: src/main.rs sits in staged and unstaged
         // and counts once.
         assert_eq!(prepared.label, "gitten (main) · 4 changed");
@@ -1691,7 +1822,7 @@ mod tests {
             "the count behind the label is the distinct-path count"
         );
 
-        let clean = prepare(Status::default(), "gitten (main)");
+        let clean = prepare(Status::default(), "gitten (main)", HashMap::new());
         assert_eq!(clean.label, "gitten (main) · 0 changed");
         assert_eq!(clean.changed, 0);
         assert!(clean.rows.is_empty(), "a clean tree flattens to nothing");
@@ -1700,6 +1831,77 @@ mod tests {
         // free — the very number `prepare` already spelled in the label.
         assert_eq!(files(sample_status()).changed(), 4);
         assert_eq!(files(Status::default()).changed(), 0);
+    }
+
+    #[test]
+    fn rows_carry_their_staging_fractions_from_the_refresh_counts() {
+        let mut counts = HashMap::new();
+        counts.insert(b"src/main.rs".to_vec(), (1, 3));
+        counts.insert(b"gone.txt".to_vec(), (2, 2));
+        let prepared = prepare(sample_status(), "gitten (main)", counts);
+        let fraction = |section: Section, path: &str| {
+            prepared
+                .rows
+                .iter()
+                .find_map(|row| match row {
+                    Entry::File(f)
+                        if f.section == section && f.path.as_bytes() == path.as_bytes() =>
+                    {
+                        Some(f.fraction)
+                    }
+                    _ => None,
+                })
+                .expect("the row exists")
+        };
+        // The staged twin is Full by section; the unstaged twin of the same
+        // path derives Partial from the shared pair.
+        assert_eq!(
+            fraction(Section::Staged, "src/main.rs"),
+            StageFraction::Full { total: 1 }
+        );
+        assert_eq!(
+            fraction(Section::Unstaged, "src/main.rs"),
+            StageFraction::Partial {
+                staged: 1,
+                total: 3
+            }
+        );
+        assert_eq!(
+            fraction(Section::Staged, "gone.txt"),
+            StageFraction::Full { total: 2 }
+        );
+        // No count behind them: file-level boxes, staged checked by section
+        // and unstaged empty.
+        let bare = prepare(sample_status(), "gitten (main)", HashMap::new());
+        let bare_fraction = |section: Section, path: &str| {
+            bare.rows
+                .iter()
+                .find_map(|row| match row {
+                    Entry::File(f)
+                        if f.section == section && f.path.as_bytes() == path.as_bytes() =>
+                    {
+                        Some(f.fraction)
+                    }
+                    _ => None,
+                })
+                .expect("the row exists")
+        };
+        assert_eq!(
+            bare_fraction(Section::Staged, "src/main.rs"),
+            StageFraction::Full { total: 0 }
+        );
+        assert_eq!(
+            bare_fraction(Section::Unstaged, "src/main.rs"),
+            StageFraction::Unstaged { total: 0 }
+        );
+        // The pane sums staged hunks for the status bar and lists staged
+        // files for the inspector, both off the same map.
+        let pane = Files::from_prepared(prepared);
+        assert_eq!(pane.staged_hunks(), 3);
+        let summary = pane.staged_summary();
+        assert_eq!(summary.len(), 2);
+        assert_eq!(summary[0].name.as_ref(), "main.rs");
+        assert_eq!(summary[0].hunks, (1, 3));
     }
 
     #[test]

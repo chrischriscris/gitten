@@ -1166,6 +1166,24 @@ mod tests {
     }
 
     #[test]
+    fn the_workspace_doors_are_bindable_from_the_config_file() {
+        use gitten_core::command::{Key, Modes, Resolve};
+        let mut h = host();
+        let warn = apply(
+            &mut h,
+            "[keys]\n\"W\" = \"workspace.changes\"\n\"H\" = \"workspace.history\"\n",
+        );
+        assert!(warn.is_empty(), "{warn:?}");
+        assert!(h.commands.known("workspace.changes"));
+        assert!(h.commands.known("workspace.history"));
+        assert!(h.commands.known("workspace.preview"));
+        assert_eq!(
+            h.keys.resolve(&Modes::new(), &[Key::char('W')]),
+            Resolve::Run("workspace.changes")
+        );
+    }
+
+    #[test]
     fn a_key_can_be_unbound_and_not_only_moved() {
         use gitten_core::command::{Key, Modes, Resolve};
         let mut h = host();

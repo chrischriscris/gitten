@@ -28,9 +28,11 @@ use gpui::*;
 /// turning each stacked pane into a card.
 pub const HEADER_H: f32 = 28.0;
 
-/// Height of the bottom bar. Forty pixels gives its mode and shortcuts
-/// enough weight to balance the 44px title bar without becoming a second pane.
-pub const STATUS_H: f32 = 40.0;
+/// Height of the bottom bar. Twenty-nine pixels per the workspace spec — a
+/// readout strip, not a second pane: badge, sync state, staging count,
+/// hints, version. The badge math below derives from this, so the badge
+/// stays concentric with the window corner at any height.
+pub const STATUS_H: f32 = 29.0;
 
 /// Left padding of every list row and section label. Ten pixels matches the
 /// pane header inset at the shipped font, so labels, status marks and names
@@ -392,9 +394,14 @@ pub fn pane_header_with(
 /// `key label` pairs, with the key stronger than its description; the live
 /// registry still decides which pairs exist. `truncated` adds a faint ellipsis
 /// rather than silently claiming the visible hints are exhaustive.
+/// One fixed segment of the status bar's left half: sync state, remote,
+/// staging count. Drawn dim at bar text size, parted by `·` — the same
+/// separator the title strip's drift chip uses, so the two read as one
+/// language for "state beside identity".
 pub fn status_bar(
     host: &Host,
     badge: SharedString,
+    leading: &[SharedString],
     hints: &[(SharedString, SharedString)],
     truncated: bool,
     version: &str,
@@ -435,6 +442,20 @@ pub fn status_bar(
                 .text_color(rgb(chip_ink))
                 .child(badge),
         )
+        .children(leading.iter().enumerate().map(|(i, segment)| {
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(gap_l(&host.font))
+                .children((i > 0).then(|| {
+                    div()
+                        .flex_none()
+                        .text_color(rgb(host.theme.quiet_on(c.status_bg)))
+                        .child("·")
+                }))
+                .child(segment.clone())
+        }))
         .children(hints.iter().map(|(key, label)| {
             div()
                 .flex_none()
@@ -582,8 +603,11 @@ pub fn version() -> &'static str {
 
 /// How wide the hints may draw. Every fixed piece is costed at the exact scale
 /// and spacing the renderer uses; one ellipsis is reserved so truncation never
-/// pushes the version offscreen.
-pub fn hints_budget(host: &Host, bar_px: f32, badge: &str) -> f32 {
+/// pushes the version offscreen. `leading` is the bar's fixed left-half
+/// segments — sync state, remote, staging count — costed at bar text size
+/// with the same gaps the renderer parts them with, so the hints shrink by
+/// exactly what the segments spend.
+pub fn hints_budget(host: &Host, bar_px: f32, badge: &str, leading: &[SharedString]) -> f32 {
     let body_ch = host.font.char_width();
     let hint_ch = body_ch * STATUS_TEXT_SCALE;
     let badge_ch = body_ch * STATUS_BADGE_TEXT_SCALE;
@@ -594,7 +618,11 @@ pub fn hints_budget(host: &Host, bar_px: f32, badge: &str) -> f32 {
     let badge = badge.chars().count() as f32 * badge_ch + badge_pad;
     let version = version().chars().count() as f32 * version_ch;
     let ellipsis_reserve = hint_ch + f32::from(gap_l(&host.font));
-    (bar_px - outer - fixed_gaps - badge - version - ellipsis_reserve).max(0.0)
+    let leading_px: f32 = leading
+        .iter()
+        .map(|s| s.chars().count() as f32 * body_ch + f32::from(gap_l(&host.font)))
+        .sum();
+    (bar_px - outer - fixed_gaps - badge - version - ellipsis_reserve - leading_px).max(0.0)
 }
 
 #[cfg(test)]

@@ -103,3 +103,59 @@ with file:line refs live in the subagent artifacts for this session:
   on failure.
 - theme-workspace: `Theme::guide()` port rule, px↔share conversion, strangler
   order, single-`Font` vs dual-face open question.
+
+## Phase 3 status (stabilize-and-commit run; parent timed out mid-wave)
+
+Commit `desktop-v2 phase3-partial` compiles green: core 498, app 155,
+ shell 397; `cargo fmt --check` clean for the shell package.
+
+DONE (in the tree, tested where noted):
+
+- `workspace.changes/history/preview` registered in `Commands::builtin`
+  (`core/src/command.rs`) AND shell dispatch; new core test
+  `workspace_commands_are_registered_and_bindable` proves the `known()`
+  gate passes — a `[keys]` `"W" = "workspace.changes"` entry now loads.
+- `TITLE_H` 44→53, `STATUS_H` 40→29 (`chrome.rs`); `status_bar` +
+  `hints_budget` take `leading` segments; statusbar-height test updated
+  40→29. Old-stack call sites pass `&[]` (TODO phase3-status).
+- `files::prepare` takes hunk-fraction `counts`; `side_hunk_counts`
+  (`app/src/acquire.rs`, repo-arg cleanup) is called on the refresh path
+  (`main.rs`); `flatten` renders from it. Needs visual QA.
+- `act::stage_remainder_or_unstage` (new, staged) + shell caller +
+  unit test — the sidebar checkbox verb (partial→stage remainder,
+  full→unstage). Needs click-level QA.
+- `CommitDraft{summary, description}` + `has_message`/`message` gate
+  helpers; per-repo `drafts` map + `commit_confirm` flag +
+  `last_fetch`/`last_push` timestamps exist on `DevShell` and are
+  constructed — all currently UNREAD (dead-code warnings).
+- `commands.palette` dispatch arm (reuses `toggle_help`: one panel, two
+  names) + `cmd-k` binding; `CommitStaged` menu action + `cmd-enter`
+  binding routing to the `workspace.commit` named door.
+- `input.rs` multiline groundwork (`set_multiline`, `set_text`,
+  `insert_newline` present, unwired per warnings).
+
+STUBBED (present but inert — the next worker's list):
+
+- `open_commit_confirm` / `confirm_commit` / `cancel_commit_confirm`
+  (`main.rs`): notice stubs ("commit confirmation arrives with the
+  inspector"). No confirm dialog, no real commit from the inspector;
+  the old `files.commit` prompt path is untouched and still works.
+- `views/inspector.rs` (new, ~235 lines): `render_inspector`,
+  `InspectorDeps`, `StagedFile` exist but are referenced NOWHERE — the
+  inspector is not in any render path. Wiring it into `workspace.rs`
+  (266px slot) is the core of the resume run, incl. drafts↔fields,
+  staged summary from `counts`, gating via `has_message` + staged total.
+- Status-bar leading segments (sync state, remote, staging count):
+  computed nowhere; `last_fetch`/`last_push` never stamped on job
+  finish; hints budget costs `[]`.
+- Toolbar: no branch control, no Push button + `ahead` count, no
+  Commands button (menu adapters + keys exist; the 53px strip's
+  controls do not).
+- `commit_confirm` dialog state, draft-field editing wiring,
+  `staged_summary`/`staged_hunks` methods: written, never called.
+
+Resume order for the next worker: wire inspector into workspace render
+→ drafts + staged summary + gating → confirm dialog through
+`act::commit_message` (staged-only, keep draft on refusal) → status
+segments + job-finish timestamps → toolbar controls → visual QA via
+`./dev dump`. Do NOT launch any client.

@@ -14,12 +14,14 @@
 //! what a client needs.
 
 use crate::cli::{Source, View};
-use gitten_core::differ::Overrides;
+use gitten_core::differ::{Differs, Overrides};
 use gitten_core::host::Host;
 use gitten_core::refs::Stash;
 use gitten_core::source::DiffSource;
+use gitten_core::status::Status;
 use gitten_core::{Commit, FileDiff};
 use gitten_git::Repo;
+use std::collections::HashMap;
 use std::path::Path;
 
 /// Where the fixtures live, for a client that wants to say so in an error.
@@ -235,6 +237,55 @@ pub fn diff_source(
         label: source.label(),
         data: Data::Diff(diff_pairs(&pairs, differs, over)),
     })
+}
+
+/// Per-path staged/total hunk counts for the paths a [`Status`] says are
+/// staged — the `(staged, total)` behind the sidebar's `n/m` fractions and
+/// the inspector's staged summary.
+///
+/// Only staged paths are read: an unstaged-only file never shows a fraction
+/// (its box is empty, its `Unstaged` needs no denominator), and untracked or
+/// conflicted paths have no index side to count. A staged-only path's total
+/// is its staged count — one read; a twin's total adds the unstaged side's —
+/// two. Every read goes through [`gitten_git::diff_pairs`], so unchanged
+/// blob pairs are remembered work, not recomputed diffs.
+///
+/// A path whose read fails is skipped, not refused: counts are display state,
+/// and a file the sidebar already lists must not lose its row because a hunk
+/// count raced a write. Callers fall back to file-level boxes — staged rows
+/// checked, unstaged rows empty — which is the truth the counts refine.
+pub fn side_hunk_counts(
+    repo: &dyn Repo,
+    differs: &Differs,
+    over: &Overrides,
+    status: &Status,
+) -> HashMap<Vec<u8>, (u32, u32)> {
+    fn hunks_of(
+        differs: &Differs,
+        over: &Overrides,
+        pairs: gitten_git::Result<Vec<gitten_git::Pair>>,
+    ) -> Option<u32> {
+        let pairs = pairs.ok()?;
+        Some(
+            gitten_git::diff_pairs(&pairs, differs, over)
+                .iter()
+                .map(|f| f.hunks.len() as u32)
+                .sum(),
+        )
+    }
+    let mut out = HashMap::new();
+    for entry in &status.staged {
+        let path = entry.path.as_bytes();
+        let Some(staged) = hunks_of(differs, over, repo.pairs_staged(Some(path))) else {
+            continue;
+        };
+        let total = match status.unstaged.iter().any(|u| u.path.as_bytes() == path) {
+            true => staged + hunks_of(differs, over, repo.pairs_unstaged(Some(path))).unwrap_or(0),
+            false => staged,
+        };
+        out.insert(path.to_vec(), (staged, total));
+    }
+    out
 }
 
 /// The command line's own source, as an explicit diff source — what a
@@ -908,6 +959,99 @@ mod tests {
         };
         assert_eq!(count(1), 2, "narrow context keeps two hunks apart");
         assert_eq!(count(12), 1, "wide context merges them");
+    }
+
+    /// A repository with one hunk per side read: `a.rs` staged only,
+    /// `b.rs` a twin, `c.rs` unstaged only, `gone.rs` staged but unreadable.
+    struct Sides;
+
+    fn one_hunk_pair(path: &str, old_mark: &str, new_mark: &str, tag: &str) -> Pair {
+        Pair {
+            path: path.into(),
+            old_path: None,
+            status: 'M',
+            old: vec![old_mark.into()],
+            new: vec![new_mark.into()],
+            old_oid: Some(format!("staged-{tag}")),
+            new_oid: Some(format!("new-{tag}")),
+            old_final_newline: true,
+            new_final_newline: true,
+            binary: false,
+        }
+    }
+
+    impl Repo for Sides {
+        fn log(&self, _limit: usize) -> gitten_git::Result<Vec<Commit>> {
+            Ok(Vec::new())
+        }
+
+        fn pairs(&self, _revspec: &str) -> gitten_git::Result<Vec<Pair>> {
+            Ok(Vec::new())
+        }
+
+        fn pairs_staged(&self, path: Option<&[u8]>) -> gitten_git::Result<Vec<Pair>> {
+            let path = path
+                .map(|p| String::from_utf8_lossy(p).into_owned())
+                .unwrap_or_default();
+            match path.as_str() {
+                "a.rs" => Ok(vec![one_hunk_pair("a.rs", "old a", "new a", "a")]),
+                "b.rs" => Ok(vec![one_hunk_pair("b.rs", "old b", "new b", "b")]),
+                _ => Err("staged side unreadable".into()),
+            }
+        }
+
+        fn pairs_unstaged(&self, path: Option<&[u8]>) -> gitten_git::Result<Vec<Pair>> {
+            let path = path
+                .map(|p| String::from_utf8_lossy(p).into_owned())
+                .unwrap_or_default();
+            match path.as_str() {
+                "b.rs" => Ok(vec![one_hunk_pair("b.rs", "new b", "newer b", "b2")]),
+                _ => Err("unstaged side unreadable".into()),
+            }
+        }
+
+        fn status(&self) -> gitten_git::Result<Status> {
+            use gitten_core::status::{
+                Change, Kind, PathBytes, StagedEntry, Submodule, UnstagedEntry,
+            };
+            let staged = |path: &str| StagedEntry {
+                path: PathBytes::from(path),
+                change: Change::Modified,
+                old_path: None,
+                kind: Kind::File,
+                submodule: Submodule::default(),
+            };
+            let unstaged = |path: &str| UnstagedEntry {
+                path: PathBytes::from(path),
+                change: Change::Modified,
+                kind: Kind::File,
+                submodule: Submodule::default(),
+            };
+            Ok(Status {
+                staged: vec![staged("a.rs"), staged("b.rs"), staged("gone.rs")],
+                unstaged: vec![unstaged("b.rs"), unstaged("c.rs")],
+                ..Status::default()
+            })
+        }
+
+        fn describe(&self) -> String {
+            "sides".into()
+        }
+    }
+
+    #[test]
+    fn staged_paths_count_their_sides_and_nothing_else() {
+        use gitten_core::differ::{Differs, Overrides};
+        let repo = Sides;
+        let status = repo.status().unwrap();
+        let counts = side_hunk_counts(&repo, &Differs::default(), &Overrides::default(), &status);
+        // One read for a staged-only path, two for a twin; an unstaged-only
+        // path is never read, and a failed read skips the path instead of
+        // refusing the whole map.
+        assert_eq!(counts.get(b"a.rs".as_slice()), Some(&(1, 1)));
+        assert_eq!(counts.get(b"b.rs".as_slice()), Some(&(1, 2)));
+        assert!(!counts.contains_key(b"c.rs".as_slice()));
+        assert!(!counts.contains_key(b"gone.rs".as_slice()));
     }
 
     /// A differ that counts how often it was asked, and answers with one

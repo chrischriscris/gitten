@@ -31,6 +31,8 @@ actions!(
         Delete,
         Left,
         Right,
+        Up,
+        Down,
         SelectLeft,
         SelectRight,
         Home,
@@ -53,6 +55,12 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("delete", Delete, Some(KEY_CONTEXT)),
         KeyBinding::new("left", Left, Some(KEY_CONTEXT)),
         KeyBinding::new("right", Right, Some(KEY_CONTEXT)),
+        // Vertical moves only a multiline field answers: a prompt is one
+        // line, where up and down never meant anything, and the handler
+        // below no-ops there — bound so a multiline field's keyboard is
+        // complete, not so a prompt gains a move it cannot make.
+        KeyBinding::new("up", Up, Some(KEY_CONTEXT)),
+        KeyBinding::new("down", Down, Some(KEY_CONTEXT)),
         KeyBinding::new("shift-left", SelectLeft, Some(KEY_CONTEXT)),
         KeyBinding::new("shift-right", SelectRight, Some(KEY_CONTEXT)),
         KeyBinding::new("home", Home, Some(KEY_CONTEXT)),
@@ -101,6 +109,16 @@ pub struct Input {
     marked: Option<Range<usize>>,
     last_layout: Option<ShapedLine>,
     last_bounds: Option<Bounds<Pixels>>,
+    /// One painted line per visual row, in order — the multiline field's
+    /// hit-testing and IME answers. Each entry is the line's bounds with
+    /// the shaped line and its byte range in `content` at paint time.
+    /// Empty for single-line fields, which keep answering from
+    /// `last_layout`/`last_bounds` exactly as before.
+    last_lines: Vec<(Bounds<Pixels>, ShapedLine, usize, usize)>,
+    /// Whether the field holds line breaks: the inspector's Description.
+    /// Single-line fields keep every existing behavior — paste folds
+    /// newlines to spaces, Enter is accept's, the render is one row.
+    multiline: bool,
     selecting: bool,
     /// The two ways out, resolved once when the shell opened the prompt: the
     /// live key for `input.accept` and for `input.cancel`, `None` until then.
@@ -129,9 +147,49 @@ impl Input {
             marked: None,
             last_layout: None,
             last_bounds: None,
+            last_lines: Vec::new(),
+            multiline: false,
             selecting: false,
             exits: None,
         }
+    }
+
+    /// Turns the field multiline — the Description's shape. Newlines survive
+    /// paste, Enter (as `input.newline`, routed by the shell) breaks the
+    /// line, and the render grows one row per visual line.
+    #[allow(dead_code)] // STUB(phase3-resume): the Description field's shape, unwired.
+    pub fn set_multiline(&mut self, multiline: bool) {
+        self.multiline = multiline;
+    }
+
+    #[allow(dead_code)] // STUB(phase3-resume): read by the inspector's Description field.
+    pub fn is_multiline(&self) -> bool {
+        self.multiline
+    }
+
+    /// Replaces the whole text — a draft store refilling its field on a
+    /// repository switch. The cursor parks at the end; no event fires,
+    /// because the caller already wrote the draft this mirrors.
+    #[allow(dead_code)] // STUB(phase3-resume): draft store refilling fields on repo switch.
+    pub fn set_text(&mut self, text: String, cx: &mut Context<Self>) {
+        self.content = text;
+        let end = self.content.len();
+        self.selected = end..end;
+        self.reversed = false;
+        self.marked = None;
+        cx.notify();
+    }
+
+    /// The `input.newline` answer for a focused multiline field: a line
+    /// break at the cursor. Single-line fields refuse it — their Enter is
+    /// accept's, and a break inside one would be content no render shows.
+    #[allow(dead_code)] // STUB(phase3-resume): Enter breaking the Description line.
+    pub fn insert_newline(&mut self, cx: &mut Context<Self>) {
+        if !self.multiline {
+            return;
+        }
+        self.replace(None, "\n", cx);
+        cx.notify();
     }
 
     /// The text as it stands — what a prompt's consumer reads on accept.
@@ -229,6 +287,65 @@ impl Input {
             .unwrap_or(self.content.len())
     }
 
+    /// Byte starts of every visual line, in order — the multiline cursor's
+    /// address book. Pure over the text, so moves compute without paint.
+    fn line_starts(content: &str) -> Vec<usize> {
+        let mut starts = vec![0];
+        for (at, ch) in content.char_indices() {
+            if ch == '\n' {
+                starts.push(at + 1);
+            }
+        }
+        starts
+    }
+
+    /// The visual line holding `at`, clamping a past-the-end cursor onto
+    /// the last line.
+    fn line_of(content: &str, at: usize) -> usize {
+        let starts = Self::line_starts(content);
+        starts.iter().rposition(|&s| s <= at).unwrap_or(0)
+    }
+
+    /// A visual line's byte range, end exclusive and without its break.
+    fn line_range(content: &str, line: usize) -> (usize, usize) {
+        let starts = Self::line_starts(content);
+        let start = starts.get(line).copied().unwrap_or(content.len());
+        let end = starts
+            .get(line + 1)
+            .map(|next| next.saturating_sub(1))
+            .unwrap_or(content.len());
+        (start, end.min(content.len()))
+    }
+
+    /// Moves the cursor one visual line down (`delta` +1) or up (-1),
+    /// keeping the grapheme column where the target line is long enough.
+    /// A no-op on single-line fields and past either edge.
+    fn move_line(&mut self, delta: isize) {
+        if !self.multiline {
+            return;
+        }
+        let line = Self::line_of(&self.content, self.cursor());
+        let next = line as isize + delta;
+        if next < 0 {
+            return;
+        }
+        let (start, _) = Self::line_range(&self.content, line);
+        let column = self.content[start..self.cursor()].graphemes(true).count();
+        let (nstart, nend) = Self::line_range(&self.content, next as usize);
+        if nstart >= self.content.len() && next as usize >= Self::line_starts(&self.content).len() {
+            return;
+        }
+        let mut at = nstart;
+        for _ in 0..column {
+            let next_at = self.next_boundary(at);
+            if next_at > nend {
+                break;
+            }
+            at = next_at;
+        }
+        self.move_to(at);
+    }
+
     /// Replaces the selected (or marked, or given) range. The one choke point
     /// for every edit that is not composition state — backspace, delete,
     /// paste, cut and the platform's own `replace_text_in_range` all arrive
@@ -287,6 +404,9 @@ impl Input {
         if self.content.is_empty() {
             return 0;
         }
+        if self.multiline {
+            return self.multiline_index_for_point(point);
+        }
         let (Some(bounds), Some(line)) = (&self.last_bounds, &self.last_layout) else {
             return 0;
         };
@@ -300,6 +420,30 @@ impl Input {
             return self.content.len();
         }
         line.closest_index_for_x(point.x - bounds.left())
+    }
+
+    /// A point into a multiline field: the row by its painted bounds, then
+    /// the column inside that row's shaped line, shifted by the row's byte
+    /// start. A point past the last row names the end of the text; a stale
+    /// paint (rows shaped for older content) keeps the cursor, because a
+    /// click resolved against yesterday's rows is worse than no move.
+    fn multiline_index_for_point(&self, point: Point<Pixels>) -> usize {
+        let Some((bounds, line, start, _)) = self
+            .last_lines
+            .iter()
+            .find(|(bounds, _, _, _)| point.y >= bounds.top() && point.y <= bounds.bottom())
+        else {
+            return match self.last_lines.last() {
+                Some((bounds, _, _, _)) if point.y > bounds.bottom() => self.content.len(),
+                _ => self.cursor(),
+            };
+        };
+        let expected = &self.content[*start..];
+        let row_text = line.text.as_ref();
+        if !expected.starts_with(row_text) {
+            return self.cursor();
+        }
+        start + line.closest_index_for_x(point.x - bounds.left())
     }
 
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
@@ -316,7 +460,32 @@ impl Input {
             true => self.next_boundary(self.cursor()),
             false => self.selected.end,
         };
+        // Across the break, in a field that has breaks: the grapheme
+        // after a line's last character is the next line's first, and
+        // `next_boundary` stops at the break itself.
+        let at =
+            match self.multiline && at < self.content.len() && self.content[at..].starts_with('\n')
+            {
+                true => at + 1,
+                false => at,
+            };
         self.move_to(at);
+        cx.notify();
+    }
+
+    fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.multiline {
+            return;
+        }
+        self.move_line(-1);
+        cx.notify();
+    }
+
+    fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.multiline {
+            return;
+        }
+        self.move_line(1);
         cx.notify();
     }
 
@@ -331,22 +500,40 @@ impl Input {
     }
 
     fn home(&mut self, _: &Home, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_to(0);
+        // The line's start in a field that has lines, the field's in one
+        // that does not.
+        let at = match self.multiline {
+            true => Self::line_range(&self.content, Self::line_of(&self.content, self.cursor())).0,
+            false => 0,
+        };
+        self.move_to(at);
         cx.notify();
     }
 
     fn end(&mut self, _: &End, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_to(self.content.len());
+        let at = match self.multiline {
+            true => Self::line_range(&self.content, Self::line_of(&self.content, self.cursor())).1,
+            false => self.content.len(),
+        };
+        self.move_to(at);
         cx.notify();
     }
 
     fn select_home(&mut self, _: &SelectHome, _: &mut Window, cx: &mut Context<Self>) {
-        self.select_to(0);
+        let at = match self.multiline {
+            true => Self::line_range(&self.content, Self::line_of(&self.content, self.cursor())).0,
+            false => 0,
+        };
+        self.select_to(at);
         cx.notify();
     }
 
     fn select_end(&mut self, _: &SelectEnd, _: &mut Window, cx: &mut Context<Self>) {
-        self.select_to(self.content.len());
+        let at = match self.multiline {
+            true => Self::line_range(&self.content, Self::line_of(&self.content, self.cursor())).1,
+            false => self.content.len(),
+        };
+        self.select_to(at);
         cx.notify();
     }
 
@@ -382,7 +569,14 @@ impl Input {
 
     fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            self.replace(None, &text.replace(['\r', '\n'], " "), cx);
+            // A multiline field keeps its breaks — carriage returns still
+            // go, because a pasted CRLF is one break, not two characters.
+            // A prompt folds both to a space, as before.
+            let text = match self.multiline {
+                true => text.replace('\r', ""),
+                false => text.replace(['\r', '\n'], " "),
+            };
+            self.replace(None, &text, cx);
             cx.notify();
         }
     }
@@ -512,6 +706,27 @@ impl EntityInputHandler for Input {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
+        // The cursor's own row in a multiline field — the single shaped
+        // line everywhere else. A range outside the row it lands on answers
+        // nothing rather than a box on the wrong row.
+        if self.multiline {
+            let cursor = self.cursor();
+            let (row_bounds, line, start, end) = self
+                .last_lines
+                .iter()
+                .find(|(_, _, s, e)| *s <= cursor && cursor <= *e)?;
+            let range = range_from_utf16(&self.content, &range_utf16);
+            if range.end < *start || range.start > *end {
+                return None;
+            }
+            let len = line.text.len();
+            let local =
+                |at: usize| line.x_for_index(at.max(*start).saturating_sub(*start).min(len));
+            return Some(Bounds::from_corners(
+                point(row_bounds.left() + local(range.start), row_bounds.top()),
+                point(row_bounds.left() + local(range.end), row_bounds.bottom()),
+            ));
+        }
         let line = self.last_layout.as_ref()?;
         if line.text.as_ref() != self.content {
             return None;
@@ -553,12 +768,20 @@ struct TextElement {
     input: Entity<Input>,
     cursor: Rgba,
     selection: Rgba,
+    /// Which visual line this element draws. Single-line fields draw line
+    /// 0 over the whole content; a multiline field draws one element per
+    /// row, each shaping only its own slice.
+    line: usize,
 }
 
 struct Prepaint {
     line: ShapedLine,
     cursor: Option<PaintQuad>,
     selection: Option<PaintQuad>,
+    /// This element's byte range in the content at shape time — what paint
+    /// files into `last_lines` for hit-testing.
+    start: usize,
+    end: usize,
 }
 
 impl IntoElement for TextElement {
@@ -605,9 +828,20 @@ impl Element for TextElement {
     ) -> Self::PrepaintState {
         let input = self.input.read(cx);
         let style = window.text_style();
+        // The slice this element shapes: the whole content on line 0 of a
+        // single-line field, one visual row of a multiline one. The
+        // placeholder shows on the first row of an empty field only.
+        let (start, end) = match input.multiline {
+            true => Input::line_range(&input.content, self.line),
+            false => (0, input.content.len()),
+        };
         let (text, color) = match input.content.is_empty() {
-            true => (input.placeholder.clone(), style.color.opacity(0.55)),
-            false => (SharedString::from(input.content.clone()), style.color),
+            true if self.line == 0 => (input.placeholder.clone(), style.color.opacity(0.55)),
+            true => (SharedString::from(""), style.color),
+            false => (
+                SharedString::from(input.content[start..end].to_string()),
+                style.color,
+            ),
         };
         let base = TextRun {
             len: text.len(),
@@ -617,71 +851,109 @@ impl Element for TextElement {
             underline: None,
             strikethrough: None,
         };
+        // Composition underlines ride in this element's own coordinates:
+        // a multiline row intersects the content-global marked range with
+        // its slice, so an IME composing across a break underlines both
+        // rows rather than neither.
         let runs = match input.marked.as_ref() {
-            Some(marked) if !input.content.is_empty() => vec![
-                TextRun {
-                    len: marked.start,
-                    ..base.clone()
-                },
-                TextRun {
-                    len: marked.end - marked.start,
-                    underline: Some(UnderlineStyle {
-                        color: Some(color),
-                        thickness: px(1.0),
-                        wavy: false,
-                    }),
-                    ..base.clone()
-                },
-                TextRun {
-                    len: text.len() - marked.end,
-                    ..base
-                },
-            ]
-            .into_iter()
-            .filter(|run| run.len > 0)
-            .collect(),
+            Some(marked) if !input.content.is_empty() => {
+                let local = marked.start.max(start).saturating_sub(start)
+                    ..marked.end.max(start).saturating_sub(start);
+                let local = local.start.min(text.len())..local.end.min(text.len());
+                match local.is_empty() {
+                    true => vec![base],
+                    false => vec![
+                        TextRun {
+                            len: local.start,
+                            ..base.clone()
+                        },
+                        TextRun {
+                            len: local.end - local.start,
+                            underline: Some(UnderlineStyle {
+                                color: Some(color),
+                                thickness: px(1.0),
+                                wavy: false,
+                            }),
+                            ..base.clone()
+                        },
+                        TextRun {
+                            len: text.len() - local.end,
+                            ..base
+                        },
+                    ]
+                    .into_iter()
+                    .filter(|run| run.len > 0)
+                    .collect(),
+                }
+            }
             _ => vec![base],
         };
         let font_size = style.font_size.to_pixels(window.rem_size());
+        let text_len = text.len();
         let line = window
             .text_system()
             .shape_line(text, font_size, &runs, None);
+        // The cursor and the selection in this row's coordinates: intersect
+        // the content-global range with the shaped slice. A cursor on
+        // another row draws nothing here; a selection crossing the row
+        // paints the overlap. Single-line rows span the whole content, so
+        // the intersection is the range itself.
+        let at = input
+            .cursor()
+            .max(start)
+            .saturating_sub(start)
+            .min(text_len);
+        let sel = input
+            .selected
+            .start
+            .max(start)
+            .saturating_sub(start)
+            .min(text_len)
+            ..input
+                .selected
+                .end
+                .max(start)
+                .saturating_sub(start)
+                .min(text_len);
+        // The cursor belongs to exactly one row: the row holding it, or
+        // the last row when it stands at the very end of the text.
+        let has_cursor = (start <= input.cursor() && input.cursor() < end)
+            || (input.cursor() == input.content.len() && end == input.content.len());
         let (selection, cursor) = if input.selected.is_empty() {
-            (
-                None,
-                Some(fill(
-                    Bounds::new(
-                        point(
-                            bounds.left() + line.x_for_index(input.cursor()),
-                            bounds.top(),
+            match has_cursor {
+                true => (
+                    None,
+                    Some(fill(
+                        Bounds::new(
+                            point(bounds.left() + line.x_for_index(at), bounds.top()),
+                            size(px(1.0), bounds.size.height),
                         ),
-                        size(px(1.0), bounds.size.height),
-                    ),
-                    self.cursor,
-                )),
-            )
+                        self.cursor,
+                    )),
+                ),
+                false => (None, None),
+            }
         } else {
-            (
-                Some(fill(
-                    Bounds::from_corners(
-                        point(
-                            bounds.left() + line.x_for_index(input.selected.start),
-                            bounds.top(),
+            match sel.is_empty() {
+                true => (None, None),
+                false => (
+                    Some(fill(
+                        Bounds::from_corners(
+                            point(bounds.left() + line.x_for_index(sel.start), bounds.top()),
+                            point(bounds.left() + line.x_for_index(sel.end), bounds.bottom()),
                         ),
-                        point(
-                            bounds.left() + line.x_for_index(input.selected.end),
-                            bounds.bottom(),
-                        ),
-                    ),
-                    self.selection,
-                )),
-                None,
-            )
+                        self.selection,
+                    )),
+                    None,
+                ),
+            }
         };
         Prepaint {
             line,
             cursor,
             selection,
+            start,
+            end,
         }
     }
 
@@ -695,12 +967,24 @@ impl Element for TextElement {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let focus = self.input.read(cx).focus.clone();
-        window.handle_input(
-            &focus,
-            ElementInputHandler::new(bounds, self.input.clone()),
-            cx,
-        );
+        // The platform delivers text to the focused handler: register the
+        // row the cursor stands on, so IME positioning follows it. One
+        // registration per field — every row registering would leave the
+        // platform no single answer about where the text goes.
+        let (focus, cursor_line) = {
+            let input = self.input.read(cx);
+            (
+                input.focus.clone(),
+                Input::line_of(&input.content, input.cursor()),
+            )
+        };
+        if self.line == cursor_line {
+            window.handle_input(
+                &focus,
+                ElementInputHandler::new(bounds, self.input.clone()),
+                cx,
+            );
+        }
         if let Some(selection) = state.selection.take() {
             window.paint_quad(selection);
         }
@@ -721,16 +1005,42 @@ impl Element for TextElement {
             }
         }
         self.input.update(cx, |input, _| {
-            input.last_layout = Some(state.line.clone());
-            input.last_bounds = Some(bounds);
+            match input.multiline {
+                // Filed in paint order, which is row order: render clears
+                // the vec, then every row paints exactly once. A row
+                // arriving out of sequence replaces its slot; anything
+                // stranger clears, and the staleness guards in the
+                // hit-testing hold until the next frame repopulates.
+                true => {
+                    if input.last_lines.len() == self.line {
+                        input
+                            .last_lines
+                            .push((bounds, state.line.clone(), state.start, state.end));
+                    } else if input.last_lines.len() > self.line {
+                        input.last_lines[self.line] =
+                            (bounds, state.line.clone(), state.start, state.end);
+                    } else {
+                        input.last_lines.clear();
+                    }
+                }
+                false => {
+                    input.last_layout = Some(state.line.clone());
+                    input.last_bounds = Some(bounds);
+                }
+            }
         });
     }
 }
 
 impl Render for Input {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let host = config::host(cx);
         let chrome = host.theme.chrome;
+        if self.multiline {
+            return self
+                .render_multiline(window, &host, chrome, cx)
+                .into_any_element();
+        }
         div()
             .id("input")
             .key_context(KEY_CONTEXT)
@@ -753,6 +1063,8 @@ impl Render for Input {
             .on_action(cx.listener(Self::delete))
             .on_action(cx.listener(Self::left))
             .on_action(cx.listener(Self::right))
+            .on_action(cx.listener(Self::up))
+            .on_action(cx.listener(Self::down))
             .on_action(cx.listener(Self::select_left))
             .on_action(cx.listener(Self::select_right))
             .on_action(cx.listener(Self::home))
@@ -784,9 +1096,103 @@ impl Render for Input {
                         input: cx.entity(),
                         cursor: rgb(chrome.accent),
                         selection: rgb(chrome.selected_bg),
+                        line: 0,
                     }),
             )
             .child(exit_hints(&host, chrome, &self.exits))
+            .into_any_element()
+    }
+}
+
+/// The multiline field's own render: a labeled box that grows one row per
+/// visual line, rather than the prompt's fixed-height band. No exit hints —
+/// an embedded field's keyboard belongs to the shell's named routing (see
+/// the inspector), not to a prompt slot, so naming prompt exits here would
+/// be the panel-of-keys lie.
+impl Input {
+    /// Most rows a pathological paste may spend. Past the cap the field
+    /// still holds every line — content is never truncated — but only rows
+    /// through the cursor's own paint, so one frame never shapes ten
+    /// thousand rows for a field nobody is reading past.
+    const MAX_ROWS: usize = 64;
+
+    fn render_multiline(
+        &mut self,
+        window: &mut Window,
+        host: &Host,
+        chrome: ChromePalette,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        // Cleared here, repopulated in paint order (row order) below: every
+        // frame re-files every row it draws, so hit-testing never reads a
+        // row shaped for older content.
+        self.last_lines.clear();
+        let rows = self.content.split('\n').count().max(1);
+        let cursor_line = Self::line_of(&self.content, self.cursor());
+        let shown = rows.max(cursor_line + 1).min(Self::MAX_ROWS);
+        let entity = cx.entity();
+        let field = div()
+            .id("input-multiline")
+            .key_context(KEY_CONTEXT)
+            .track_focus(&self.focus)
+            .flex_none()
+            .flex()
+            .flex_col()
+            .px(gap_m(&host.font))
+            .py(px(f32::from(window.line_height()) * 0.4))
+            // Three rows at rest: a description is usually one line, and a
+            // one-row box reads as a second summary field rather than the
+            // longer text it invites.
+            .min_h(px(f32::from(window.line_height()) * 3.0))
+            .bg(rgb(chrome.raised))
+            .border_1()
+            .border_color(rgb(chrome.border))
+            .rounded(px(crate::chrome::RADIUS))
+            .cursor(CursorStyle::IBeam)
+            .text_color(rgb(chrome.fg))
+            .on_action(cx.listener(Self::backspace))
+            .on_action(cx.listener(Self::delete))
+            .on_action(cx.listener(Self::left))
+            .on_action(cx.listener(Self::right))
+            .on_action(cx.listener(Self::up))
+            .on_action(cx.listener(Self::down))
+            .on_action(cx.listener(Self::select_left))
+            .on_action(cx.listener(Self::select_right))
+            .on_action(cx.listener(Self::home))
+            .on_action(cx.listener(Self::end))
+            .on_action(cx.listener(Self::select_home))
+            .on_action(cx.listener(Self::select_end))
+            .on_action(cx.listener(Self::select_all))
+            .on_action(cx.listener(Self::paste))
+            .on_action(cx.listener(Self::copy))
+            .on_action(cx.listener(Self::cut))
+            .on_action(cx.listener(Self::character_palette))
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up))
+            .on_mouse_move(cx.listener(Self::mouse_move))
+            .children((0..shown).map(|line| TextElement {
+                input: entity.clone(),
+                cursor: rgb(chrome.accent),
+                selection: rgb(chrome.selected_bg),
+                line,
+            }))
+            .children((shown < rows).then(|| {
+                div()
+                    .text_color(rgb(host.theme.dim_on(gitten_core::theme::Surface::Context)))
+                    .child(SharedString::from(format!("… {} more lines", rows - shown)))
+            }));
+        div()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap_y(px(2.0))
+            .child(
+                div()
+                    .text_color(rgb(host.theme.dim_on(gitten_core::theme::Surface::Context)))
+                    .child(self.label.clone()),
+            )
+            .child(field)
     }
 }
 

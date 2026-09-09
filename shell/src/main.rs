@@ -90,12 +90,24 @@ static ALLOC: stats::Counting = stats::Counting;
 // them; their handlers call [`DevShell::run_command`] with the *named*
 // commands every other door uses — `quit`, `copy.selection`, `select.all`,
 // `settings` — so a menu item is an adapter and not a second path.
-actions!(gitten, [Quit, CopySelection, SelectAll, OpenSettings]);
+actions!(
+    gitten,
+    [
+        Quit,
+        CopySelection,
+        SelectAll,
+        OpenSettings,
+        ShowCommands,
+        CommitStaged
+    ]
+);
 
 /// The title strip, which is also the window's titlebar — see the note on
-/// [`window_options`]. Forty-four pixels gives the larger title and controls
-/// clear vertical air without crowding the traffic lights.
-const TITLE_H: f32 = 44.0;
+/// [`window_options`]. Fifty-three pixels per the workspace spec: traffic
+/// lights, branch control, Commands and Push with clear vertical air. The
+/// lights recenter from this constant, so the strip grows without a second
+/// edit wherever they are placed.
+const TITLE_H: f32 = 53.0;
 /// Where the traffic lights start, and therefore how much room they need. macOS
 /// draws three 12px buttons with ~8px between them, so they end around 62; the
 /// repository begins after the 16px cluster gap.
@@ -516,6 +528,37 @@ enum Prompt {
     /// whole window onto that repository in place. Opened by `project.open`
     /// and by the project menu's `Open other…` row.
     ProjectPath,
+}
+
+/// The inspector's unsent commit text, per repository: Summary plus optional
+/// Description. Written on every field edit, read by the Commit button's
+/// gate and the confirmation dialog, cleared only when a commit job
+/// finishes cleanly — a refused commit keeps its words standing.
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)] // STUB(phase3-resume): read by the inspector's gate once wired.
+struct CommitDraft {
+    summary: String,
+    description: String,
+}
+
+#[allow(dead_code)] // STUB(phase3-resume): called by the inspector's gate once wired.
+impl CommitDraft {
+    /// The gate beside the button: staged content is the caller's to check
+    /// (it knows the index); the draft answers whether it names the commit.
+    fn has_message(&self) -> bool {
+        !self.summary.trim().is_empty()
+    }
+
+    /// What `git commit` receives: the summary, then the description as
+    /// git's own second paragraph when one was written. No trailing
+    /// paragraph for an empty description — a commit message with nothing
+    /// after the subject is the ordinary shape, not a missing one.
+    fn message(&self) -> String {
+        match self.description.trim().is_empty() {
+            true => self.summary.clone(),
+            false => format!("{}\n\n{}", self.summary, self.description),
+        }
+    }
 }
 
 /// What an accepted [`Prompt::BranchName`] does with its text.
@@ -1013,19 +1056,34 @@ impl Screen {
                 let view = view.clone();
                 let generation = generation.clone();
                 let label = label.clone();
+                // The hunk counts' inputs, cloned on the main thread: the
+                // blocking half diffs staged sides through the host's own
+                // registry (a clone shares its answer cache), so a refresh
+                // after an unrelated write re-diffs nothing it already knew.
+                let differs = host.differ.clone();
+                let over = overrides.clone();
                 Some(Refresh::new(
                     target,
                     move || {
-                        // The whole of the blocking half: one `git status`.
-                        // The describe rides along beside it so the label
-                        // keeps naming the repository, the way acquisition
-                        // overlaps its own pieces.
+                        // The whole of the blocking half: one `git status`,
+                        // then one side read per staged path for the `n/m`
+                        // fractions and the staged summary. The describe rides
+                        // along beside it so the label keeps naming the
+                        // repository, the way acquisition overlaps its own
+                        // pieces.
                         let described = std::thread::scope(|s| {
                             let title = s.spawn(|| repo.describe());
                             let status = repo.status()?;
+                            let counts = gitten_app::acquire::side_hunk_counts(
+                                repo.as_ref(),
+                                &differs,
+                                &over,
+                                &status,
+                            );
                             Ok::<_, String>(views::files::prepare(
                                 status,
                                 &title.join().unwrap_or_default(),
+                                counts,
                             ))
                         })?;
                         Ok(described)
@@ -1517,6 +1575,31 @@ struct DevShell {
     /// [`views::workspace`]; the toggle's doors are `workspace.changes`
     /// (enter) and `workspace.history` (back to the full stack).
     workspace: views::workspace::Workspace,
+    /// The commit composer's drafts, one per repository path: Summary plus
+    /// optional Description, written by the inspector's fields on every
+    /// edit. Outside the single-shot prompt slot on purpose — a prompt is
+    /// spent on accept, while a draft survives navigation, refresh and a
+    /// refused commit, and dies only on a successful one. Keyed by the
+    /// repository path, so switching repositories restores each one's
+    /// unsent words rather than leaking them across.
+    #[allow(dead_code)] // STUB(phase3-resume): the inspector's draft store, unwired.
+    drafts: std::collections::HashMap<String, CommitDraft>,
+    /// The commit confirmation standing over the workspace, if
+    /// `workspace.commit` opened it. Rendered from the draft and the staged
+    /// summary at open time and confirmed through `workspace.commit-confirm`
+    /// — the write itself is [`gitten_app::act::commit_message`]'s, the same
+    /// function the prompt path calls, so there is one commit implementation
+    /// under both doors.
+    #[allow(dead_code)] // STUB(phase3-resume): set by the confirm dialog, unwired.
+    commit_confirm: bool,
+    /// When the last fetch and push finished cleanly — the status bar's
+    /// recency, stamped in [`DevShell::drain_jobs`] by job name. `None` is
+    /// "never this session", said as "never" rather than a blank, because
+    /// a count with no recency beside it reads as current.
+    #[allow(dead_code)] // STUB(phase3-resume): stamped on job finish, read by status segments.
+    last_fetch: Option<std::time::Instant>,
+    #[allow(dead_code)] // STUB(phase3-resume): stamped on job finish, read by status segments.
+    last_push: Option<std::time::Instant>,
     /// Startup logging, and nothing else: whether [`start::mark`] has already
     /// stamped the first render. One bool read per frame afterwards.
     first_render: Cell<bool>,
@@ -1985,7 +2068,10 @@ impl DevShell {
     /// index it sits on. Staged means unstage; everything else — unstaged,
     /// untracked, a conflict whose resolution is being recorded — means stage.
     /// That is lazygit's rule and git's own asymmetry: `add` is the one word
-    /// for "the index should hold this".
+    /// for "the index should hold this". Read through the workspace's twins,
+    /// the same verb stages a partial row's remainder — see
+    /// [`gitten_app::act::stage_remainder_or_unstage`], which this calls —
+    /// because a whole-file stage of a twin lands exactly the remainder.
     ///
     /// Like every verb's I/O, this reads its context from the focused view and
     /// then leaves the screen alone: the write runs on the job thread, and a
@@ -1997,7 +2083,7 @@ impl DevShell {
             return;
         }
         let mut client = WindowActs { shell: self, cx };
-        gitten_app::act::stage_or_unstage(&mut client);
+        gitten_app::act::stage_remainder_or_unstage(&mut client);
     }
 
     /// `files.commit`: gather a message over the pane, then commit on accept.
@@ -2005,6 +2091,29 @@ impl DevShell {
     /// The input owns the keyboard while it is open — [`input::MODE`] sits on
     /// top of the pane stack — and [`DevShell::close_input`] routes the text
     /// back here through the prompt slot.
+    /// `workspace.commit`: the inspector's commit door. STUB — the confirm
+    /// dialog arrives with the inspector (Phase 3); until then this names
+    /// the absence where the button lives rather than running a second
+    /// write path beside the prompt's. The write, when it lands, is always
+    /// `act::commit_message`'s.
+    fn open_commit_confirm(&mut self, _cx: &mut Context<Self>) {
+        // TODO(phase3-inspector): open the confirm dialog (branch, message,
+        // files/hunks preview) and route accept through `act::commit_message`.
+        self.set_notice("commit confirmation arrives with the inspector");
+    }
+
+    /// `workspace.commit-confirm` / `-cancel`: unreachable until the dialog
+    /// above exists; kept so the names stay registered and bindable.
+    fn confirm_commit(&mut self, _cx: &mut Context<Self>) {
+        // TODO(phase3-inspector): submit the confirmed commit.
+        self.set_notice("commit confirmation arrives with the inspector");
+    }
+
+    fn cancel_commit_confirm(&mut self, _cx: &mut Context<Self>) {
+        // TODO(phase3-inspector): dismiss the confirm dialog.
+        self.set_notice("commit confirmation arrives with the inspector");
+    }
+
     fn begin_commit_message(&mut self, cx: &mut Context<Self>) {
         if !matches!(self.active(), Some(Screen::Files { .. })) {
             self.set_notice("files.commit is not supported here");
@@ -4168,17 +4277,7 @@ impl DevShell {
                 }
             }
             "quit" => cx.quit(),
-            "help" => {
-                self.help = !self.help;
-                // Reopening starts at the top: the rows are a different
-                // projection every time — the active modes' — and an offset
-                // the last reading left is a promise about rows that no
-                // longer exist.
-                if self.help {
-                    help::scroll_to_end(&self.help_scroll, false);
-                }
-                self.sync_modes(cx);
-            }
+            "help" => self.toggle_help(cx),
             // Settings stand in their own window now, not over this one: the
             // command opens (or activates) it, and the window owns its own
             // keyboard from there. Every door — `,`, the gear, the menu,
@@ -4311,6 +4410,18 @@ impl DevShell {
             // sits over, they act on the branch HEAD is on — which is why
             // their keys are globals.
             "repo.push" | "repo.pull" | "repo.fetch" => self.sync_remote(command, cx),
+            // The palette is the help panel by another door: the window's
+            // whole command list, opened by mouse or by key. One panel,
+            // two names — a second list would be a second thing to keep
+            // true about what is bound.
+            "commands.palette" => self.toggle_help(cx),
+            // The inspector's commit door: the button, the key and the
+            // dialog confirm all arrive here or below, and the write is
+            // always `act::commit_message`'s — never a second
+            // implementation beside the prompt path.
+            "workspace.commit" => self.open_commit_confirm(cx),
+            "workspace.commit-confirm" => self.confirm_commit(cx),
+            "workspace.commit-cancel" => self.cancel_commit_confirm(cx),
             "copy.selection" => self.copy_selection(cx),
             // Both are answered by whichever screen is up; a commit graph has no
             // selection yet, and a command nothing handles there is inert — the
@@ -4585,6 +4696,22 @@ impl DevShell {
     /// commands all keep working), and the center builds once, on first
     /// entry. Reachable by name only until the commands palette lands in
     /// Phase 3; tests drive it directly.
+    /// `help` and `commands.palette`: the window's command list, toggled.
+    /// One panel under both names — the toolbar button, `?` and cmd-k all
+    /// land on the same overlay, which lists the live registry rather than
+    /// a second inventory anyone would have to keep true.
+    fn toggle_help(&mut self, cx: &mut Context<Self>) {
+        self.help = !self.help;
+        // Reopening starts at the top: the rows are a different
+        // projection every time — the active modes' — and an offset
+        // the last reading left is a promise about rows that no
+        // longer exist.
+        if self.help {
+            help::scroll_to_end(&self.help_scroll, false);
+        }
+        self.sync_modes(cx);
+    }
+
     fn enter_workspace(&mut self, cx: &mut Context<Self>) {
         self.workspace.enabled = true;
         self.workspace.destination = views::workspace::Destination::Changes;
@@ -6313,7 +6440,13 @@ impl Render for DevShell {
                 cx.listener(|this, _: &CopySelection, _, cx| this.native("copy.selection", cx)),
             )
             .on_action(cx.listener(|this, _: &SelectAll, _, cx| this.native("select.all", cx)))
-            .on_action(cx.listener(|this, _: &OpenSettings, _, cx| this.native("settings", cx)));
+            .on_action(cx.listener(|this, _: &OpenSettings, _, cx| this.native("settings", cx)))
+            .on_action(
+                cx.listener(|this, _: &ShowCommands, _, cx| this.native("commands.palette", cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &CommitStaged, _, cx| this.native("workspace.commit", cx)),
+            );
 
         // The wheel, heard first: capture phase on a paint-time probe, the same
         // trick the diff view's old one used, moved up to where the mode stack
@@ -6591,7 +6724,10 @@ impl Render for DevShell {
                             &host,
                             &self.modes,
                             which,
-                            chrome::hints_budget(&host, width, &badge),
+                            // TODO(phase3-status): thread the bar's fixed leading
+                            // segments (sync state, remote, staging count) here;
+                            // empty until the status-segments work lands.
+                            chrome::hints_budget(&host, width, &badge, &[]),
                         )
                     }
                 };
@@ -6634,8 +6770,11 @@ impl Render for DevShell {
                                 .child(e)
                         }))
                         .into_any_element(),
-                    None => chrome::status_bar(&host, badge, &hints, truncated, chrome::version())
-                        .into_any_element(),
+                    // TODO(phase3-status): leading segments, as above.
+                    None => {
+                        chrome::status_bar(&host, badge, &[], &hints, truncated, chrome::version())
+                            .into_any_element()
+                    }
                 }
             })
             .children(overlay.map(|(frames, rows, heap, load)| {
@@ -6949,17 +7088,25 @@ fn open_main_window(launch: Launch, cx: &mut App) {
     })
     .detach();
 
-    // The platform's keys, not this app's: these four exist for the menu —
-    // accelerators macOS shows and performs — and their handlers are the
-    // element-level adapters in `render`, which call the same named dispatch
-    // every keypress uses. Nothing else is a `KeyBinding` anywhere in this
-    // crate: `s`, `w`, `T`, `escape` and the rest resolve through the live
-    // keymap, where `[keys]` can move them.
+    // The platform's keys, not this app's: these exist for the menu and for
+    // the two chords the keymap cannot spell — the platform modifier never
+    // reaches `command::Key` — and their handlers are the element-level
+    // adapters in `render`, which call the same named dispatch every
+    // keypress uses. Nothing else is a `KeyBinding` anywhere in this crate:
+    // `s`, `w`, `T`, `escape` and the rest resolve through the live keymap,
+    // where `[keys]` can move them.
     cx.bind_keys([
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("cmd-c", CopySelection, None),
         KeyBinding::new("cmd-a", SelectAll, None),
         KeyBinding::new("cmd-,", OpenSettings, None),
+        // The palette and the commit key: cmd-k opens the command list from
+        // anywhere, cmd-enter commits staged work from anywhere. Both are
+        // adapters onto named commands — `commands.palette` and the
+        // workspace's commit door — so a config file still owns every
+        // binding this map could have spelled.
+        KeyBinding::new("cmd-k", ShowCommands, None),
+        KeyBinding::new("cmd-enter", CommitStaged, None),
     ]);
 
     // Open the window here and now, not from a spawned task: the task only
@@ -7127,6 +7274,9 @@ fn open_main_window(launch: Launch, cx: &mut App) {
                                 views::files::Files::from_prepared(views::files::prepare(
                                     Default::default(),
                                     "",
+                                    // No side reads before the first refresh:
+                                    // file-level boxes until the wave lands.
+                                    std::collections::HashMap::new(),
                                 ))
                             }),
                             Generation::default(),
@@ -7180,12 +7330,20 @@ fn open_main_window(launch: Launch, cx: &mut App) {
                             .join()
                             .unwrap_or_else(|p| std::panic::resume_unwind(p))
                         {
-                            Ok(status) => views::files::prepare(status, &title),
+                            Ok(status) => views::files::prepare(
+                                status,
+                                &title,
+                                std::collections::HashMap::new(),
+                            ),
                             // Shown as a clean tree rather than failing the
                             // window: one bad status must not take the launch.
                             Err(e) => {
                                 eprintln!("gitten: status failed, showing an empty pane: {e}");
-                                views::files::prepare(Default::default(), &title)
+                                views::files::prepare(
+                                    Default::default(),
+                                    &title,
+                                    std::collections::HashMap::new(),
+                                )
                             }
                         };
                         // The same trade for the stack: a failed read is an
@@ -7388,6 +7546,10 @@ fn open_main_window(launch: Launch, cx: &mut App) {
                 stack_resized: Cell::new(false),
                 stack_count: Cell::new(0),
                 workspace: views::workspace::Workspace::default(),
+                drafts: std::collections::HashMap::new(),
+                commit_confirm: false,
+                last_fetch: None,
+                last_push: None,
                 modes: Modes::new(),
                 pending: Vec::new(),
                 help: false,
@@ -8027,6 +8189,10 @@ mod tests {
                 stack_resized: Cell::new(false),
                 stack_count: Cell::new(0),
                 workspace: crate::views::workspace::Workspace::default(),
+                drafts: std::collections::HashMap::new(),
+                commit_confirm: false,
+                last_fetch: None,
+                last_push: None,
                 modes: Modes::new(),
                 pending: vec![vec![Key::char('g')]],
                 help: false,
@@ -8164,6 +8330,10 @@ mod tests {
                 stack_resized: Cell::new(false),
                 stack_count: Cell::new(0),
                 workspace: crate::views::workspace::Workspace::default(),
+                drafts: std::collections::HashMap::new(),
+                commit_confirm: false,
+                last_fetch: None,
+                last_push: None,
                 modes: Modes::new(),
                 pending: Vec::new(),
                 help: false,
@@ -8582,6 +8752,7 @@ mod tests {
                         crate::views::files::Files::from_prepared(crate::views::files::prepare(
                             Default::default(),
                             "t",
+                            std::collections::HashMap::new(),
                         ))
                     }),
                     Generation::default(),
@@ -8786,7 +8957,7 @@ mod tests {
         let statusbar = cx
             .debug_bounds("statusbar")
             .expect("the bottom bar was not drawn");
-        assert_eq!(f32::from(statusbar.size.height), 40.0);
+        assert_eq!(f32::from(statusbar.size.height), 29.0); // STATUS_H per the workspace spec
         assert_eq!(statusbar.bottom(), gpui::px(600.0));
         let stack = cx.debug_bounds("sidebar").expect("the stack was not drawn");
         let main = cx
@@ -8888,6 +9059,7 @@ mod tests {
                         crate::views::files::Files::from_prepared(crate::views::files::prepare(
                             Default::default(),
                             "t",
+                            std::collections::HashMap::new(),
                         ))
                     }),
                     Generation::default(),
@@ -9043,6 +9215,7 @@ mod tests {
                 crate::views::files::Files::from_prepared(crate::views::files::prepare(
                     Status::default(),
                     "gitten (main)",
+                    Default::default(),
                 ))
             });
             shell.panes.register(
@@ -9382,7 +9555,11 @@ diff --git a/one.txt b/one.txt
         });
         shell.update(cx, |shell, cx| {
             let files = cx.new(|_| {
-                crate::views::files::Files::from_prepared(crate::views::files::prepare(tree, "r"))
+                crate::views::files::Files::from_prepared(crate::views::files::prepare(
+                    tree,
+                    "r",
+                    Default::default(),
+                ))
             });
             shell.panes.register(
                 "files",
@@ -10083,7 +10260,11 @@ diff --git a/one.txt b/one.txt
         shell.update(cx, |shell, cx| {
             let host = Rc::new(Host::new());
             let files = cx.new(|_| {
-                crate::views::files::Files::from_prepared(crate::views::files::prepare(tree, "r"))
+                crate::views::files::Files::from_prepared(crate::views::files::prepare(
+                    tree,
+                    "r",
+                    Default::default(),
+                ))
             });
             files.update(cx, |f, _| {
                 f.run_view("view.bottom", &host); // onto the last row: a file
@@ -10144,6 +10325,7 @@ diff --git a/one.txt b/one.txt
                 crate::views::files::Files::from_prepared(crate::views::files::prepare(
                     Status::default(),
                     "r",
+                    Default::default(),
                 ))
             });
             shell.panes.register(
@@ -10811,7 +10993,11 @@ diff --git a/fresh.txt b/fresh.txt
             });
             let host = Rc::new(Host::new());
             let files = cx.new(|_| {
-                crate::views::files::Files::from_prepared(crate::views::files::prepare(tree, ""))
+                crate::views::files::Files::from_prepared(crate::views::files::prepare(
+                    tree,
+                    "",
+                    Default::default(),
+                ))
             });
             files.update(cx, |f, _| {
                 f.run_view("view.bottom", &host); // onto loose.txt
@@ -11188,7 +11374,7 @@ diff --git a/added.txt b/added.txt
             };
             view.update(cx, |f, cx| {
                 f.replace_prepared(
-                    crate::views::files::prepare(Status::default(), "r"),
+                    crate::views::files::prepare(Status::default(), "r", Default::default()),
                     &config::host(cx),
                 );
             });
@@ -11781,6 +11967,7 @@ diff --git a/added.txt b/added.txt
                 crate::views::files::Files::from_prepared(crate::views::files::prepare(
                     Status::default(),
                     "r",
+                    Default::default(),
                 ))
             });
             shell.panes.register(
@@ -11839,6 +12026,7 @@ diff --git a/added.txt b/added.txt
                 crate::views::files::Files::from_prepared(crate::views::files::prepare(
                     Status::default(),
                     "r",
+                    Default::default(),
                 ))
             });
             shell.panes.register(
