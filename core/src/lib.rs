@@ -19,6 +19,7 @@ pub mod differ;
 pub mod edit;
 pub mod font;
 pub mod graph;
+pub mod groups;
 pub mod host;
 pub mod markdown;
 pub mod operation;

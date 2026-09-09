@@ -199,7 +199,8 @@ mod tests {
                 "gruvbox",
                 "catppuccin",
                 "tokyo-night",
-                "rose-pine"
+                "rose-pine",
+                "guide"
             ]
         );
         assert_ne!(host.themes.get("light").unwrap().diff.added_bg, 0x001100);

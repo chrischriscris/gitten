@@ -910,6 +910,113 @@ impl Theme {
         .rebuilt()
     }
 
+    /// The guide-v2 workspace on paper: subdued neutral surfaces, green
+    /// selection, teal accent.
+    ///
+    /// Built like [`Theme::light`] — what carries across is the *ratios*, not
+    /// the hues. The guide reference names its own hexes
+    /// (`artifacts/guide-v2/src/style.css`: `--surface #fff`,
+    /// `--sidebar #f5f5f3`, `--toolbar #fafaf9`, `--line #e5e7e6`,
+    /// `--text #282d31`, `--muted #737b7e`, `--accent #216e61`,
+    /// `--selected #e3eee9`, `--add #edf6ee`, `--del #fbefed`,
+    /// `--hunk #f5f7f8`); those are design targets, and every value below is
+    /// the nearest colour that also clears the floors — `min_contrast` 3.5
+    /// for text, `min_furniture` 3.0 — via `readable()` on all 11 surfaces.
+    /// The token hues are light()'s, proven on paper: the reference specifies
+    /// chrome and diff grounds but no syntax palette, and inventing eleven
+    /// unmeasured token colours is how a theme ships illegible.
+    ///
+    /// Two deliberate carries from the reference:
+    ///
+    /// - **Green selection.** `selection_bg` is the guide's `--selected`
+    ///   `#e3eee9` — the keyboard row reads green, which is the workspace's
+    ///   signature. Mouse-selected *text* keeps a cool blue
+    ///   (`selected_bg`), because a green wash over green added rows would
+    ///   erase what the row says about itself.
+    /// - **Teal accent.** `--accent #216e61` clears the text floor raw on
+    ///   every chrome ground including the green selection, so branch and
+    ///   status ink needs no lifting.
+    pub fn guide() -> Self {
+        use Kind::*;
+        let mut syntax = [Style::fg(0x3a4045); Kind::COUNT];
+        let mut set = |k: Kind, s: Style| syntax[k.index()] = s;
+        set(Comment, Style::fg(0x8a9294).italic());
+        set(Str, Style::fg(0x26662f));
+        set(Number, Style::fg(0x814e0c));
+        set(Keyword, Style::fg(0x1f5f55));
+        set(Type, Style::fg(0x245e87));
+        set(Constant, Style::fg(0x754c16));
+        set(Func, Style::fg(0x644c0e));
+        set(Property, Style::fg(0x514c44));
+        set(Heading, Style::fg(0x282d31).bold());
+        set(Strong, Style::fg(0x33383c).bold());
+        set(Emphasis, Style::fg(0x3f4448).italic());
+        set(Link, Style::fg(0x245e87));
+
+        Self {
+            name: "guide".into(),
+            min_contrast: 3.5,
+            min_furniture: 3.0,
+            syntax,
+            diff: DiffPalette {
+                file_bg: 0xececea,
+                file_fg: 0x282d31,
+                adds_fg: 0x367448,
+                dels_fg: 0xa84d45,
+                hunk_bg: 0xf5f7f8,
+                hunk_fg: 0x5a6b70,
+                gutter_fg: 0xb9bcba,
+                rule: 0xe5e7e6,
+                context_bg: 0xffffff,
+                context_fg: 0x3a4045,
+                added_bg: 0xedf6ee,
+                added_fg: 0x1f5233,
+                // Double the line tint's step, like every shipped theme:
+                // the line says "changed", the word says "here".
+                added_word_bg: 0xc4e2c9,
+                removed_bg: 0xfbefed,
+                removed_fg: 0x7e322b,
+                removed_word_bg: 0xf2d2cd,
+                // Lavender, for light()'s reason: the two hues a diff owns
+                // are green and red, and a moved block must recede from both.
+                moved_removed_bg: 0xe9e6ed,
+                moved_added_bg: 0xdcdaea,
+                absent_bg: 0xd8d8d4,
+            },
+            markdown: MarkdownPalette {
+                code_bar: 0xd5d8d5,
+                quote_bar: 0x4d8a7d,
+                marker: 0x737b7e,
+                rule: 0xe0e2e0,
+            },
+            chrome: ChromePalette {
+                bg: 0xf5f5f3,
+                fg: 0x282d31,
+                dim: 0x737b7e,
+                faint: 0xb9bcba,
+                accent: 0x216e61,
+                title_bg: 0xfafaf9,
+                status_bg: 0xf6f6f4,
+                border: 0xe5e7e6,
+                // Raised goes *darker* on paper — elevation on a light
+                // ground is a shadow, not a shine.
+                raised: 0xececea,
+                keycap: 0xe0e0dc,
+                selection_bg: 0xe3eee9,
+                selected_bg: 0xaec6e6,
+                error: 0xa84d45,
+            },
+            lanes: vec![0x1f5f55, 0x2c709f, 0x7e5aaa, 0x29776e, 0xa6533b, 0x57732c],
+            lane_overflow: 0xbbb7b0,
+            authors: vec![0x8a7040, 0x577891, 0x816b99, 0x447e73, 0x95695b, 0x6a7a40],
+            resolved: Vec::new(),
+            gutter: [0; Surface::COUNT],
+            marker: [0; Surface::COUNT],
+            dim: [0; Surface::COUNT],
+        }
+        .rebuilt()
+    }
+
     /// Recompute the resolved table. Required after changing `syntax`, `diff` or
     /// `min_contrast` directly; [`Theme::set_syntax`] does it for you.
     pub fn rebuild(&mut self) {
@@ -1101,6 +1208,7 @@ impl Themes {
             Theme::catppuccin(),
             Theme::tokyo_night(),
             Theme::rose_pine(),
+            Theme::guide(),
         ])
     }
 
@@ -1342,7 +1450,8 @@ mod tests {
                 "gruvbox",
                 "catppuccin",
                 "tokyo-night",
-                "rose-pine"
+                "rose-pine",
+                "guide"
             ]
         );
         assert_eq!(r.get("light").map(|t| t.chrome.bg), Some(0xfaf7f1));
@@ -1352,7 +1461,7 @@ mod tests {
         let mut mine = Theme::dark();
         mine.chrome.bg = 0x010203;
         r.register(mine);
-        assert_eq!(r.len(), 7, "registering a known name added an entry");
+        assert_eq!(r.len(), 8, "registering a known name added an entry");
         assert_eq!(r.get("dark").map(|t| t.chrome.bg), Some(0x010203));
 
         // And one nobody shipped is simply another theme.
@@ -1369,6 +1478,7 @@ mod tests {
                 "catppuccin",
                 "tokyo-night",
                 "rose-pine",
+                "guide",
                 "solarized-ish"
             ]
         );
@@ -1379,7 +1489,8 @@ mod tests {
         let r = Themes::builtin();
         assert_eq!(r.after("dark").map(|t| t.name.as_str()), Some("light"));
         assert_eq!(r.after("slate").map(|t| t.name.as_str()), Some("gruvbox"));
-        assert_eq!(r.after("rose-pine").map(|t| t.name.as_str()), Some("dark"));
+        assert_eq!(r.after("rose-pine").map(|t| t.name.as_str()), Some("guide"));
+        assert_eq!(r.after("guide").map(|t| t.name.as_str()), Some("dark"));
         // A theme defined in the file and then renamed leaves this behind, and
         // the answer has to be a theme rather than nothing.
         assert_eq!(r.after("gone").map(|t| t.name.as_str()), Some("dark"));
