@@ -49,8 +49,21 @@ later is free because a key is data and a command is a name.
 1. **Phase 1 (now):** core dir-group seam + unit tests; `Theme::guide()` +
    `contrast` example check + registration. Verifiable headless.
    (`cargo test -p gitten-core`, contrast run.)
-2. **Phase 2:** workspace shell behind flag + sidebar grouped flatten + center
-   header + single-file projection.
+2. **Phase 2 (landed):** workspace shell behind named-command toggle +
+   sidebar grouped flatten + center header + single-file projection.
+   Toggle seam (no core change, no keybinding yet — the palette in Phase 3
+   is the human door; tests drive the names directly):
+   `workspace.changes` (enter, focuses files), `workspace.history` (back to
+   the full stack = History destination for now), `workspace.preview`
+   (re-aim center at the files cursor; sidebar clicks dispatch it after
+   `select_row`, the command tail + refresh wave cover the rest).
+   Center keyboard/wheel work with spot==Main via an explicit
+   `run_command_from` door + capture-phase wheel branch; layout toggle
+   calls `set_layout` directly (view-local presentation state, selection
+   carry is Phase 4); conflicts skip the preview (own markers
+   presentation); sidebar wheel follow + full gesture audit are Phase 4.
+   Also absorbed: two `app` theme-list test expectations updated for the
+   Phase 1 `guide` registration ("shipped seven"→eight).
 3. **Phase 3:** inspector (drafts, gating, confirmation, real commit) + toolbar
    branch/push/commands + status segments.
 4. **Phase 4:** selection-preserving Unified/Split toggle, per-hunk buttons,

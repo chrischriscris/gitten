@@ -116,7 +116,7 @@ impl Section {
     /// the panel exists for, which is "what will commit". The greens and
     /// reds are the diff palette's, where a theme has already tuned those
     /// two words.
-    fn ink(self, host: &Host) -> Rgb {
+    pub(crate) fn ink(self, host: &Host) -> Rgb {
         let t = &host.theme;
         match self {
             Section::Staged => t.diff.adds_fg,
@@ -309,6 +309,83 @@ fn selectable(rows: &[Entry], i: usize) -> bool {
     matches!(rows.get(i), Some(Entry::File(_)))
 }
 
+/// One row of the directory-grouped projection the workspace sidebar draws:
+/// a directory heading, or one file addressed by its position in the pane's
+/// `visible` index — the same space the cursor, the anchor and the filter
+/// already address, so selection state is shared with the stack list rather
+/// than duplicated beside it.
+#[derive(Debug)]
+pub(crate) enum GroupedRow {
+    /// A directory label, drawn once over its files, with the file count
+    /// spelled out at build time like every other heading.
+    Heading {
+        dir: SharedString,
+        count: SharedString,
+    },
+    /// One file: its position in `visible`, which names both the row and
+    /// the cursor address [`Files::select_row`] takes.
+    File { visible: usize },
+}
+
+/// The sidebar's projection of the working tree: directory headings with one
+/// row per file beneath, built once per refresh or filter change — never per
+/// frame — from the same flattened data the stack list draws.
+#[derive(Debug, Default)]
+pub(crate) struct GroupedRows {
+    pub rows: Vec<GroupedRow>,
+    /// Visible position to grouped row, for the cursor follow. `None` on
+    /// heading positions, which own no cursor.
+    pub by_visible: Vec<Option<usize>>,
+}
+
+impl GroupedRows {
+    /// The grouped row holding the cursor's visible position, if it names
+    /// a file — what the sidebar scrolls to after a keyboard move.
+    pub fn cursor_row(&self, visible_cursor: usize) -> Option<usize> {
+        self.by_visible.get(visible_cursor).copied().flatten()
+    }
+}
+
+/// Builds the grouped projection: the visible files gathered under their
+/// directory in first-appearance order. Section order inside a directory
+/// falls out of `visible`'s own order, and a path sitting in staged *and*
+/// unstaged keeps both rows under the one heading — twins stay distinct
+/// because every row still names its (section, path), and the trailing
+/// status letter keeps saying which side of the index each row is.
+///
+/// The cut is [`gitten_core::path::split_dir_name`]'s, made once at flatten
+/// into [`FileEntry::dir`] — nothing is re-split here.
+pub(crate) fn build_grouped(data: &[Entry], visible: &[usize]) -> GroupedRows {
+    let mut order: Vec<SharedString> = Vec::new();
+    let mut members: Vec<Vec<usize>> = Vec::new();
+    for (vp, &d) in visible.iter().enumerate() {
+        let Entry::File(f) = &data[d] else { continue };
+        match order
+            .iter()
+            .position(|dir: &SharedString| dir.as_ref() == f.dir.as_ref())
+        {
+            Some(i) => members[i].push(vp),
+            None => {
+                order.push(f.dir.clone());
+                members.push(vec![vp]);
+            }
+        }
+    }
+    let mut rows = Vec::new();
+    let mut by_visible: Vec<Option<usize>> = vec![None; visible.len()];
+    for (dir, vps) in order.into_iter().zip(members) {
+        rows.push(GroupedRow::Heading {
+            dir,
+            count: SharedString::from(vps.len().to_string()),
+        });
+        for vp in vps {
+            by_visible[vp] = Some(rows.len());
+            rows.push(GroupedRow::File { visible: vp });
+        }
+    }
+    GroupedRows { rows, by_visible }
+}
+
 /// Moves `v` off a heading it landed on, onward from `from`. Called after
 /// every cursor move and every refresh, so the cursor never rests on a
 /// heading — a heading is a label over rows, and a verb aimed at one has
@@ -397,6 +474,10 @@ pub struct Files {
     /// header prints. A property of the data, decided by [`prepare`] once and
     /// read for free however often a frame wants it.
     changed: usize,
+    /// The directory-grouped projection the workspace sidebar draws — the
+    /// same rows, gathered by directory. Rebuilt wherever `visible` is:
+    /// construction, refresh, filter change. Never per frame.
+    grouped: Rc<GroupedRows>,
     /// Whether this pane holds the keyboard, as the shell last told it. A
     /// row's bar is accent only when its pane is focused, and the view cannot
     /// ask the shell during render — so the shell writes it here when focus
@@ -435,12 +516,14 @@ impl Files {
         // Row 0 is always a heading when there is anything at all; the cursor
         // opens on the first file under it.
         let visible = Rc::new(Vec::from_iter(0..rows.len()));
+        let grouped = Rc::new(build_grouped(&rows, &visible));
         let mut view = Viewport::new();
         view.set_len(visible.len());
         settle(&rows, &mut view, 0);
         Self {
             data: Rc::new(rows),
             visible,
+            grouped,
             filter: None,
             scroll: UniformListScrollHandle::new(),
             view: Rc::new(Cell::new(view)),
@@ -471,6 +554,30 @@ impl Files {
     /// pane's sidebar section.
     pub fn rows(&self) -> usize {
         self.visible.len()
+    }
+
+    /// The directory-grouped projection, rebuilt on every refresh and
+    /// filter change — what the workspace sidebar draws. Reading it costs
+    /// a refcount bump, like every other per-frame read of this pane.
+    pub(crate) fn grouped(&self) -> &Rc<GroupedRows> {
+        &self.grouped
+    }
+
+    /// The flattened rows and the shown index into them — the sidebar's
+    /// grouped rows address files through `visible`, and resolve them here.
+    pub(crate) fn data(&self) -> &Rc<Vec<Entry>> {
+        &self.data
+    }
+
+    /// Shown positions into [`Files::data`], in draw order.
+    pub(crate) fn visible(&self) -> &Rc<Vec<usize>> {
+        &self.visible
+    }
+
+    /// The cursor in `visible` space — the address [`Files::select_row`]
+    /// and the anchor both speak.
+    pub(crate) fn cursor_visible(&self) -> usize {
+        self.view.get().cursor()
     }
 
     /// The live query, for pre-filling an edit of it. Empty means none.
@@ -538,6 +645,7 @@ impl Files {
             Some(q) => search_rows(&self.data, q),
             None => Vec::from_iter(0..self.data.len()),
         });
+        self.grouped = Rc::new(build_grouped(&self.data, &self.visible));
         let cursor = anchored
             .and_then(|(section, path)| {
                 self.visible.iter().position(|&d| {
@@ -603,6 +711,7 @@ impl Files {
             Some(q) => search_rows(&self.data, q),
             None => Vec::from_iter(0..self.data.len()),
         });
+        self.grouped = Rc::new(build_grouped(&self.data, &self.visible));
 
         let mut view = self.view.get();
         let cursor = anchored
@@ -1128,6 +1237,73 @@ mod tests {
                 Entry::File(f) => f.path.to_string_lossy().into_owned(),
             })
             .collect()
+    }
+
+    /// The grouped projection as text: directory headings with counts, and
+    /// files as `section:path` — the section rides along because twins
+    /// share a path and a heading.
+    fn grouped_outline(status: &Status) -> Vec<String> {
+        let rows = flatten(status);
+        let visible: Vec<usize> = (0..rows.len()).collect();
+        let grouped = super::build_grouped(&rows, &visible);
+        grouped
+            .rows
+            .iter()
+            .map(|r| match r {
+                super::GroupedRow::Heading { dir, count } => {
+                    format!("<{dir}·{count}>")
+                }
+                super::GroupedRow::File { visible: vp } => {
+                    let Entry::File(f) = &rows[visible[*vp]] else {
+                        panic!("a grouped file row names a file")
+                    };
+                    format!("{}:{}", f.section.name(), f.path.to_string_lossy())
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn grouped_rows_gather_directories_and_keep_twins_distinct() {
+        assert_eq!(
+            grouped_outline(&sample_status()),
+            vec![
+                "<src/·2>",
+                "staged:src/main.rs",
+                "unstaged:src/main.rs",
+                "<·3>",
+                "staged:gone.txt",
+                "untracked:notes.md",
+                "conflicts:merged.rs",
+            ],
+            "one heading per directory, twins under it with their sides"
+        );
+        assert_eq!(
+            grouped_outline(&Status::default()),
+            Vec::<String>::new(),
+            "an empty tree groups to nothing"
+        );
+    }
+
+    #[test]
+    fn grouped_cursor_addresses_survive_the_projection() {
+        let rows = flatten(&sample_status());
+        let visible: Vec<usize> = (0..rows.len()).collect();
+        let grouped = super::build_grouped(&rows, &visible);
+        // Every visible file position resolves to the grouped row naming
+        // it, and headings own no cursor.
+        for (vp, &d) in visible.iter().enumerate() {
+            match &rows[d] {
+                Entry::File(_) => {
+                    let at = grouped.cursor_row(vp).expect("a file has a row");
+                    assert!(matches!(
+                        grouped.rows[at],
+                        super::GroupedRow::File { visible } if visible == vp
+                    ));
+                }
+                Entry::Heading { .. } => assert_eq!(grouped.cursor_row(vp), None),
+            }
+        }
     }
 
     fn with_height(f: &mut Files, n: usize) {

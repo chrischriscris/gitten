@@ -1284,7 +1284,7 @@ mod tests {
 
     #[test]
     fn a_theme_written_in_the_file_is_registered_under_its_name() {
-        // Which is what puts it in the picker beside the shipped seven: the
+        // Which is what puts it in the picker beside the shipped eight: the
         // frontend lists a registry, so a palette somebody wrote by hand has to
         // be *in* one to be reachable at all.
         let mut h = host();
@@ -1301,6 +1301,7 @@ mod tests {
                 "catppuccin",
                 "tokyo-night",
                 "rose-pine",
+                "guide",
                 "solarized-ish"
             ]
         );
@@ -1330,9 +1331,10 @@ mod tests {
                 "gruvbox",
                 "catppuccin",
                 "tokyo-night",
-                "rose-pine"
+                "rose-pine",
+                "guide"
             ],
-            "an eighth entry appeared"
+            "a ninth entry appeared"
         );
         assert_eq!(
             h.themes.get("slate").map(|t| t.chrome.accent),

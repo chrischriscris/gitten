@@ -408,5 +408,7 @@ pub mod commits;
 pub mod diff;
 pub mod files;
 pub mod markdown;
+pub mod sidebar;
 pub mod split;
 pub mod stashes;
+pub mod workspace;

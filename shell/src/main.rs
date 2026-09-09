@@ -1511,6 +1511,12 @@ struct DevShell {
     /// Number of sidebar sections drawn this frame. Repository diff launches
     /// omit commits, so a drag clamps against the actual stack, not four.
     stack_count: Cell<usize>,
+    /// The guide-v2 workspace shell: toggle, center view and preview guard.
+    /// The sidebar holds no state of its own — it draws the files pane's
+    /// grouped projection under the files pane's cursor. See
+    /// [`views::workspace`]; the toggle's doors are `workspace.changes`
+    /// (enter) and `workspace.history` (back to the full stack).
+    workspace: views::workspace::Workspace,
     /// Startup logging, and nothing else: whether [`start::mark`] has already
     /// stamped the first render. One bool read per frame afterwards.
     first_render: Cell<bool>,
@@ -1789,6 +1795,15 @@ impl DevShell {
                 Screen::Commits { view, .. } => view.update(cx, |v, _| v.set_focused(focused)),
                 Screen::Diff { view, .. } => view.update(cx, |v, _| v.set_focused(focused)),
                 Screen::Custom(_) => {}
+            }
+        }
+        // The workspace center is not a pane, so it is not in the loop:
+        // its bar is accent exactly when the keyboard sits in the diff
+        // region while the workspace is up.
+        if self.workspace.enabled {
+            if let Some(center) = self.workspace.center.clone() {
+                let focused = self.spot == Spot::Main;
+                center.update(cx, |v, _| v.set_focused(focused));
             }
         }
     }
@@ -3334,6 +3349,10 @@ impl DevShell {
         // on changed under it — which is a selection change as far as the
         // main view is concerned.
         self.sync_main_diff(cx);
+        // And a refresh re-lands the files cursor the same way: a staging
+        // write's wave carries the side that just moved, and the preview
+        // follows it without another keystroke.
+        self.sync_workspace_preview(cx);
         cx.notify();
     }
 
@@ -4250,6 +4269,9 @@ impl DevShell {
             // The working tree's verbs. Context comes from the focused pane,
             // the write from the job queue — and where either is missing, the
             // same honest sentence an unknown command gets.
+            "workspace.changes" => self.enter_workspace(cx),
+            "workspace.history" => self.leave_workspace(cx),
+            "workspace.preview" => self.sync_workspace_preview(cx),
             "files.stage" => self.stage_or_unstage(cx),
             "files.commit" => self.begin_commit_message(cx),
             "files.amend" => self.begin_amend_message(cx),
@@ -4302,6 +4324,23 @@ impl DevShell {
                     screen.select(command == "select.all", cx);
                 }
             }
+            // The workspace center is not a Screen, so its keyboard verbs
+            // need an explicit door: workspace up and keyboard in the diff
+            // region, and the view/diff movement names go to the center
+            // view. The files pane keeps its names through the ordinary
+            // path while spot is List; the hidden main view keeps none.
+            "view.down" | "view.up" | "view.page-down" | "view.page-up" | "view.scroll-down"
+            | "view.scroll-up" | "view.top" | "view.bottom" | "view.left" | "view.right"
+            | "diff.next-file" | "diff.prev-file" | "diff.cycle-layout" | "diff.cycle-wrap"
+                if self.workspace.enabled && self.spot == Spot::Main =>
+            {
+                if let Some(center) = self.workspace.center.clone() {
+                    let host = config::host(cx);
+                    center.update(cx, |v, _| {
+                        v.run_view(command, &host);
+                    });
+                }
+            }
             _ => {
                 let known = match over.or_else(|| self.active()) {
                     Some(screen) => {
@@ -4329,6 +4368,11 @@ impl DevShell {
         // gone. One read on the no-op path.
         self.sync_modes(cx);
         self.sync_main_diff(cx);
+        // The workspace center learns the same way, off the files cursor.
+        // Disabled is one bool read; a refresh wave re-lands the same
+        // selection with a newer generation, which the guard below counts
+        // as new — staging a hunk re-aims the preview at the moved side.
+        self.sync_workspace_preview(cx);
         cx.notify();
     }
 
@@ -4534,6 +4578,172 @@ impl DevShell {
             return;
         }
         self.schedule_main_diff(commit, false, cx);
+    }
+
+    /// `workspace.changes`: enter the guide-v2 workspace — the Changes
+    /// destination. The stack stays alive underneath (cursors, refresh,
+    /// commands all keep working), and the center builds once, on first
+    /// entry. Reachable by name only until the commands palette lands in
+    /// Phase 3; tests drive it directly.
+    fn enter_workspace(&mut self, cx: &mut Context<Self>) {
+        self.workspace.enabled = true;
+        self.workspace.destination = views::workspace::Destination::Changes;
+        self.workspace_center(cx);
+        if self.panes.position("files").is_some() {
+            self.focus_named("files", cx);
+        }
+        self.sync_workspace_preview(cx);
+    }
+
+    /// `workspace.history`: back to the full stack — the History destination
+    /// until the timeline moves into the workspace in a later phase.
+    fn leave_workspace(&mut self, cx: &mut Context<Self>) {
+        self.workspace.enabled = false;
+        self.workspace.destination = views::workspace::Destination::History;
+        if self.has_column {
+            self.focus_named("commits", cx);
+        }
+    }
+
+    /// The workspace's center diff, built once on first entry and re-aimed
+    /// per selection — never rebuilt, which is what keeps its scroll state
+    /// and presentation across files, the same promise the main view keeps
+    /// across commits.
+    fn workspace_center(&mut self, cx: &mut Context<Self>) -> Entity<views::diff::Diff> {
+        if let Some(center) = self.workspace.center.clone() {
+            return center;
+        }
+        let host = config::host(cx);
+        let center = cx.new(|cx| views::diff::Diff::new(Vec::new(), host.clone(), cx));
+        center.update(cx, |v, _| v.set_focused(self.spot == Spot::Main));
+        self.workspace.center = Some(center.clone());
+        center
+    }
+
+    /// `workspace.preview`: re-aim the center at the files cursor — the
+    /// workspace's answer to [`DevShell::sync_main_diff`], called from the
+    /// same two places: the tail of every command and the landing of every
+    /// refresh wave. The no-op path is one read of the current row plus a
+    /// key compare; a schedule is one side read plus one prepare on the
+    /// executor, landing through the request guard.
+    ///
+    /// The key names section, path *and* the files pane's refresh
+    /// generation: a staging write's wave re-lands the same selection with
+    /// a newer generation, which counts as new — the preview follows the
+    /// side that just moved without another keystroke.
+    fn sync_workspace_preview(&mut self, cx: &mut Context<Self>) {
+        if !self.workspace.enabled {
+            return;
+        }
+        let Some(Screen::Files {
+            view: files_view,
+            generation,
+            ..
+        }) = self.panes.get("files")
+        else {
+            return;
+        };
+        let gen = generation.get().get();
+        let (cursor, current) = {
+            let v = files_view.read(cx);
+            (
+                v.cursor_visible(),
+                v.current_file()
+                    .map(|f| (f.section, f.path.clone(), f.path_text.clone())),
+            )
+        };
+        let Some((section, path, _)) = current.clone() else {
+            // An empty tree is not a selection: keep the last rows
+            // standing, but drop the key so the next file schedules.
+            self.workspace.last = None;
+            return;
+        };
+        let key = (section, path.clone(), gen);
+        if self.workspace.last.as_ref() == Some(&key) {
+            return;
+        }
+        // The sidebar follows the keyboard even when there is nothing new
+        // to load: grouped space pans on its own handle, minimally.
+        if let Some(row) = files_view.read(cx).grouped().cursor_row(cursor) {
+            self.workspace
+                .sidebar_scroll
+                .scroll_to_item(row, ScrollStrategy::Nearest);
+        }
+        // Conflicts render through their own markers presentation, not a
+        // diff — Phase 2 leaves the center on the last file.
+        let source = match section {
+            views::files::Section::Staged => {
+                gitten_core::source::DiffSource::Staged { path: path.clone() }
+            }
+            views::files::Section::Unstaged => {
+                gitten_core::source::DiffSource::Unstaged { path: path.clone() }
+            }
+            views::files::Section::Untracked => {
+                gitten_core::source::DiffSource::Untracked { path: path.clone() }
+            }
+            views::files::Section::Conflicts => return,
+        };
+        let Some((_, repo)) = self.repo.clone() else {
+            return;
+        };
+        self.workspace.last = Some(key);
+        let req = self.workspace.request + 1;
+        self.workspace.request = req;
+        let over = self.over.clone();
+        cx.spawn(async move |shell, cx| {
+            let mut job = None;
+            let live = shell
+                .update(cx, |shell, cx| {
+                    if shell.workspace.request != req {
+                        return false;
+                    }
+                    // An owned host crosses the thread boundary — the same
+                    // copy a pane refresh carries into its load half.
+                    let host = (*config::host(cx)).clone();
+                    let repo = repo.clone();
+                    job = Some(cx.background_spawn(async move {
+                        let loaded = gitten_app::acquire::diff_source(
+                            &source,
+                            &host.differ,
+                            &over,
+                            repo.as_ref(),
+                            false,
+                        )?;
+                        let Data::Diff(files) = loaded.data else {
+                            return Err("preview returned no diff".to_string());
+                        };
+                        let prepared = views::diff::prepare_files(&files, &host);
+                        Ok((files, prepared))
+                    }));
+                    true
+                })
+                .unwrap_or(false);
+            let Some(job) = job.filter(|_| live) else {
+                return;
+            };
+            let outcome = job.await;
+            // Apply half, guarded once more: a newer request wins, and a
+            // window that went away updates nothing.
+            _ = shell.update(cx, move |shell, cx| {
+                if shell.workspace.request != req {
+                    return;
+                }
+                match outcome {
+                    Ok((files, prepared)) => {
+                        if let Some(center) = shell.workspace.center.clone() {
+                            let host = config::host(cx);
+                            center
+                                .update(cx, |d, cx| d.replace_prepared(files, prepared, &host, cx));
+                        }
+                    }
+                    // A side that vanished under the selection — staged the
+                    // last hunk, deleted the file — is not a crash: one
+                    // sentence in the band, and the last rows keep standing.
+                    Err(e) => shell.set_notice(e),
+                }
+            });
+        })
+        .detach();
     }
 
     /// Aims the main view at `commit`.
@@ -4909,6 +5119,61 @@ impl DevShell {
         if self.help || self.open.is_some() || self.context.is_some() {
             return;
         }
+        // The workspace center is not a Screen, so the capture handler meets
+        // it before the stack/main hit test below — whose stale main bounds
+        // would otherwise eat the gesture and scroll a hidden list. The
+        // locked delta pans/scrolls the center directly; any other resolved
+        // command dispatches by name, and the view.* names land on the
+        // center through the workspace door in `run_command_from`.
+        // (Phase 4 owns the full gesture audit, including the sidebar rail.)
+        if self.workspace.enabled {
+            if let Some(center) = self.workspace.center.clone() {
+                if center.read(cx).list_bounds().contains(&ev.position) {
+                    let mut ongoing = self.ongoing.get();
+                    let delta = views::diff::locked(
+                        ev.delta.pixel_delta(window.line_height()),
+                        ev.modifiers.shift,
+                        &mut ongoing,
+                        ev.touch_phase,
+                    );
+                    self.ongoing.set(ongoing);
+                    let mut moved = false;
+                    if !delta.x.is_zero() {
+                        moved |= center.read(cx).pan_pixels(-f32::from(delta.x));
+                    }
+                    if !delta.y.is_zero() {
+                        let host = self.fresh_host(cx);
+                        let key = Key::new(
+                            match f32::from(delta.y) > 0.0 {
+                                true => Code::WheelUp,
+                                false => Code::WheelDown,
+                            },
+                            ev.modifiers.control,
+                            ev.modifiers.alt,
+                            false,
+                        );
+                        let modes = self.stack_for(Some(&self.main), cx);
+                        if let Resolve::Run(name) = host.keys.resolve(&modes, &[key]) {
+                            let name = name.to_string();
+                            match Self::smooth_pixels(&name, f32::from(delta.y), host.view.rows) {
+                                Some(px) => {
+                                    moved |= center.update(cx, |v, _| v.scroll_pixels(px, &host));
+                                }
+                                _ => {
+                                    self.notice = None;
+                                    self.run_command_from(&name, None, cx);
+                                }
+                            }
+                        }
+                    }
+                    cx.stop_propagation();
+                    if moved {
+                        cx.notify();
+                    }
+                    return;
+                }
+            }
+        }
         // Over one region's rows or the other's, and not over the title bar
         // or a dropdown above them. The wheel is a glance, not a commitment:
         // it scrolls the pane under it and the keyboard stays where it was —
@@ -5197,6 +5462,304 @@ impl DevShell {
                 .child(self.section_content("side-commits", screen.any(), c.bg, cx))
                 .into_any_element(),
         );
+    }
+}
+
+impl DevShell {
+    /// The workspace middle region: 76px destination header over a
+    /// sidebar + center-diff + inspector-stub row. Widths are fixed px per
+    /// the spec (255/266, 280/295 past 1550px), read from the viewport once
+    /// here at composition time — never from inside a view.
+    fn workspace_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let host = config::host(cx);
+        let c = host.theme.chrome;
+        let viewport_w = f32::from(window.viewport_size().width);
+        let side_w = views::workspace::sidebar_width(viewport_w);
+        let insp_w = views::workspace::inspector_width(viewport_w);
+
+        let Some(files_screen) = self.panes.get("files").cloned() else {
+            // A fixture has no working tree and therefore no sidebar to
+            // group: the workspace is a repository layout, said plainly.
+            return div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(rgb(host.theme.dim_on(theme::Surface::Context)))
+                .child("the workspace needs a repository \u{2014} this view has none")
+                .into_any_element();
+        };
+        let Screen::Files {
+            view: files_view,
+            label: files_label,
+            ..
+        } = files_screen
+        else {
+            unreachable!("panes are named")
+        };
+
+        let (changed, filter_note, cursor_file) = {
+            let v = files_view.read(cx);
+            (
+                v.changed(),
+                v.filter_note(),
+                v.current_file().map(|f| {
+                    (
+                        f.section,
+                        f.path_text.clone(),
+                        f.dir.clone(),
+                        f.name.clone(),
+                    )
+                }),
+            )
+        };
+        let mut status_line = format!("{changed} files changed");
+        if let Some(note) = filter_note {
+            status_line = format!("{status_line} \u{00b7} {note}");
+        }
+        let title: SharedString = match &self.repo {
+            Some((path, _)) => path
+                .file_name()
+                .map(|n| SharedString::from(n.to_string_lossy().into_owned()))
+                .unwrap_or_else(|| SharedString::from("repository")),
+            None => SharedString::from("no repository"),
+        };
+
+        // Every sidebar control resolves through the named dispatch — the
+        // same names the keyboard resolves to, so a button is an adapter
+        // and not a second path.
+        let me = cx.entity().downgrade();
+        let dispatch: views::sidebar::Dispatch = Rc::new(move |command, cx| {
+            if let Some(shell) = me.upgrade() {
+                shell.update(cx, |this, cx| this.run_command(command, cx));
+            }
+        });
+        let deps = views::sidebar::SidebarDeps {
+            files: files_view.clone(),
+            dispatch: dispatch.clone(),
+            title,
+            subtitle: SharedString::from(files_label.borrow().clone()),
+            status_line: SharedString::from(status_line.clone()),
+            destination: self.workspace.destination,
+            scroll: self.workspace.sidebar_scroll.clone(),
+        };
+        let sidebar = div()
+            .id("workspace-sidebar")
+            .debug_selector(|| "workspace-sidebar".to_string())
+            .flex_none()
+            .w(px(side_w))
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .border_r_1()
+            .border_color(rgb(c.border))
+            // A click anywhere here is the keyboard coming back to the
+            // files pane — capture phase, so the row's own handler stages
+            // the row the keyboard is already on.
+            .capture_any_mouse_down(cx.listener(|this, _, _, cx| this.focus_named("files", cx)))
+            .child(views::sidebar::render_sidebar(&deps, cx));
+
+        // The center: breadcrumb, Unified/Split toggle, status and totals
+        // over the shared diff view, fed one file's rows per selection.
+        let center = self.workspace_center(cx);
+        let summary = center.read(cx).file_summary();
+        let (layout_names, layout_index) = {
+            let v = center.read(cx);
+            (v.layout_names(), v.layout_index())
+        };
+        let status_word = match cursor_file.as_ref().map(|(s, _, _, _)| s) {
+            Some(views::files::Section::Staged) => "Staged",
+            Some(views::files::Section::Untracked) => "New file",
+            Some(views::files::Section::Conflicts) => "Conflict",
+            _ => "Modified",
+        };
+        let breadcrumb: AnyElement = match &cursor_file {
+            Some((_, _, dir, name)) => chrome::path_spans(
+                &host,
+                dir.clone(),
+                name.clone(),
+                c.fg,
+                theme::Surface::Title,
+                false,
+            )
+            .into_any_element(),
+            None => div()
+                .text_color(rgb(host.theme.dim_on(theme::Surface::Title)))
+                .child("No file selected")
+                .into_any_element(),
+        };
+        // Totals name the diff on screen, not the selection: a load still
+        // in flight must not print the new file's name over the old file's
+        // numbers.
+        let totals: Option<AnyElement> = match (&summary, &cursor_file) {
+            (Some(s), Some((_, path_text, _, _))) if s.path.as_str() == path_text.as_ref() => Some(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(chrome::gap_m(&host.font))
+                    .child(
+                        div()
+                            .text_color(rgb(host.theme.diff.adds_fg))
+                            .child(SharedString::from(format!("+{}", s.adds))),
+                    )
+                    .child(
+                        div()
+                            .text_color(rgb(host.theme.diff.dels_fg))
+                            .child(SharedString::from(format!("\u{2212}{}", s.dels))),
+                    )
+                    .into_any_element(),
+            ),
+            _ => None,
+        };
+        let toggle = div().flex_none().flex().flex_row().children(
+            layout_names
+                .into_iter()
+                .enumerate()
+                .map(|(i, name)| {
+                    let center = center.clone();
+                    let chosen = i == layout_index;
+                    div()
+                        .id(("ws-layout", i))
+                        .px(chrome::gap_s(&host.font))
+                        .py(px(2.0))
+                        .rounded(px(chrome::RADIUS))
+                        .cursor_pointer()
+                        .bg(rgb(match chosen {
+                            true => c.raised,
+                            false => c.bg,
+                        }))
+                        .text_color(rgb(match chosen {
+                            true => c.fg,
+                            false => host.theme.dim_on(theme::Surface::Title),
+                        }))
+                        .child(name)
+                        // Presentation state, not app dispatch: the toggle
+                        // names one of the registry entries this very view
+                        // published. (Carrying the selection across the
+                        // switch is Phase 4; the registry rebuild keeps the
+                        // reading position today.)
+                        .on_click(move |_, _, cx| {
+                            let host = config::host(cx);
+                            center.update(cx, |v, cx| v.set_layout(i, &host, cx));
+                        })
+                        .into_any_element()
+                })
+                .collect::<Vec<_>>(),
+        );
+        let center_header = div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(chrome::gap_l(&host.font))
+            .px(px(12.0))
+            .h(px(40.0))
+            .border_b_1()
+            .border_color(rgb(c.border))
+            .child(div().min_w_0().flex_shrink(1.0).child(breadcrumb))
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(chrome::gap_m(&host.font))
+                    .child(
+                        div()
+                            .text_color(rgb(host.theme.dim_on(theme::Surface::Title)))
+                            .child(status_word),
+                    )
+                    .children(totals)
+                    .child(toggle),
+            );
+        let center_pane = div()
+            .id("workspace-center")
+            .debug_selector(|| "workspace-center".to_string())
+            .flex_grow(1.0)
+            .min_w_0()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .capture_any_mouse_down(cx.listener(|this, _, _, cx| this.set_spot(Spot::Main, cx)))
+            .child(center_header)
+            .child(
+                div()
+                    .min_h_0()
+                    .flex_grow(1.0)
+                    .overflow_hidden()
+                    .child(center.clone()),
+            );
+
+        // The inspector's slot: content (staged summary, drafts, commit)
+        // is Phase 3. The width is reserved here so the center never lays
+        // out against a width Phase 3 will move.
+        let inspector = div()
+            .id("workspace-inspector")
+            .debug_selector(|| "workspace-inspector".to_string())
+            .flex_none()
+            .w(px(insp_w))
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .border_l_1()
+            .border_color(rgb(c.border))
+            .bg(rgb(c.bg))
+            .px(px(12.0))
+            .py(px(10.0))
+            .gap_y(px(8.0))
+            .child(div().text_color(rgb(c.fg)).child("Commit"))
+            .child(
+                div()
+                    .text_color(rgb(host.theme.dim_on(theme::Surface::Context)))
+                    .child("Staged summary and commit arrive in Phase 3."),
+            );
+
+        let (destination_title, header_sub) = match self.workspace.destination {
+            views::workspace::Destination::Changes => {
+                ("Changes", format!("{status_line} \u{00b7} working copy"))
+            }
+            views::workspace::Destination::History => ("History", status_line.clone()),
+        };
+        let header = div()
+            .flex_none()
+            .h(px(views::workspace::HEADER_H))
+            .flex()
+            .flex_col()
+            .justify_center()
+            .gap_y(px(4.0))
+            .px(px(16.0))
+            .border_b_1()
+            .border_color(rgb(c.border))
+            .bg(rgb(c.title_bg))
+            .child(div().text_color(rgb(c.fg)).child(destination_title))
+            .child(
+                div()
+                    .text_color(rgb(host.theme.dim_on(theme::Surface::Title)))
+                    .child(SharedString::from(header_sub)),
+            );
+
+        div()
+            .min_h_0()
+            .flex_grow(1.0)
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .child(header)
+            .child(
+                div()
+                    .min_h_0()
+                    .flex_grow(1.0)
+                    .flex()
+                    .flex_row()
+                    .overflow_hidden()
+                    .child(sidebar)
+                    .child(center_pane)
+                    .child(inspector),
+            )
+            .into_any_element()
     }
 }
 
@@ -5900,9 +6463,13 @@ impl Render for DevShell {
             )
             // The two regions in one row: the left stack, the diff. A fixture
             // has no stack — no repository to list — and the diff fills the
-            // window; a repository has both.
-            .child(
-                div()
+            // window; a repository has both. With the workspace up, the
+            // whole middle is the workspace instead — header, grouped
+            // sidebar, file diff, inspector slot — composed once here at
+            // the viewport the window handed over.
+            .child(match self.workspace.enabled {
+                true => self.workspace_body(window, cx),
+                false => div()
                     .min_h_0()
                     .flex_grow(1.0)
                     .flex()
@@ -5942,8 +6509,9 @@ impl Render for DevShell {
                                     }
                                 },
                             ))
-                    })),
-            )
+                    }))
+                    .into_any_element(),
+            })
             .children(input)
             // The menu itself is deferred at priority 1. Its transparent
             // priority-0 backdrop blocks the rest of the window without
@@ -6819,6 +7387,7 @@ fn open_main_window(launch: Launch, cx: &mut App) {
                 stack_splits: Cell::new([0.0; STACK_DIVIDERS]),
                 stack_resized: Cell::new(false),
                 stack_count: Cell::new(0),
+                workspace: views::workspace::Workspace::default(),
                 modes: Modes::new(),
                 pending: Vec::new(),
                 help: false,
@@ -7457,6 +8026,7 @@ mod tests {
                 stack_splits: Cell::new([0.0; super::STACK_DIVIDERS]),
                 stack_resized: Cell::new(false),
                 stack_count: Cell::new(0),
+                workspace: crate::views::workspace::Workspace::default(),
                 modes: Modes::new(),
                 pending: vec![vec![Key::char('g')]],
                 help: false,
@@ -7593,6 +8163,7 @@ mod tests {
                 stack_splits: Cell::new([0.0; super::STACK_DIVIDERS]),
                 stack_resized: Cell::new(false),
                 stack_count: Cell::new(0),
+                workspace: crate::views::workspace::Workspace::default(),
                 modes: Modes::new(),
                 pending: Vec::new(),
                 help: false,
@@ -8835,6 +9406,42 @@ diff --git a/one.txt b/one.txt
                 );
             }
             _ => panic!("the files list is not showing"),
+        });
+    }
+
+    /// The workspace toggle: `workspace.changes` raises the workspace and
+    /// builds the center once; `workspace.history` lowers it again. The
+    /// preview schedule itself runs on the executor, so this asserts the
+    /// composition state — enabled flag, destination, one center entity —
+    /// not the loaded rows.
+    #[gpui::test]
+    fn workspace_toggle_raises_and_lowers_the_workspace(cx: &mut TestAppContext) {
+        let (shell, _, _) = files_shell(cx);
+        shell.update(cx, |shell, cx| {
+            assert!(!shell.workspace.enabled);
+            shell.run_command("workspace.changes", cx);
+            assert!(shell.workspace.enabled);
+            assert_eq!(
+                shell.workspace.destination,
+                crate::views::workspace::Destination::Changes
+            );
+            assert!(
+                shell.workspace.center.is_some(),
+                "entering builds the center"
+            );
+            let first = shell.workspace.center.clone();
+            shell.run_command("workspace.changes", cx);
+            assert_eq!(
+                shell.workspace.center.clone().map(|c| c.entity_id()),
+                first.map(|c| c.entity_id()),
+                "re-entering rebuilds nothing"
+            );
+            shell.run_command("workspace.history", cx);
+            assert!(!shell.workspace.enabled);
+            assert_eq!(
+                shell.workspace.destination,
+                crate::views::workspace::Destination::History
+            );
         });
     }
 
