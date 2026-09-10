@@ -55,7 +55,9 @@ pub(crate) fn open(main: Entity<crate::DevShell>, cx: &mut App) {
         if activate(cx) {
             return;
         }
-        let mut options = crate::window_options("gitten — Settings".into());
+        let mut options = // The settings window sizes itself below; a QA geometry is the
+        // main window's, not this one's.
+        crate::window_options("gitten — Settings".into(), None);
         options.window_bounds = Some(WindowBounds::centered(size(px(740.0), px(560.0)), cx));
         if let Ok(handle) = cx.open_window(options, |window, cx| {
             let win = cx.new(|cx| SettingsWindow::new(main.clone(), window, cx));

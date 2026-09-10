@@ -17,6 +17,35 @@ use gpui::*;
 /// panel. Typing narrows far faster than scrolling would.
 pub(crate) const VISIBLE_ROWS: usize = 14;
 
+/// One row: the command, its doc line, and the key the shared map binds it
+/// to.
+///
+/// The key comes from the live [`Keymap`](gitten_core::command::Keymap)
+/// rather than a table here, so a `[keys]` rebinding rewrites the column and
+/// an extension's own binding appears in it without this file changing. The
+/// platform's chords are not in the shared map — the platform modifier never
+/// reaches `command::Key` — so they are absent from the column for the same
+/// reason they are absent from every client's help: each window advertises
+/// its own in its chrome, where this one names `cmd-k` and `cmd-enter`.
+pub(crate) struct Row {
+    pub name: String,
+    pub doc: String,
+    /// Empty for a command nothing is bound to — a name reached only from
+    /// here, which is not a gap to paper over with a guess.
+    pub keys: String,
+}
+
+/// The keys to name on a row: the map's first binding for the command, with
+/// the pointer's two pseudo-chords left out. A keycap is a key — `wheelup`
+/// is a gesture the map spells as a chord so a wheel event can resolve to a
+/// command, and reading it as a key would send someone looking for it.
+pub(crate) fn key_column(keys: &[String]) -> String {
+    keys.iter()
+        .find(|key| !matches!(key.as_str(), "wheeldown" | "wheelup"))
+        .cloned()
+        .unwrap_or_default()
+}
+
 /// Registry order kept — the order `[keys]` and the terminal already agree
 /// on.
 pub(crate) fn filtered<'a>(commands: &'a [Command], query: &str) -> Vec<&'a Command> {
@@ -72,11 +101,15 @@ impl crate::DevShell {
     }
 
     /// The registry rows under the current query, in registry order.
-    pub(crate) fn palette_rows(&self, cx: &App) -> Vec<(String, String)> {
+    pub(crate) fn palette_rows(&self, cx: &App) -> Vec<Row> {
         let host = config::host(cx);
         filtered(host.commands.all(), &self.palette_query)
             .into_iter()
-            .map(|c| (c.name.clone(), c.doc.clone()))
+            .map(|c| Row {
+                name: c.name.clone(),
+                doc: c.doc.clone(),
+                keys: key_column(&host.keys.keys_for(&c.name)),
+            })
             .collect()
     }
 
@@ -96,7 +129,7 @@ impl crate::DevShell {
     /// way Esc would have — a run is one decision and not two.
     pub(crate) fn run_palette_selection(&mut self, cx: &mut Context<Self>) {
         let rows = self.palette_rows(cx);
-        let Some((name, _)) = rows.get(self.palette_sel).cloned() else {
+        let Some(name) = rows.get(self.palette_sel).map(|row| row.name.clone()) else {
             return;
         };
         self.palette_open = false;
@@ -139,9 +172,10 @@ impl crate::DevShell {
                 div()
                     .flex()
                     .flex_col()
-                    .children(visible.iter().enumerate().map(|(i, (name, doc))| {
+                    .children(visible.iter().enumerate().map(|(i, row)| {
                         let me = me.clone();
-                        let name = name.clone();
+                        let (name, doc, keys) =
+                            (row.name.clone(), row.doc.clone(), row.keys.clone());
                         div()
                             .id(SharedString::from(format!("palette-row-{i}")))
                             .flex()
@@ -162,14 +196,25 @@ impl crate::DevShell {
                                         true => c.fg,
                                         false => c.accent,
                                     }))
-                                    .child(SharedString::from(name.clone())),
+                                    .child(SharedString::from(name)),
                             )
                             .child(
                                 div()
+                                    .flex_1()
                                     .min_w_0()
                                     .truncate()
                                     .text_color(rgb(c.dim))
-                                    .child(SharedString::from(doc.clone())),
+                                    .child(SharedString::from(doc)),
+                            )
+                            // The key, at the row's end, in the same ink as
+                            // every other label glance-read rather than read:
+                            // raw `faint` is under the furniture floor here,
+                            // so it resolves against the row it lands on.
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_color(rgb(host.theme.quiet_on(c.bg)))
+                                    .child(SharedString::from(keys)),
                             )
                             .on_click(move |_, _, cx| {
                                 _ = me.update(cx, |this, cx| {
@@ -187,8 +232,8 @@ impl crate::DevShell {
 
 #[cfg(test)]
 mod tests {
-    use super::filtered;
-    use gitten_core::command::Command;
+    use super::{filtered, key_column};
+    use gitten_core::command::{Command, Keymap};
 
     fn command(name: &str, doc: &str) -> Command {
         Command {
@@ -219,5 +264,31 @@ mod tests {
         assert_eq!(filtered(&all, "stage").len(), 1);
         assert_eq!(filtered(&all, "branch").len(), 1);
         assert!(filtered(&all, "zzz").is_empty());
+    }
+
+    /// The column is the live map's answer and not a table beside it: a
+    /// rebinding is what the row names on the next frame, and an extension's
+    /// own binding arrives with no line of this file changing.
+    #[test]
+    fn the_key_column_follows_the_live_keymap() {
+        let builtin = Keymap::builtin();
+        assert_eq!(key_column(&builtin.keys_for("view.down")), "j");
+        let mut rebound = Keymap::empty();
+        rebound
+            .bind("global", "n", "view.down")
+            .expect("n is unclaimed");
+        assert_eq!(key_column(&rebound.keys_for("view.down")), "n");
+        // A name nothing binds says so by leaving the column empty, which is
+        // the honest answer and not a gap to fill with a guess.
+        assert_eq!(key_column(&rebound.keys_for("nothing.binds.this")), "");
+    }
+
+    /// The pointer's two pseudo-chords are gestures the map spells as chords
+    /// so a wheel event can resolve to a command. A row that named
+    /// `wheeldown` would send someone to the keyboard looking for it.
+    #[test]
+    fn the_key_column_never_names_a_wheel() {
+        assert_eq!(key_column(&["wheeldown".into(), "ctrl-e".into()]), "ctrl-e");
+        assert_eq!(key_column(&["wheelup".into()]), "");
     }
 }
