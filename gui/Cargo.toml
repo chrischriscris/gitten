@@ -1,5 +1,5 @@
 [package]
-name = "gitten-shell"
+name = "gitten-gui"
 version = "0.0.0"
 edition = "2021"
 

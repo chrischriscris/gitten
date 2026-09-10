@@ -8046,7 +8046,7 @@ mod tests {
     /// working-tree `diff` has something deterministic to open regardless of
     /// whether the enclosing checkout is clean (CI) or dirty (a laptop).
     fn scratch_repo(name: &str, dirty: bool) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("gitten-shell-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("gitten-gui-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("a temp dir");
         let git = |args: &[&str]| {

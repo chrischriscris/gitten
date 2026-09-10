@@ -4,7 +4,7 @@ gitten is a core and a set of clients. They are **not** equal:
 
 | | |
 |---|---|
-| `gitten-shell` | **the product.** GPUI. A feature asked for without a client named means this one. |
+| `gitten-gui` | **the product.** GPUI. A feature asked for without a client named means this one. |
 | `gitten-tui` | planned, and built; the one that comes after the window. |
 | `cli/` | the non-interactive agent door: `inspect` and `dispatch`, text or `--json`. |
 | `gitten-web` | a loopback JSON API, not a plan. It exists because a client written in another language could not exist at all if `core` had leaked anything UI-shaped. |
@@ -48,7 +48,7 @@ twice — and it has been three times already:
 | where a scrollbar's thumb goes | nowhere — no client drew one | `core::view` |
 
 The last two are the ones that mattered most. Before `gitten-app`, the parser for
-`gitten.toml` lived in `shell/src/config.rs` — so the *window* was the only client
+`gitten.toml` lived in `gui/src/config.rs` — so the *window* was the only client
 that could be configured, and `gitten-web` shipped with a comment apologising for
 it. Before `core::command`, a keybinding was three `match` statements that could
 not be made to agree.
@@ -76,7 +76,7 @@ A client with something to draw before its data exists — the desktop — takes
 the client schedules itself through the same `acquire::acquire`.
 
 ```rust
-let configured = Startup::new("gitten-shell", View::Commits)
+let configured = Startup::new("gitten-gui", View::Commits)
     .configure()?;   // args parsed, gitten.toml read and warned about; no repository read yet
 ```
 
@@ -95,7 +95,7 @@ let port = cli::take_value(start.take(), "--port")?;
 ## The arguments are a promise
 
 ```sh
-gitten-shell diff . HEAD~2..HEAD
+gitten-gui diff . HEAD~2..HEAD
 gitten-web   diff . HEAD~2..HEAD
 gitten-tui   diff . HEAD~2..HEAD
 
@@ -184,7 +184,7 @@ exists and a typo is named.
 
 | client | `render` produces |
 |---|---|
-| `gitten-shell` | `AnyElement` |
+| `gitten-gui` | `AnyElement` |
 | `gitten-tui` | cells, through a `Pen` |
 | `gitten-web` | text pieces on the wire |
 

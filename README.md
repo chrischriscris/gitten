@@ -139,7 +139,7 @@ and input, and nothing else.
 ```
 gitten-core                                   zero deps — differs, graph, rows, keys, themes
 gitten-git · gitten-app                        the only git boundary · gitten.toml and the cli
-gitten-shell │ gitten-tui │ gitten-web │ yours  the window │ the tty │ the agent API │ next
+gitten-gui │ gitten-tui │ gitten-web │ yours    the window │ the tty │ the agent API │ next
 ```
 
 Start reading at [docs/README.md](docs/README.md). `AGENTS.md` holds the

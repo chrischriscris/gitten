@@ -327,7 +327,7 @@ a glyph there rather than asking someone to open something.
 unstable-feature error, that pin has drifted — go read Zed's `rust-toolchain.toml`.
 
 **GPUI is pinned only by `Cargo.lock`, so never run a bare `cargo update`.** The
-four GPUI git dependencies in `shell/Cargo.toml` (`gpui`, `gpui_platform`,
+four GPUI git dependencies in `gui/Cargo.toml` (`gpui`, `gpui_platform`,
 `gpui-component`, `gpui-component-assets`) are declared without a `rev`; the exact
 commits live in `Cargo.lock` and nothing else holds them. A bare `cargo update`
 floats them to Zed's default-branch tip — a wall of compile errors and probably a
@@ -465,7 +465,7 @@ thing the eye does with that column is run down it. `justify_end` and a pad.
 A bare binary is not an `.app` bundle, so the window opens behind everything,
 the menu bar is titled with the executable's name and there is no icon.
 `cx.activate(true)` is the dev fix for the first of those; `./dev bundle` is the
-answer to all three. The mark is `shell/assets/icon.svg` — three lanes of a
+answer to all three. The mark is `gui/assets/icon.svg` — three lanes of a
 commit graph weaving past each other, which is what the word means — and the
 iconset is re-rendered from the vector at every size rather than downscaled from
 one PNG, because at 16 and 32 pixels that is the whole legibility of it.
@@ -502,7 +502,7 @@ per frame is a refcount bump.
 
 Don't add dependencies to `core/`.
 
-Don't put logic in `shell/` that `cli/` would have to duplicate.
+Don't put logic in `gui/` that `cli/` would have to duplicate.
 
 Don't build what the framework already has. `uniform_list` was there the whole
 time and a hand-rolled list cost a day.

@@ -140,7 +140,7 @@ jobs:
       # resolves `-lxkbcommon-x11`, which needs the unversioned .so symlink the
       # -dev package carries — the -0 runtime library alone leaves rust-lld
       # unable to find it.
-      - run: cargo test -q --locked -p gitten-shell
+      - run: cargo test -q --locked -p gitten-gui
 
   # RUSTSEC advisories against the locked tree. Advisory, not a gate: this repo
   # is ~99% transitive gpui dependencies, and a blocking job would turn main red

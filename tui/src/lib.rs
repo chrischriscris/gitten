@@ -4,7 +4,7 @@
 //! its own. Acquisition is `gitten-git`, the differ and every pass over a diff is
 //! `gitten-core`, and what is here is a grid of cells, the presentations that
 //! fill it and the escape codes that put it on screen — the same division
-//! `gitten-shell` has with GPUI and `gitten-web` has with JSON on the wire.
+//! `gitten-gui` has with GPUI and `gitten-web` has with JSON on the wire.
 //!
 //! ```text
 //!   gitten-git ──► core::rows::assemble ──► Ordered ──► Rows::render ──► Screen

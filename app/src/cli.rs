@@ -1,12 +1,12 @@
 //! The command line every client shares.
 //!
-//! `gitten-shell diff . HEAD~2..HEAD` and `gitten-web diff . HEAD~2..HEAD` and
+//! `gitten-gui diff . HEAD~2..HEAD` and `gitten-web diff . HEAD~2..HEAD` and
 //! `gitten-tui diff . HEAD~2..HEAD` are the same words in the same order, and
 //! that is a promise rather than a coincidence: a client is a way of *looking*
 //! at a repository, not a different tool, so the thing you type to reach one
 //! should reach any of them.
 //!
-//! It was written twice before it was written once. `gitten-shell` and
+//! It was written twice before it was written once. `gitten-gui` and
 //! `gitten-web` each had their own `USAGE`, their own `Source`, their own
 //! `--fixtures` arm; the two drifted in their error messages within a week of
 //! each other.

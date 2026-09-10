@@ -17,7 +17,7 @@ and anyone can write another.
    └──┬──────────────────┬──────────────────┬─────────────────────────────┘
       │                  │                  │
  ┌────▼───────┐ ┌────────▼─────┐ ┌──────────▼──┐   ┌──────────────────┐
- │gitten-shell │ │  gitten-tui   │ │  gitten-web  │   │ yours            │
+ │gitten-gui   │ │  gitten-tui   │ │  gitten-web  │   │ yours            │
  │GPUI window │ │cells, raw tty│ │loopback HTTP│   │ AnyElement, a    │
  │            │ │              │ │  agent JSON │   │ cell, a payload  │
  └────────────┘ └──────────────┘ └─────────────┘   └──────────────────┘
@@ -29,7 +29,7 @@ same `gitten.toml`, the same keymap. What differs is the type a `Rows`
 implementation returns — an `AnyElement`, a row of cells, a JSON payload — and
 that is the only reason the `Rows` trait itself cannot live in `core`.
 
-**The clients are not equal.** `gitten-shell` is the product; `gitten-tui` comes
+**The clients are not equal.** `gitten-gui` is the product; `gitten-tui` comes
 after it; `gitten-web` is the loopback agent API and `cli/` the non-interactive
 agent door, and neither is a thing anybody asked to ship as a product. A feature
 asked for without a client named means the window. See [clients.md](clients.md),
@@ -200,7 +200,7 @@ The graph crosses the wire as `core::graph::plan` — the halves, not a drawing 
 them — so a client's SVG paths and the window's Bézier curves are the same shape
 from the same numbers.
 
-## gitten-shell
+## gitten-gui
 
 GPUI. Drawing and input, and as little else as possible.
 

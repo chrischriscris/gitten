@@ -26,11 +26,11 @@
 //! | `ROUNDS` | `usize` | 7 (`tti`) | `tti`: runs per side, ABBA-interleaved, median reported |
 //! | `SETTLE` | seconds (`f64`) | 1 | `tti`: the gap between two timed runs |
 //! | `GITTEN_BASELINE` | path | unset (single side) | `tti`: an older `gitten-tui` to ABBA against |
-//! | `GITTEN_BASELINE_SHELL` | path | unset (no baseline) | `tti`: an older `gitten-shell` to ABBA against |
-//! | `GITTEN_TTI_SHELL` | `0` off, anything else on | on | `tti`: whether the desktop side runs at all (check.sh turns it off to stay windowless) |
+//! | `GITTEN_BASELINE_GUI` | path | unset (no baseline) | `tti`: an older `gitten-gui` to ABBA against |
+//! | `GITTEN_TTI_GUI` | `0` off, anything else on | on | `tti`: whether the desktop side runs at all (check.sh turns it off to stay windowless) |
 //! | `GITTEN_TTI_MAX_FIRST_FRAME_MS` | `f64` ms | unset (advisory) | `tti`: exit non-zero when the median exceeds it |
 //! | `GITTEN_TTI_MAX_FILLED_MS` | `f64` ms | unset (advisory) | `tti`: as above, for the filled frame |
-//! | `GITTEN_TTI_MAX_SHELL_MS` | `f64` ms | unset (advisory) | `tti`: as above, for the shell wall clock |
+//! | `GITTEN_TTI_MAX_GUI_MS` | `f64` ms | unset (advisory) | `tti`: as above, for the window wall clock |
 //! | `GITTEN_FORMAT` | `json` or unset | unset (human) | every `--json` tool: machine-readable output on stdout |
 //! | `GITTEN_CONFIG` | path | see `config::path` | which `gitten.toml` to read; honoured by [`config::path`](crate::config::path) |
 //!
@@ -200,19 +200,19 @@ pub fn baseline() -> Option<PathBuf> {
     get("GITTEN_BASELINE").map(PathBuf::from)
 }
 
-/// The same for the window: `GITTEN_BASELINE_SHELL`, a `gitten-shell` of
+/// The same for the window: `GITTEN_BASELINE_GUI`, a `gitten-gui` of
 /// another vintage.
-pub fn baseline_shell() -> Option<PathBuf> {
-    get("GITTEN_BASELINE_SHELL").map(PathBuf::from)
+pub fn baseline_gui() -> Option<PathBuf> {
+    get("GITTEN_BASELINE_GUI").map(PathBuf::from)
 }
 
-/// Whether the desktop side of a TTI measurement runs. `GITTEN_TTI_SHELL`,
+/// Whether the desktop side of a TTI measurement runs. `GITTEN_TTI_GUI`,
 /// and the default is *on*: the flag is a veto, `0` being the only off —
 /// which is the opposite of the [`enabled`] flags, because the side a caller
 /// wants removed is the desktop (check.sh turns it off to stay windowless),
 /// never the terminal.
-pub fn tti_shell() -> bool {
-    !std::env::var("GITTEN_TTI_SHELL").is_ok_and(|v| v == "0")
+pub fn tti_gui() -> bool {
+    !std::env::var("GITTEN_TTI_GUI").is_ok_and(|v| v == "0")
 }
 
 /// A ceiling a caller may pin, if it set one. `name` is the whole variable

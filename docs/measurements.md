@@ -21,7 +21,7 @@ cargo run -q -p gitten-core --example paint   --release   # the diff view, in AN
 cargo run -q -p gitten-git  --example diffcheck --release [REPO] [REVSPEC]
                                                         # differs, against git's own answer
 ./dev dump diff --fixtures                              # a terminal frame, and what it cost
-GITTEN_STATS=1 ./target/release/gitten-shell diff         # frame/heap overlay
+GITTEN_STATS=1 ./target/release/gitten-gui diff         # frame/heap overlay
 ```
 
 `bench` and `shape` read `fixtures/big.diff` and `fixtures/log.txt`; `check.sh`
@@ -371,7 +371,7 @@ commits / widest 21 lanes; 928,577 lines / 5,953 files / 142,858 replace-pairs /
 
 ```
 cargo run -q -p gitten-core --example bench --release   # per-stage, fixtures/big.diff + log.txt
-GITTEN_START_LOG=1 ./target/release/gitten-shell diff .   # startup stages, opt-in
+GITTEN_START_LOG=1 ./target/release/gitten-gui diff .   # startup stages, opt-in
 ```
 
 Before/after, `main` vs the pass, median of six rounds a side. The design
@@ -414,7 +414,7 @@ Since then the tui's startup has split into two frames: the list frame
 loading shape, and one wave of deferred reads fills them before a second frame
 (`startup frame flushed`) is flushed. "First fully-presented frame" now means
 the second. The desktop's time-to-interactive is now reproducible headlessly —
-`GITTEN_START_QUIT=1 GITTEN_START_LOG=1 ./target/release/gitten-shell commits .`
+`GITTEN_START_QUIT=1 GITTEN_START_LOG=1 ./target/release/gitten-gui commits .`
 quits the moment its first rows are drawn, so a wall clock around the process
 *is* the number (a window still appears) — recorded in
 [the desktop section below](#the-desktop-opens-its-window-before-it-acquires).
@@ -678,7 +678,7 @@ should measure against, not the line text.
 
 | | |
 |---|---|
-| `gitten-shell`, release, before syntax highlighting | 12,916,304 bytes |
+| `gitten-gui`, release, before syntax highlighting | 12,916,304 bytes |
 | after: scanner, theme, host, prepared, seams | 13,056,496 bytes (+123 KB) |
 | new dependencies | none |
 | `core` dependencies | none, and `[dependencies]` is empty |
@@ -727,7 +727,7 @@ column is half the width so more of them wrap.
 ### The desktop opens its window before it acquires
 
 Startup used to acquire, then open the window; an explicit repository launch
-(`gitten commits .`, `gitten diff .`) now opens it first. `shell/src/main.rs`
+(`gitten commits .`, `gitten diff .`) now opens it first. `gui/src/main.rs`
 takes `Startup::configure` — everything `go()` does but the acquisition, which
 lives in `app/src/lib.rs` — and registers empty screens one generation below the
 shell's, the sidebar panes in a loading shape (header label `STARTUP_LOADING`,
@@ -743,7 +743,7 @@ patches keep the synchronous `go()` road: in-process reads with no spawn floor t
 defer against, and failures still print to stderr and exit.
 
 ```sh
-GITTEN_START_QUIT=1 GITTEN_START_LOG=1 ./target/release/gitten-shell commits .
+GITTEN_START_QUIT=1 GITTEN_START_LOG=1 ./target/release/gitten-gui commits .
 ```
 
 Quits the moment its first rows are drawn — a window appears and closes — so a
@@ -1034,10 +1034,10 @@ The `tui` row is `GITTEN_START_LOG=1 ./target/release/gitten-tui commits .` on a
 non-tty stdin — it exits at `could not take the terminal` after printing its
 `gitten-start:` stages, so wall minus the printed stage sum is everything its
 clock cannot see. The `shell` row is
-`GITTEN_START_LOG=1 GITTEN_START_QUIT=1 ./target/release/gitten-shell commits .`
+`GITTEN_START_LOG=1 GITTEN_START_QUIT=1 ./target/release/gitten-gui commits .`
 — a window appears and closes, as in [the desktop section](#the-desktop-opens-its-window-before-it-acquires).
 Release binaries as of `27e15a0`, toolchain 1.97.1: `gitten-tui` 2.4 MB,
-`gitten-shell` 16.1 MB, probe 0.43 MB. The machine was **not idle** — another
+`gitten-gui` 16.1 MB, probe 0.43 MB. The machine was **not idle** — another
 session was building in this tree during part of the sitting — so SDs are
 quoted and the minima are the honest floors.
 
@@ -1046,7 +1046,7 @@ quoted and the minima are the honest floors.
 | probe, 0.43 MB, full runtime | 4.7 | 7.7 | 2.0 | 4.3 |
 | probe, `libc::_exit` | 3.6 | 1.6 | 2.0 | 2.9 |
 | `gitten-tui`, 2.4 MB | 6.1 | 9.9 | 4.2 | — |
-| `gitten-shell`, 16.1 MB | 7.1 | 4.8 | 6.0 | — |
+| `gitten-gui`, 16.1 MB | 7.1 | 4.8 | 6.0 | — |
 
 Paired within the same round: tui − probe **+2.3 ms**, shell − probe **+5.0 ms**,
 `_exit` − probe −0.3 ms (noise), so the probe is a fair floor. The tui row is
@@ -1109,21 +1109,21 @@ decompose before anyone optimizes it.
 ### Build times
 
 Wall clock around `cargo build`. A *save* is a one-line content change to
-`shell/src/graph.rs` on a current tree; the debug-loop rows are the dev loop,
+`gui/src/graph.rs` on a current tree; the debug-loop rows are the dev loop,
 not runtime numbers — the warning about debug builds is about frame times.
 Incremental for release is on (`[profile.release]` in Cargo.toml) and the
 before/after was measured on the same tree, same protocol.
 
 | what | time |
 |---|---|
-| no-op `cargo build -p gitten-shell` | 0.7 s |
+| no-op `cargo build -p gitten-gui` | 0.7 s |
 | save, dev loop (debug) | 4.4 s |
 | save, `--release`, incremental off (the old default) | 9.2 s |
 | save, `--release`, first build after the flag turns on | 11.5 s |
 | save, `--release`, warm incremental cache | **2.3 s** |
 | link only (bin codegen + link, debug) | 0.5 s |
 | gpui alone, cold rebuild | 77 s |
-| `cargo test -p gitten-shell --no-run`, cold | 87 s |
+| `cargo test -p gitten-gui --no-run`, cold | 87 s |
 | cold release build, from an empty target dir | 143.8 s (797 s CPU, ~5.5 cores) |
 
 The cold release build, by unit (37 % of CPU sits in the top 25):

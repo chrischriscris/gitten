@@ -4,7 +4,7 @@
 //! order, and every frontend needs the same result: the GPUI view, the ANSI
 //! `paint` example, the headless `bench`, and a `cli/` that does not exist yet.
 //! It lived in the view first and was immediately copied into two examples —
-//! which is exactly what "don't put logic in `shell/` that `cli/` would have to
+//! which is exactly what "don't put logic in `gui/` that `cli/` would have to
 //! duplicate" is warning about, so it is here instead. What is left in a
 //! frontend is drawing.
 //!

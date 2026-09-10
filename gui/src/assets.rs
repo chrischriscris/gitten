@@ -10,7 +10,7 @@
 //! library's own answer.
 //!
 //! This is the seam for chrome art, not a second registry: adding an icon is
-//! a file under `shell/assets/icons/` and one arm below. A client that wants
+//! a file under `gui/assets/icons/` and one arm below. A client that wants
 //! different art supplies its own [`gpui::AssetSource`] at the same place the
 //! window is built.
 

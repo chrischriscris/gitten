@@ -50,14 +50,14 @@ and the index built over it together, and nothing more. See
 
 | frontend | `render` produces |
 |---|---|
-| `gitten-shell` | `AnyElement` |
+| `gitten-gui` | `AnyElement` |
 | `gitten-web` | text pieces on the wire |
 | `gitten-tui` | cells, through a `Pen` |
 
 Everything above it is `core::rows::Present`, which the frontend trait extends.
 So a presentation that exists in one door is a `render` away from existing in
 another, and `SplitRows` is the proof: `tui/src/split.rs` is
-`shell/src/views/split.rs` with the GPUI taken out and *no* pipeline code, no
+`gui/src/views/split.rs` with the GPUI taken out and *no* pipeline code, no
 second alignment rule, no second wrap table.
 
 ## Two dependencies, and where the line is

@@ -7,7 +7,7 @@
 //!
 //! It lives here rather than in `core` for one reason: reading a file is I/O,
 //! and `core` does none — the same rule that makes `gitten-git` its own crate.
-//! It lived in `gitten-shell` until there were three clients, at which point the
+//! It lived in `gitten-gui` until there were three clients, at which point the
 //! window was the only one that could read the file, which is not a property a
 //! config format should have.
 //!

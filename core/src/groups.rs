@@ -269,8 +269,8 @@ mod tests {
     #[test]
     fn files_group_under_one_label_per_directory() {
         let s = status_of(vec![
-            staged("shell/src/diff/view.rs", Change::Modified),
-            staged("shell/src/diff/scroll.rs", Change::Modified),
+            staged("gui/src/diff/view.rs", Change::Modified),
+            staged("gui/src/diff/scroll.rs", Change::Modified),
             staged("core/src/groups.rs", Change::Added),
             staged("README", Change::Modified),
         ]);
@@ -279,7 +279,7 @@ mod tests {
             .iter()
             .map(|g| g.dir.to_string_lossy().into_owned())
             .collect();
-        assert_eq!(dirs, vec!["shell/src/diff/", "core/src/", ""]);
+        assert_eq!(dirs, vec!["gui/src/diff/", "core/src/", ""]);
         assert_eq!(groups[0].entries.len(), 2);
         // Heading plus filename concatenate back to the path.
         for g in &groups {

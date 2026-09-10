@@ -90,22 +90,33 @@ pub fn row_width(d: &Draw) -> f32 {
 }
 
 pub fn row_canvas(d: Draw, host: Rc<Host>) -> impl IntoElement {
+    row_canvas_h(d, host, ROW_H)
+}
+
+/// [`row_canvas`] at a caller-chosen row height.
+///
+/// The History timeline's rows are taller than the commit list's, and the graph
+/// has to fill the whole slot: a lane's halves meet on the row boundary, so
+/// every row in one list must be the same height or the S tears. The commit list
+/// passes [`ROW_H`]; the timeline passes its own, and the contract is only that
+/// it is uniform down the list.
+pub fn row_canvas_h(d: Draw, host: Rc<Host>, row_h: f32) -> impl IntoElement {
     let w = row_width(&d);
     canvas(
         move |_bounds, _window, _cx| d,
-        move |bounds, d: Draw, window, _cx| paint_row(bounds, &d, window, &host.theme),
+        move |bounds, d: Draw, window, _cx| paint_row(bounds, &d, window, &host.theme, row_h),
     )
     .flex_none()
     .w(px(w))
-    .h(px(ROW_H))
+    .h(px(row_h))
 }
 
-fn paint_row(bounds: Bounds<Pixels>, d: &Draw, window: &mut Window, theme: &Theme) {
+fn paint_row(bounds: Bounds<Pixels>, d: &Draw, window: &mut Window, theme: &Theme, row_h: f32) {
     let ox = f32::from(bounds.origin.x);
     let x = |lane: u16| ox + lane_x(lane);
     let top = f32::from(bounds.origin.y);
-    let mid = top + ROW_H / 2.0;
-    let bot = top + ROW_H;
+    let mid = top + row_h / 2.0;
+    let bot = top + row_h;
 
     // Straight halves first, as quads. A vertical line is a rectangle, and a
     // quad costs a fraction of a tessellated stroke path — with a 12-lane cap
@@ -135,6 +146,7 @@ fn paint_row(bounds: Bounds<Pixels>, d: &Draw, window: &mut Window, theme: &Them
             mid,
             c.down,
             color(theme, over, c.hue),
+            row_h,
         );
     }
 
@@ -161,9 +173,17 @@ fn paint_row(bounds: Bounds<Pixels>, d: &Draw, window: &mut Window, theme: &Them
 /// t=0.5 lands exactly on the row boundary, midway between the lanes; these
 /// are the de Casteljau control points of that split, so the neighbour's half
 /// continues this one to the pixel.
-fn half_s(window: &mut Window, x: f32, partner_x: f32, y: f32, down: bool, color: Rgba) {
+fn half_s(
+    window: &mut Window,
+    x: f32,
+    partner_x: f32,
+    y: f32,
+    down: bool,
+    color: Rgba,
+    row_h: f32,
+) {
     let dx = (partner_x - x) / 2.0;
-    let dy = if down { ROW_H / 2.0 } else { -ROW_H / 2.0 };
+    let dy = if down { row_h / 2.0 } else { -row_h / 2.0 };
 
     let mut p = PathBuilder::stroke(px(STROKE));
     p.move_to(point(px(x), px(y)));

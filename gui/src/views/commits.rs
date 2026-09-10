@@ -193,6 +193,13 @@ impl Commits {
         self.ages.get(*self.visible.get(row)?)
     }
 
+    /// The graph plan at a *visible* row — the History timeline's read, through
+    /// the indirection like [`Commits::commit_at`], so a filtered list draws the
+    /// topology of the commits it is actually showing.
+    pub(crate) fn draw_at(&self, row: usize) -> Option<&graph::Draw> {
+        self.data.draws.get(*self.visible.get(row)?)
+    }
+
     /// The visible cursor row — what the History timeline tints as selected.
     pub(crate) fn cursor(&self) -> usize {
         self.view.get().cursor()

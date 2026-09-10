@@ -4,14 +4,18 @@
 //! The timeline is a projection of the commits pane, not a second list with
 //! its own cursor: it reads [`Commits`]' visible rows and tints the row the
 //! keyboard is on, and a click routes back through the pane's own
-//! `select_row`. The detail is the window's one diff view — the same entity
-//! the stacked History used — so a commit is loaded exactly once however it
-//! was reached. Nothing here holds repository data or makes a selection
-//! decision; it is geometry and one named dispatch.
+//! `select_row`. Its gutter is the same commit graph the pane draws — each row
+//! carries the plan `core` computed for it, drawn by [`crate::graph`] at the
+//! timeline's taller row height — so branches fork and merge here exactly as
+//! they do in the commits list. The detail is the window's one diff view — the
+//! same entity the stacked History used — so a commit is loaded exactly once
+//! however it was reached. Nothing here holds repository data or makes a
+//! selection decision; it is geometry and one named dispatch.
 
 use super::commits::Commits;
 use super::diff::Diff;
 use crate::chrome;
+use crate::graph;
 use gitten_core::theme::Surface;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
@@ -83,86 +87,66 @@ pub(crate) fn render_history(deps: &HistoryDeps, cx: &mut App) -> AnyElement {
                         ),
                     };
                     let selected = i == cursor;
-                    let head = i == 0;
-                    let node = if head {
-                        host.theme.chrome.accent
-                    } else {
-                        host.theme.chrome.faint
-                    };
+                    let draw = view.draw_at(i).cloned();
                     let select = select.clone();
-                    div()
-                        .relative()
+                    let row = div()
+                        .flex()
                         .flex_none()
                         .w_full()
                         .h(px(ROW_H))
-                        .pl(px(31.0))
-                        .pr(px(12.0))
                         .rounded(px(5.0))
                         .bg(rgb(match selected {
                             true => c.selection_bg,
                             false => c.bg,
-                        }))
-                        // The connector: one pixel down the row's own
-                        // height, so consecutive rows draw one line. The
-                        // reference tints it between the node and the rail.
-                        .child(
-                            div()
-                                .absolute()
-                                .left(px(17.0))
-                                .top_0()
-                                .bottom_0()
-                                .w(px(1.0))
-                                .bg(rgb(c.accent).alpha(0.35)),
-                        )
-                        // The node: HEAD is the accent ring, the rest the
-                        // faint one — the reference's current/other cut,
-                        // without a second lane model.
-                        .child(
-                            div()
-                                .absolute()
-                                .left(px(13.0))
-                                .top(px(21.0))
-                                .w(px(9.0))
-                                .h(px(9.0))
-                                .rounded_full()
-                                .border_2()
-                                .border_color(rgb(node))
-                                .bg(rgb(c.bg)),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .justify_center()
-                                .h_full()
-                                .gap_y(px(5.0))
-                                .child(
-                                    div()
-                                        .truncate()
-                                        .text_size(px(11.0))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(rgb(c.fg))
-                                        .child(subject),
-                                )
-                                .child(
-                                    div()
-                                        .truncate()
-                                        .text_size(px(9.0))
-                                        .text_color(rgb(dim))
-                                        .child(SharedString::from(format!(
-                                            "{author} \u{00b7} {age}  {short}"
-                                        ))),
-                                ),
-                        )
-                        .id(("history-row", i))
-                        .cursor_pointer()
-                        .when(!selected, |r| {
-                            r.hover(|s| s.bg(rgb(host.theme.chrome.fg).alpha(0.03)))
-                        })
-                        .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, _, cx| {
-                            select(i, cx);
-                        })
-                        .into_any_element()
+                        }));
+                    // The graph gutter is the plan `core` computed for this
+                    // row, drawn at the timeline's own row height: a lane's
+                    // two halves meet on the row boundary, so the whole column
+                    // reads as one continuous graph. Per-row width, like the
+                    // commits list — a row alone on the trunk spends its
+                    // columns on its subject rather than reserving the widest
+                    // merge's.
+                    let row = match draw {
+                        Some(d) => row.child(graph::row_canvas_h(d, host.clone(), ROW_H)),
+                        None => row.child(div().flex_none().w(px(0.0))),
+                    };
+                    row.child(
+                        div()
+                            .min_w_0()
+                            .flex_grow(1.0)
+                            .flex()
+                            .flex_col()
+                            .justify_center()
+                            .h_full()
+                            .gap_y(px(5.0))
+                            .pr(px(12.0))
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(11.0))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(c.fg))
+                                    .child(subject),
+                            )
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(9.0))
+                                    .text_color(rgb(dim))
+                                    .child(SharedString::from(format!(
+                                        "{author} \u{00b7} {age}  {short}"
+                                    ))),
+                            ),
+                    )
+                    .id(("history-row", i))
+                    .cursor_pointer()
+                    .when(!selected, |r| {
+                        r.hover(|s| s.bg(rgb(host.theme.chrome.fg).alpha(0.03)))
+                    })
+                    .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, _, cx| {
+                        select(i, cx);
+                    })
+                    .into_any_element()
                 })
                 .collect()
         })

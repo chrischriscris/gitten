@@ -625,7 +625,7 @@ not have:
 
 What a client writes is a translation from its own platform's event to
 `command::Key` — `gitten-tui`'s is `term.rs`, the only file in that crate
-that imports `crossterm`; the window's is `shell/src/dispatch.rs`, over GPUI
+that imports `crossterm`; the window's is `gui/src/dispatch.rs`, over GPUI
 keystrokes. See [clients.md](clients.md).
 
 **A name is also how a command reaches the repository.** The window's dispatch
@@ -642,7 +642,7 @@ that way, the seam is broken.
 /// Where a click landed inside a row. `core::select`, because two doors ask it.
 pub struct Hit { pub part: u16, pub off: usize }
 
-// gitten-shell, in pixels:
+// gitten-gui, in pixels:
 fn hit(&self, index: usize, seg: usize, x: f32, host: &Host, shift: f32) -> Option<Hit>;
 // gitten-tui, in columns:
 fn hit(&self, index: usize, seg: usize, col: usize, shift: usize) -> Option<Hit>;
