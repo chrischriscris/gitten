@@ -2951,6 +2951,90 @@ pub(crate) fn row_frame() -> Div {
 /// intraline spans address the *line*, so cutting the string before
 /// [`Scratch::merged`] pairs styling with the wrong bytes. The same reason the
 /// terminal swallows columns in the pen rather than slicing.
+/// The presentation picker for one diff: a segmented control over the entries
+/// that view published, each one loading a layout straight onto the view that
+/// named it.
+///
+/// A pure function of a list and an index — the same reason a picker is not a
+/// registry — and here rather than at either call site because both the
+/// workspace center and the History detail show this component: the file diff
+/// in one destination, the commit's in the other. A second copy of the control
+/// is a second place for the two to disagree about what the registry holds.
+///
+/// The click reads the host *then*, not the one captured at build time, so a
+/// `gitten.toml` reload between frame and click reaches the rebuild it asks
+/// for. `surface` is what it is drawn on, because the quiet segment's ink is
+/// resolved against it — the workspace's toolbar and the History detail's
+/// heading are two different grounds.
+pub(crate) fn layout_toggle(
+    view: &Entity<Diff>,
+    names: Vec<&'static str>,
+    current: usize,
+    host: &Host,
+    surface: Surface,
+) -> AnyElement {
+    let c = host.theme.chrome;
+    div()
+        // The wrapper carries the view's identity, so the per-entry ids below
+        // are unique per diff and two of these can never cross-drive each
+        // other's hover — the named half of the identity rule, not a name
+        // string allocated per frame to fake it.
+        .id(("ws-layout", view.entity_id()))
+        .debug_selector(|| "layout-toggle".to_string())
+        .flex_none()
+        .flex()
+        .flex_row()
+        .p(px(2.0))
+        .rounded(px(6.0))
+        .border_1()
+        .border_color(rgb(c.border))
+        .bg(rgb(c.bg))
+        .children(
+            names
+                .into_iter()
+                .enumerate()
+                .map(|(i, name)| {
+                    let chosen = i == current;
+                    div()
+                        .id(("ws-layout", i))
+                        .px(px(8.0))
+                        .py(px(4.0))
+                        .rounded(px(4.0))
+                        .cursor_pointer()
+                        .bg(rgb(match chosen {
+                            true => c.title_bg,
+                            false => c.bg,
+                        }))
+                        .text_color(rgb(match chosen {
+                            true => c.fg,
+                            false => host.theme.dim_on(surface),
+                        }))
+                        .child(title_case(name))
+                        .on_click({
+                            let view = view.clone();
+                            move |_, _, cx| {
+                                let host = crate::config::host(cx);
+                                view.update(cx, |v, cx| v.set_layout(i, &host, cx));
+                            }
+                        })
+                        .into_any_element()
+                })
+                .collect::<Vec<_>>(),
+        )
+        .into_any_element()
+}
+
+/// A registry name as a control spells it: `unified` -> `Unified`. The
+/// registry's own name is the identity `gitten.toml` and `[keys]` use and is
+/// never rewritten — this is presentation, applied where the name is drawn.
+fn title_case(name: &str) -> SharedString {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) => SharedString::from(format!("{}{}", first.to_uppercase(), chars.as_str())),
+        None => SharedString::from(""),
+    }
+}
+
 pub(crate) fn scrolled(shift: f32, text: Div) -> Div {
     div()
         .flex()

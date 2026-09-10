@@ -1533,17 +1533,6 @@ fn push_label(ahead: Option<u32>) -> SharedString {
     }
 }
 
-/// A registry name as a control spells it: `unified` -> `Unified`. The
-/// registry's own name is the identity `gitten.toml` and `[keys]` use and is
-/// never rewritten — this is presentation, applied where the name is drawn.
-fn title_case(name: &str) -> SharedString {
-    let mut chars = name.chars();
-    match chars.next() {
-        Some(first) => SharedString::from(format!("{}{}", first.to_uppercase(), chars.as_str())),
-        None => SharedString::from(""),
-    }
-}
-
 /// The staging count's noun: the one case the plural would embarrass.
 fn staging_text(staged: u32) -> SharedString {
     match staged {
@@ -1588,6 +1577,27 @@ impl DevShell {
         match self.panes.get("commits") {
             Some(Screen::Commits { view, .. }) => Some(view.clone()),
             _ => None,
+        }
+    }
+
+    /// The diff the main spot's keyboard acts on: the workspace's own file diff
+    /// in Changes, the selected commit's in History.
+    ///
+    /// The two destinations draw *different entities in the same column*, and
+    /// the one that is not on screen still answers: it keeps the bounds it was
+    /// last painted with, it is still in the registry, and its scroll handle
+    /// still exists. The movement and layout commands the keyboard runs, the
+    /// wheel's region and the focus walk all have to name one of the two, and
+    /// this is where that choice is made. Naming `workspace.center` or `main`
+    /// directly is how a hidden diff eats a key or a flick meant for the one on
+    /// screen.
+    fn main_diff(&self) -> Option<Entity<views::diff::Diff>> {
+        match self.workspace.destination {
+            views::workspace::Destination::Changes => self.workspace.center.clone(),
+            views::workspace::Destination::History => match &self.main {
+                Screen::Diff { view, .. } => Some(view.clone()),
+                _ => None,
+            },
         }
     }
 
@@ -4278,11 +4288,11 @@ impl DevShell {
             "view.down" | "view.up" | "view.page-down" | "view.page-up" | "view.scroll-down"
             | "view.scroll-up" | "view.top" | "view.bottom" | "view.left" | "view.right"
             | "diff.next-file" | "diff.prev-file" | "diff.cycle-layout" | "diff.cycle-wrap"
-                if self.workspace.center.is_some() && self.spot == Spot::Main =>
+                if self.spot == Spot::Main && self.main_diff().is_some() =>
             {
-                if let Some(center) = self.workspace.center.clone() {
+                if let Some(main) = self.main_diff() {
                     let host = config::host(cx);
-                    center.update(cx, |v, _| {
+                    main.update(cx, |v, _| {
                         v.run_view(command, &host);
                     });
                 }
@@ -4430,7 +4440,7 @@ impl DevShell {
             _ => "files",
         };
         let mut stops = vec![Stop::List];
-        if self.workspace.center.is_some() {
+        if self.main_diff().is_some() {
             stops.push(Stop::Center);
         }
         if self.workspace.summary.is_some() {
@@ -5366,11 +5376,27 @@ impl DevShell {
         }
     }
 
+    /// The command one wheel event's vertical delta means.
+    ///
+    /// `gpui` passes the platform's delta through in the platform's own sign,
+    /// and it is *content* movement: positive pushes the rows down the window —
+    /// a two-finger flick toward you, with natural scrolling — and that is
+    /// `view.scroll-up`. The sign is the whole of this function, and it is the
+    /// one thing a diff cannot show you: get it backwards and the wheel still
+    /// scrolls, just away from the finger.
+    fn wheel_command(dy: f32) -> &'static str {
+        match dy > 0.0 {
+            true => "view.scroll-up",
+            false => "view.scroll-down",
+        }
+    }
+
     /// The pixels the smooth path feeds the list for a fixed scroll name.
     ///
-    /// The **command** signs them, not the finger: a finger-flick away from
-    /// you is positive, but `view.scroll-down` means that flick scrolls
-    /// *down* — so the name flips it. `[view] scroll` multiplies.
+    /// The **command** signs them, not the finger: the event's own sign has
+    /// already picked the name in [`Self::wheel_command`], and from there
+    /// `view.scroll-up` is the positive direction — pixels toward the top of
+    /// the document. `[view] scroll` multiplies.
     fn smooth_pixels(command: &str, dy: f32, rows: usize) -> Option<f32> {
         let px = dy.abs() * rows as f32;
         match command {
@@ -5380,19 +5406,53 @@ impl DevShell {
         }
     }
 
+    /// One list's vertical half, wherever the wheel landed: the platform's
+    /// sign picks the name, the name signs the pixels, and the redraw happens
+    /// only when something moved. The event stops here either way — the list's
+    /// own scroll handler decides the axis per event, which is the drift the
+    /// capture phase exists to prevent.
+    fn wheel_list(
+        &mut self,
+        list: UniformListScrollHandle,
+        delta: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut moved = false;
+        if !delta.y.is_zero() {
+            // Native scroll, always — the shipped `view.scroll-*` meaning,
+            // without consulting a keymap no finger can rebind. A glance pans
+            // the list; cursor verbs never rode the wheel. Only pixels did.
+            let host = self.fresh_host(cx);
+            let name = Self::wheel_command(f32::from(delta.y));
+            if let Some(px) = Self::smooth_pixels(name, f32::from(delta.y), host.view.rows) {
+                moved = views::workspace::wheel_pixels(&list, px);
+            }
+        }
+        cx.stop_propagation();
+        if moved {
+            cx.notify();
+        }
+    }
+
     /// One wheel event, wherever it rolled.
     ///
-    /// Two rules, both inherited from the probe this replaced: the gesture has
-    /// **one axis for its life** ([`views::diff::locked`], `gpui`'s own lock),
-    /// and what is locked is decided *here*, in the capture phase, before the
-    /// list's own scroll handler can turn a sideways flick into vertical
-    /// movement.
+    /// Three rules, the first two inherited from the probe this replaced: the
+    /// gesture has **one axis for its life** ([`views::diff::locked`], `gpui`'s
+    /// own lock), what is locked is decided *here*, in the capture phase, before
+    /// the list's own scroll handler can turn a sideways flick into vertical
+    /// movement, and — the rule the two destinations added — **a region is
+    /// chosen by what is drawn in it, never by which handle still answers**.
+    /// History draws the commit's diff where Changes drew the file's, and the
+    /// file diff's last painted bounds still name that column: without the
+    /// destination check the hidden one takes the wheel and the branch timeline
+    /// sits still.
     ///
     /// What changed with command dispatch is who owns the vertical half:
     /// the wheel scrolls natively, always — no keymap is consulted, so no
-    /// binding can rebind, page, or stop it. What ships (`view.scroll-down`
-    /// semantics) moves the list by the event's own pixels, which is what
-    /// keeps a trackpad smooth.
+    /// binding can rebind, page, or stop it. What ships (`view.scroll-*`
+    /// semantics, the finger's sign read in [`Self::wheel_command`]) moves
+    /// the list by the event's own pixels, which is what keeps a trackpad
+    /// smooth.
     fn on_wheel(&mut self, ev: &ScrollWheelEvent, window: &mut Window, cx: &mut Context<Self>) {
         // A wheel notch is an intervening event wherever it lands: a chord
         // half-typed when the fingers touch the wheel is not half-typed any
@@ -5406,11 +5466,11 @@ impl DevShell {
             return;
         }
         // The workspace owns the whole middle, so the capture handler
-        // meets its three regions directly — center, sidebar rail, then
-        // the natively-scrolling chrome. The locked delta pans/scrolls
-        // the region directly; the gesture lock (`OngoingScroll`) lives
-        // for the whole gesture, never per-event, so a diagonal flick
-        // cannot drift the rows.
+        // meets its regions directly — the rail, the branch timeline, the
+        // center's diff, then the natively-scrolling chrome. The locked
+        // delta pans/scrolls the region directly; the gesture lock
+        // (`OngoingScroll`) lives for the whole gesture, never per-event, so
+        // a diagonal flick cannot drift the rows.
         let mut ongoing = self.ongoing.get();
         let delta = views::diff::locked(
             ev.delta.pixel_delta(window.line_height()),
@@ -5419,7 +5479,20 @@ impl DevShell {
             ev.touch_phase,
         );
         self.ongoing.set(ongoing);
-        if let Some(center) = self.workspace.center.clone() {
+        // The branch timeline first, and by its own painted box: it is a list
+        // on its own handle, so the wheel is its own pixels there, exactly
+        // like the rail's.
+        if self.workspace.destination == views::workspace::Destination::History
+            && views::workspace::list_bounds(&self.workspace.history_scroll).contains(&ev.position)
+        {
+            self.wheel_list(self.workspace.history_scroll.clone(), delta, cx);
+            return;
+        }
+        // The center's diff: the selected file's in Changes, the selected
+        // commit's in History. One body, because the wheel's contract is the
+        // same list arithmetic in both — `Diff` owns the model either way.
+        let center = self.main_diff();
+        if let Some(center) = center {
             if center.read(cx).list_bounds().contains(&ev.position) {
                 let mut moved = false;
                 if !delta.x.is_zero() {
@@ -5427,15 +5500,7 @@ impl DevShell {
                 }
                 if !delta.y.is_zero() {
                     let host = self.fresh_host(cx);
-                    // Native scroll, always: a flick away from you scrolls
-                    // down, toward you scrolls up — the shipped
-                    // `view.scroll-*` meaning, without consulting a keymap
-                    // no finger can rebind. Cursor verbs never rode the
-                    // wheel here; only pixels did.
-                    let name = match f32::from(delta.y) > 0.0 {
-                        true => "view.scroll-down",
-                        false => "view.scroll-up",
-                    };
+                    let name = Self::wheel_command(f32::from(delta.y));
                     if let Some(px) = Self::smooth_pixels(name, f32::from(delta.y), host.view.rows)
                     {
                         moved |= center.update(cx, |v, _| v.scroll_pixels(px, &host));
@@ -5451,11 +5516,11 @@ impl DevShell {
         // The sidebar rail: the wheel pans the grouped list on its own
         // handle (`workspace.sidebar_scroll`) — the stack list's handle
         // addresses hidden rows, so the glance must never fall through
-        // to it. Pixels accumulate to whole rail rows (uniform ROW_H
-        // items, so a trackpad's small deltas add up instead of dying
-        // to rounding); the keyboard stays where it was. Any resolved
-        // name that is not a smooth scroll is a cursor verb, ignored on
-        // a glance the way an unbound key is.
+        // to it. The pixels land on that handle as they come, the way the
+        // center's do: a rail row is 30px and the platform reports points,
+        // so a row is not a unit either side has. Changes is the destination
+        // that draws it; in History the rail is the branch note, and a glance
+        // there scrolls nothing.
         //
         // The rect mirrors `workspace_body`'s geometry — title bar and
         // destination header above, status bar below, the spec width
@@ -5463,70 +5528,13 @@ impl DevShell {
         // names those numbers.
         let vp = window.viewport_size();
         let rail = views::workspace::sidebar_width(f32::from(vp.width));
-        let in_sidebar = f32::from(ev.position.x) >= 0.0
+        let in_sidebar = self.workspace.destination == views::workspace::Destination::Changes
+            && f32::from(ev.position.x) >= 0.0
             && f32::from(ev.position.x) < rail
             && f32::from(ev.position.y) >= TITLE_H
             && f32::from(ev.position.y) < f32::from(vp.height) - chrome::STATUS_H;
         if in_sidebar {
-            let mut moved = false;
-            if !delta.y.is_zero() {
-                let grouped_len = match self.panes.get("files") {
-                    Some(Screen::Files { view, .. }) => view.read(cx).grouped().rows.len(),
-                    _ => 0,
-                };
-                let host = self.fresh_host(cx);
-                // Native scroll, always — the shipped `view.scroll-*`
-                // meaning, without consulting a keymap. A glance pans the
-                // rail; cursor verbs never rode it.
-                let name = match f32::from(delta.y) > 0.0 {
-                    true => "view.scroll-down",
-                    false => "view.scroll-up",
-                };
-                if let Some(px) = Self::smooth_pixels(name, f32::from(delta.y), host.view.rows) {
-                    // The mirror against the rail's actual position
-                    // first: the keyboard-follow scroll moves the list
-                    // without stepping it, and stepping from a stale
-                    // top jumps.
-                    let max = grouped_len.saturating_sub(1);
-                    let mirror = self.workspace.sidebar_top.get();
-                    let top = views::workspace::reconcile_top(
-                        &self.workspace.sidebar_scroll,
-                        mirror,
-                        crate::graph::ROW_H,
-                        max,
-                    );
-                    let acc = match top == mirror {
-                        // Another path moved the list: the banked
-                        // remainder belongs to the old position, so
-                        // this flick starts fresh.
-                        true => self.workspace.sidebar_px.get() + px,
-                        false => {
-                            self.workspace.sidebar_top.set(top);
-                            px
-                        }
-                    };
-                    match views::workspace::wheel_step(top, acc, crate::graph::ROW_H, max) {
-                        Some((next, rest)) => {
-                            // Strict: the step already spent its
-                            // pixels, so the row lands on top even
-                            // when it is already visible. Non-strict
-                            // would sit still while the mirror walks
-                            // away from the window it claims to name.
-                            self.workspace
-                                .sidebar_scroll
-                                .scroll_to_item_strict(next, ScrollStrategy::Top);
-                            self.workspace.sidebar_top.set(next);
-                            self.workspace.sidebar_px.set(rest);
-                            moved |= next != top;
-                        }
-                        None => self.workspace.sidebar_px.set(acc),
-                    }
-                }
-            }
-            cx.stop_propagation();
-            if moved {
-                cx.notify();
-            }
+            self.wheel_list(self.workspace.sidebar_scroll.clone(), delta, cx);
         }
         // The inspector, the destination header and the chrome scroll
         // natively or not at all: falling through would scroll rows
@@ -5841,6 +5849,9 @@ impl DevShell {
         // over the shared diff view, fed one file's rows per selection.
         let center = self.workspace_center(cx);
         let summary = center.read(cx).file_summary();
+        // What the registry holds and which entry is loaded: the toggle is a
+        // pure function of the two, and the same one History draws over the
+        // commit's diff.
         let (layout_names, layout_index) = {
             let v = center.read(cx);
             (v.layout_names(), v.layout_index())
@@ -5900,50 +5911,13 @@ impl DevShell {
             ),
             _ => None,
         };
-        let toggle = div()
-            .flex_none()
-            .flex()
-            .flex_row()
-            .p(px(2.0))
-            .rounded(px(6.0))
-            .border_1()
-            .border_color(rgb(c.border))
-            .bg(rgb(c.bg))
-            .children(
-                layout_names
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, name)| {
-                        let center = center.clone();
-                        let chosen = i == layout_index;
-                        div()
-                            .id(("ws-layout", i))
-                            .px(px(8.0))
-                            .py(px(4.0))
-                            .rounded(px(4.0))
-                            .cursor_pointer()
-                            .bg(rgb(match chosen {
-                                true => host.theme.chrome.title_bg,
-                                false => c.bg,
-                            }))
-                            .text_color(rgb(match chosen {
-                                true => c.fg,
-                                false => host.theme.dim_on(theme::Surface::Title),
-                            }))
-                            .child(title_case(name))
-                            // Presentation state, not app dispatch: the toggle
-                            // names one of the registry entries this very view
-                            // published. The rebuild keeps the reading position
-                            // and carries the selection by content (see
-                            // `snapshot_selection`); an unresolvable end drops it.
-                            .on_click(move |_, _, cx| {
-                                let host = config::host(cx);
-                                center.update(cx, |v, cx| v.set_layout(i, &host, cx));
-                            })
-                            .into_any_element()
-                    })
-                    .collect::<Vec<_>>(),
-            );
+        let toggle = views::diff::layout_toggle(
+            &center,
+            layout_names,
+            layout_index,
+            &host,
+            theme::Surface::Title,
+        );
         // The center header: breadcrumb left, status + totals + the
         // Unified/Split segmented control right — the reference's 48px
         // diff-toolbar, chosen segment on the surface over the rail tint.
@@ -8714,6 +8688,107 @@ mod tests {
             shell.read_with(&cx, |shell, _| shell.workspace.destination),
             crate::views::workspace::Destination::History
         );
+        // The commit's diff is the same component the Changes center shows,
+        // so it carries the same presentation picker.
+        assert!(
+            cx.debug_bounds("layout-toggle").is_some(),
+            "the history detail has no layout picker"
+        );
+    }
+
+    /// The branch timeline scrolls its own list. History draws the commit's
+    /// diff where Changes drew the file's, and the file diff's last painted
+    /// bounds still name that column — so the wheel has to pick its region by
+    /// destination, or the hidden diff takes the event and the timeline sits
+    /// still however hard the fingers move.
+    #[gpui::test]
+    fn the_branch_timeline_takes_the_wheel_over_its_own_rows(cx: &mut TestAppContext) {
+        let shell = commits_shell(cx);
+        shell.update(cx, |shell, cx| {
+            let files = cx.new(|_| {
+                crate::views::files::Files::from_prepared(crate::views::files::prepare(
+                    Status::default(),
+                    "gitten (main)",
+                    Default::default(),
+                ))
+            });
+            shell.panes.register(
+                "files",
+                Screen::files(files, Generation::default(), "files"),
+            );
+        });
+        // Changes first, with a diff in its center: the state the bug needs,
+        // since that diff's painted bounds are what swallow the timeline's
+        // wheel one destination later.
+        install_center(&shell, ONE_HUNK, cx);
+        let observed = shell.clone();
+        let window = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.set_global(config::Active(Rc::new(Host::new())));
+            cx.open_window(
+                gpui::WindowOptions {
+                    window_bounds: Some(gpui::WindowBounds::Windowed(gpui::Bounds {
+                        origin: Default::default(),
+                        size: gpui::size(gpui::px(1200.0), gpui::px(800.0)),
+                    })),
+                    ..Default::default()
+                },
+                move |_, _| observed,
+            )
+            .unwrap()
+        });
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+        shell.update(&mut cx, |shell, cx| {
+            shell.run_command("workspace.history", cx)
+        });
+        cx.run_until_parked();
+
+        let timeline = shell.read_with(&cx, |shell, _| {
+            shell
+                .workspace
+                .history_scroll
+                .0
+                .borrow()
+                .base_handle
+                .bounds()
+        });
+        assert!(
+            timeline.size.height > gpui::px(0.0),
+            "the timeline was not drawn"
+        );
+        let at = timeline.center();
+        let wheel = |dy: f32| gpui::ScrollWheelEvent {
+            position: at,
+            delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.0), gpui::px(dy))),
+            modifiers: Default::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+        };
+        let offset = |cx: &gpui::VisualTestContext| {
+            shell.read_with(cx, |shell, _| {
+                f32::from(
+                    shell
+                        .workspace
+                        .history_scroll
+                        .0
+                        .borrow()
+                        .base_handle
+                        .offset()
+                        .y,
+                )
+            })
+        };
+
+        // Away from you is negative: the timeline walks down its commits.
+        cx.simulate_event(wheel(-45.0));
+        assert_eq!(offset(&cx), -45.0, "the timeline did not take the wheel");
+        // Toward you is positive, back by the same pixels.
+        cx.simulate_event(wheel(20.0));
+        assert_eq!(
+            offset(&cx),
+            -25.0,
+            "the timeline's sign came from somewhere else"
+        );
     }
 
     /// The design's whole arrangement: stack, diff — two regions side by
@@ -8728,6 +8803,79 @@ mod tests {
             assert!(shell.notice.is_some(), "a fixture went unsaid");
             assert!(shell.open.is_none(), "refusing to browse left a menu open");
         });
+    }
+
+    /// The rail's wheel is the rail's: the platform's own pixels on the
+    /// grouped list's own handle, and the platform's own direction — a flick
+    /// away from you is negative and scrolls down.
+    #[gpui::test]
+    fn the_rails_wheel_moves_its_own_list_by_the_platforms_pixels(cx: &mut TestAppContext) {
+        // Forty files: more grouped rows than the rail's pane can show, so
+        // there is a bound for the pixels to move within.
+        let mut tree = Status::default();
+        for i in 0..40 {
+            tree.unstaged.push(gitten_core::status::UnstagedEntry {
+                path: gitten_core::status::PathBytes::from(
+                    format!("dir{i:02}/file{i:02}.txt").as_str(),
+                ),
+                change: gitten_core::status::Change::Modified,
+                kind: gitten_core::status::Kind::File,
+                submodule: Default::default(),
+            });
+        }
+        let (shell, _repo, _handle) = tree_shell(cx, tree);
+        let observed = shell.clone();
+        let window = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.set_global(config::Active(Rc::new(Host::new())));
+            cx.open_window(
+                gpui::WindowOptions {
+                    window_bounds: Some(gpui::WindowBounds::Windowed(gpui::Bounds {
+                        origin: Default::default(),
+                        size: gpui::size(gpui::px(1200.0), gpui::px(800.0)),
+                    })),
+                    ..Default::default()
+                },
+                move |_, _| observed,
+            )
+            .unwrap()
+        });
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+
+        let rail = cx.debug_bounds("workspace-sidebar").expect("no rail drawn");
+        let at = rail.center();
+        let wheel = |dy: f32| gpui::ScrollWheelEvent {
+            position: at,
+            delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.0), gpui::px(dy))),
+            modifiers: Default::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+        };
+        let offset = |cx: &gpui::VisualTestContext| {
+            shell.read_with(cx, |shell, _| {
+                f32::from(
+                    shell
+                        .workspace
+                        .sidebar_scroll
+                        .0
+                        .borrow()
+                        .base_handle
+                        .offset()
+                        .y,
+                )
+            })
+        };
+
+        // Away from you is negative: the rows walk down the document.
+        cx.simulate_event(wheel(-90.0));
+        assert_eq!(offset(&cx), -90.0, "the rail did not take the pixels");
+        // Toward you is positive, and it walks back by the same pixels.
+        cx.simulate_event(wheel(40.0));
+        assert_eq!(
+            offset(&cx),
+            -50.0,
+            "the rail's sign came from somewhere else"
+        );
     }
 
     #[gpui::test]
@@ -9135,16 +9283,25 @@ diff --git a/one.txt b/one.txt
         });
     }
 
+    /// The workspace owns key routing: entering builds the center, and the
+    /// destination decides which diff the diff region's keys reach — the
+    /// file's in Changes, the selected commit's in History. The other one
+    /// still exists in the shell; it just keeps no keyboard names.
     #[gpui::test]
     fn commands_follow_the_region_the_list_moves_lists_then_the_diff(cx: &mut TestAppContext) {
         let shell = commits_shell(cx);
-        // The workspace owns key routing: entering builds the center, and
-        // History hands the keyboard to the commits timeline. `view.down`
-        // then moves the list through the ordinary pane path, and from the
-        // diff region through the workspace door onto the center — never
-        // the hidden main view, which keeps no keyboard names.
         shell.update(cx, |shell, cx| shell.run_command("workspace.changes", cx));
         install_center(&shell, ONE_HUNK, cx);
+        // Rows in the History detail too, so "which diff moved" is observable
+        // rather than inferable. No repository behind this shell, so nothing
+        // loads over them.
+        shell.update(cx, |shell, cx| {
+            let host = Rc::new(Host::new());
+            let detail = cx.new(|cx| {
+                crate::views::diff::Diff::new(gitten_core::parse_unified_diff(ONE_HUNK), host, cx)
+            });
+            shell.main = Screen::diff(detail, None, Generation::default(), "");
+        });
         shell.update(cx, |shell, cx| shell.run_command("workspace.history", cx));
         // From the timeline, `j` moves the commit list and touches nothing else.
         shell.update(cx, |shell, cx| shell.run_command("view.down", cx));
@@ -9164,17 +9321,54 @@ diff --git a/one.txt b/one.txt
             assert_eq!(shell.spot, super::Spot::Main);
         });
 
-        // ...and now `j` scrolls the center, leaving the list where it was.
+        // ...and now `j` scrolls the diff *on screen*, which History draws
+        // through the main view — never the file diff the other destination
+        // left in the same column, whose stale bounds and live handle are
+        // exactly what this names.
         shell.update(cx, |shell, cx| shell.run_command("view.down", cx));
         shell.read_with(cx, |shell, cx| {
+            let shown = match &shell.main {
+                Screen::Diff { view, .. } => view.clone(),
+                _ => panic!("the history detail is not a diff"),
+            };
+            assert_eq!(shown.read(cx).cursor(), 1, "the commit's diff took the key");
             let center = shell
                 .workspace
                 .center
                 .clone()
                 .expect("center built on entry");
-            assert_eq!(center.read(cx).cursor(), 1);
+            assert_eq!(
+                center.read(cx).cursor(),
+                0,
+                "the hidden file diff took the key instead"
+            );
         });
         assert_eq!(column_commits(&shell, cx), search_commit(1).sha);
+
+        // `s` cycles the same diff's presentation, through the same door: the
+        // commit's layout moves and the file diff's does not.
+        shell.update(cx, |shell, cx| shell.run_command("diff.cycle-layout", cx));
+        shell.read_with(cx, |shell, cx| {
+            let shown = match &shell.main {
+                Screen::Diff { view, .. } => view.clone(),
+                _ => panic!("the history detail is not a diff"),
+            };
+            assert_eq!(
+                shown.read(cx).layout_index(),
+                1,
+                "the commit's diff kept its presentation"
+            );
+            let center = shell
+                .workspace
+                .center
+                .clone()
+                .expect("center built on entry");
+            assert_eq!(
+                center.read(cx).layout_index(),
+                0,
+                "the hidden file diff re-laid out instead"
+            );
+        });
     }
 
     #[gpui::test]
@@ -9226,9 +9420,19 @@ diff --git a/one.txt b/one.txt
     }
 
     #[test]
+    fn the_wheel_pushes_the_rows_the_way_the_finger_went() {
+        // The platform's delta is content movement: positive pushes the rows
+        // down the window, which is a two-finger flick toward you and is
+        // called `view.scroll-up`. The bug this names is the pair swapped —
+        // a wheel that still scrolls, just away from the finger.
+        assert_eq!(DevShell::wheel_command(40.0), "view.scroll-up");
+        assert_eq!(DevShell::wheel_command(-40.0), "view.scroll-down");
+    }
+
+    #[test]
     fn the_wheel_follows_the_resolved_command_not_the_finger() {
-        // A flick away from the user is positive; what it *does* is whatever
-        // `[keys]` resolved to. The shipped binding signs it one way…
+        // The name signs the pixels and the finger does not; the shipped
+        // binding signs it one way…
         assert_eq!(
             DevShell::smooth_pixels("view.scroll-up", 40.0, 1),
             Some(40.0)

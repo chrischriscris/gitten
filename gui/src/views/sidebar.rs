@@ -17,6 +17,7 @@
 
 use super::files::{Entry, Files, GroupedRow};
 use super::workspace::Destination;
+use super::{vertical_scrollbar, DeferredScrollbar};
 use crate::chrome::{self, empty_line};
 use gitten_core::font::Font;
 use gitten_core::groups::StageFraction;
@@ -574,12 +575,23 @@ pub(crate) fn render_sidebar(deps: &SidebarDeps, cx: &mut App) -> AnyElement {
         .when(deps.history_note.is_none(), |d| {
             d.child(
                 div()
+                    // The bar overlays the list, so its box has to be the one
+                    // the list is painted in — the same shape every pane's
+                    // strip container has.
+                    .relative()
                     .flex_grow(1.0)
                     .min_h_0()
                     .overflow_hidden()
                     .pt(px(5.0))
                     .px(px(10.0))
-                    .child(list),
+                    .child(list)
+                    .when(host.view.scrollbar, |d| {
+                        // `direct`: the rail's wheel writes the handle's own
+                        // offset in the platform's pixels, so there are no
+                        // banked deltas for a thumb drag to cancel — only the
+                        // strict request a keyboard-follow scroll parks.
+                        d.child(vertical_scrollbar(&DeferredScrollbar::direct(&deps.scroll)))
+                    }),
             )
         })
         .when(deps.history_note.is_none(), |d| {

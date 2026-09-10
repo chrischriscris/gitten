@@ -143,14 +143,29 @@ fn accept_deferred_scroll(
 #[derive(Clone)]
 struct DeferredScrollbar {
     scroll: UniformListScrollHandle,
-    pending: PendingScroll,
+    /// `None` for a list whose wheel writes its offset directly: there are no
+    /// banked pixels to cancel, and only the parked request can fight a thumb.
+    pending: Option<PendingScroll>,
 }
 
 impl DeferredScrollbar {
+    /// A list whose wheel parks its pixels in a [`PendingScroll`]: a thumb
+    /// write cancels both the pixels and the request.
     fn new(scroll: &UniformListScrollHandle, pending: &PendingScroll) -> Self {
         Self {
             scroll: scroll.clone(),
-            pending: pending.clone(),
+            pending: Some(pending.clone()),
+        }
+    }
+
+    /// A list whose wheel has already applied its pixels to the handle — the
+    /// rail's, where a row is 30px and the platform reports points, so a pixel
+    /// is the only honest unit. Nothing is parked; the strict request a
+    /// keyboard-follow scroll leaves behind is still cancelled.
+    fn direct(scroll: &UniformListScrollHandle) -> Self {
+        Self {
+            scroll: scroll.clone(),
+            pending: None,
         }
     }
 }
@@ -165,7 +180,9 @@ impl ScrollbarHandle for DeferredScrollbar {
     }
 
     fn set_offset(&self, offset: Point<Pixels>) {
-        self.pending.cancel();
+        if let Some(pending) = &self.pending {
+            pending.cancel();
+        }
         let mut state = self.scroll.0.borrow_mut();
         state.deferred_scroll_to_item = None;
         state.base_handle.set_offset(offset);

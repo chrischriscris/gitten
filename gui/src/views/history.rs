@@ -14,6 +14,7 @@
 
 use super::commits::Commits;
 use super::diff::Diff;
+use super::{vertical_scrollbar, DeferredScrollbar};
 use crate::chrome;
 use crate::graph;
 use gitten_core::theme::Surface;
@@ -63,6 +64,12 @@ pub(crate) fn render_history(deps: &HistoryDeps, cx: &mut App) -> AnyElement {
     let dim = host.theme.dim_on(Surface::Context);
     let cursor = deps.commits.read(cx).cursor();
     let rows = deps.commits.read(cx).rows();
+    // The detail's presentation registry, read once per frame: what the picker
+    // in the heading lists and which entry is loaded.
+    let (layout_names, layout_index) = {
+        let v = deps.diff.read(cx);
+        (v.layout_names(), v.layout_index())
+    };
 
     let timeline = {
         let commits = deps.commits.clone();
@@ -181,15 +188,34 @@ pub(crate) fn render_history(deps: &HistoryDeps, cx: &mut App) -> AnyElement {
 
     let heading = div()
         .flex_none()
+        // Chrome type, and only this part of the pane: the diff below keeps
+        // whatever font the shell root hands it, which is the code font.
+        .font_family(host.chrome_family.clone())
         .px(px(28.0))
         .pt(px(28.0))
         .pb(px(22.0))
         .child(
             div()
-                .text_size(px(10.0))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(rgb(dim))
-                .child(SharedString::from(format!("COMMIT {short}"))),
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .text_size(px(10.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(dim))
+                        .child(SharedString::from(format!("COMMIT {short}"))),
+                )
+                // The commit's diff is the same component the Changes center
+                // shows, so it carries the same presentation picker — acting
+                // on *this* view, which is the one on screen here.
+                .child(super::diff::layout_toggle(
+                    &deps.diff,
+                    layout_names,
+                    layout_index,
+                    &host,
+                    Surface::Context,
+                )),
         )
         .child(
             div()
@@ -233,6 +259,7 @@ pub(crate) fn render_history(deps: &HistoryDeps, cx: &mut App) -> AnyElement {
         .flex()
         .items_center()
         .justify_between()
+        .font_family(host.chrome_family.clone())
         .px(px(16.0))
         .py(px(14.0))
         .border_t_1()
@@ -330,7 +357,10 @@ pub(crate) fn render_history(deps: &HistoryDeps, cx: &mut App) -> AnyElement {
         .debug_selector(|| "workspace-history".to_string())
         .size_full()
         .flex()
-        .font_family(host.chrome_family.clone())
+        // No family here: the code is this pane's main content and the shell
+        // root already draws it in the code font. The chrome around it — the
+        // timeline, the commit's heading, the footer — names the chrome face
+        // for itself, the way every other pane's furniture does.
         .child(
             div()
                 .flex_none()
@@ -339,6 +369,7 @@ pub(crate) fn render_history(deps: &HistoryDeps, cx: &mut App) -> AnyElement {
                 .flex()
                 .flex_col()
                 .overflow_hidden()
+                .font_family(host.chrome_family.clone())
                 .border_r_1()
                 .border_color(rgb(c.border))
                 .child(
@@ -363,11 +394,22 @@ pub(crate) fn render_history(deps: &HistoryDeps, cx: &mut App) -> AnyElement {
                 .child(div().flex_none().px(px(10.0)).child(uncommitted))
                 .child(
                     div()
+                        // The bar overlays the list, so the container is the
+                        // positioned ancestor — the same shape the rail and
+                        // every pane's strip container use.
+                        .relative()
                         .min_h_0()
                         .flex_grow(1.0)
                         .overflow_hidden()
                         .px(px(10.0))
-                        .child(timeline),
+                        .child(timeline)
+                        .when(host.view.scrollbar, |d| {
+                            // `direct`: the timeline's wheel writes the handle's
+                            // own offset in the platform's pixels, so nothing
+                            // is banked for a thumb drag to cancel — only the
+                            // strict request the cursor-follow scroll parks.
+                            d.child(vertical_scrollbar(&DeferredScrollbar::direct(&deps.scroll)))
+                        }),
                 ),
         )
         .child(detail)

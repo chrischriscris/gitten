@@ -14,7 +14,7 @@ use super::diff::Diff;
 use super::files::Section;
 use crate::input::Input;
 use gitten_core::status::PathBytes;
-use gpui::{Entity, Subscription, UniformListScrollHandle};
+use gpui::{point, px, Bounds, Entity, Pixels, Subscription, UniformListScrollHandle};
 use std::cell::Cell;
 
 /// The destination header's height: title, real counts, working-copy status.
@@ -44,55 +44,6 @@ pub fn inspector_width(viewport_w: f32) -> f32 {
         true => INSPECTOR_WIDE_W,
         false => INSPECTOR_W,
     }
-}
-
-/// One wheel step in grouped-row space: from the mirrored top and the
-/// accumulated pixels, the next top and the leftover remainder — or `None`
-/// when the pixels haven't filled a row yet and stay banked. Pure, so the
-/// settle arithmetic is a test instead of only a gesture.
-///
-/// Positive pixels scroll up, toward lower indices — the center's own sign
-/// convention. A step clamped against a bound forgets its remainder, or
-/// the first flick back jumps by the stored distance.
-pub fn wheel_step(top: usize, acc: f32, row_h: f32, max: usize) -> Option<(usize, f32)> {
-    let step = (-acc / row_h).trunc() as isize;
-    if step == 0 {
-        return None;
-    }
-    let next = (top as isize + step).clamp(0, max as isize) as usize;
-    let rest = match next == top {
-        true => 0.0,
-        false => acc + step as f32 * row_h,
-    };
-    Some((next, rest))
-}
-
-/// Reconcile the mirrored top with the rail's actual position, at a scroll
-/// decision point — never per frame.
-///
-/// The mirror is stepped beside every wheel-issued request, but the list
-/// also moves by paths that never touch it (the keyboard-follow scroll in
-/// `sync_workspace_preview`, a future scrollbar). Reading the handle's
-/// settled pixel offset and truncating to rows re-lands the mirror on the
-/// row the window actually shows.
-///
-/// One exception: while a programmatic request is still parked (it lays out
-/// on the next frame, not this one), the offset still names the *previous*
-/// position while the mirror already names the intent — trusting the offset
-/// then would un-step a step. A parked request keeps the mirror
-/// authoritative.
-pub fn reconcile_top(
-    scroll: &UniformListScrollHandle,
-    mirror: usize,
-    row_h: f32,
-    max: usize,
-) -> usize {
-    let state = scroll.0.borrow();
-    if state.deferred_scroll_to_item.is_some() {
-        return mirror;
-    }
-    let y = f32::from(state.base_handle.offset().y);
-    (-y / row_h).trunc().clamp(0.0, max as f32) as usize
 }
 
 /// Which destination the workspace shows. Changes is the default per the
@@ -137,17 +88,6 @@ pub struct Workspace {
     /// cursor; the timeline follows by parking a scroll when this differs —
     /// never by scrolling on every frame.
     pub history_cursor: Cell<usize>,
-    /// Sub-row wheel remainder for the rail above: trackpad deltas smaller
-    /// than one row accumulate here until they spend. Beside the handle it
-    /// feeds, zeroed whenever a step clamps against a bound.
-    pub sidebar_px: Cell<f32>,
-    /// Mirror of the rail's top index, stepped beside every wheel-issued
-    /// request. The handle's own top getter is test-gated upstream
-    /// (`#[cfg(any(test, feature = "test-support"))]`), so production reads
-    /// this instead — reconciled against the handle's actual offset at each
-    /// wheel decision by [`reconcile_top`], because the keyboard-follow
-    /// scroll moves the list without stepping it.
-    pub sidebar_top: Cell<usize>,
     /// The inspector's two fields, built once on first entry and refilled
     /// from the draft store whenever the repository changes. Owned here —
     /// beside the center view they serve — rather than in the modal prompt
@@ -175,8 +115,6 @@ impl Default for Workspace {
             sidebar_scroll: UniformListScrollHandle::new(),
             history_scroll: UniformListScrollHandle::new(),
             history_cursor: Cell::new(usize::MAX),
-            sidebar_px: Cell::new(0.0),
-            sidebar_top: Cell::new(0),
             summary: None,
             description: None,
             fields_key: None,
@@ -185,10 +123,44 @@ impl Default for Workspace {
     }
 }
 
+/// The box a `uniform_list` was last painted in — what the wheel hit-tests a
+/// list by before the list's own body runs. Zero until the first prepaint, so
+/// nothing can be scrolled through a region that has never been drawn; and the
+/// *stale* bounds of a list that has stopped being drawn are why the wheel
+/// picks its region by destination and not by whichever handle answers first.
+pub fn list_bounds(scroll: &UniformListScrollHandle) -> Bounds<Pixels> {
+    scroll.0.borrow().base_handle.bounds()
+}
+
+/// Moves a list by `dy` pixels — the wheel's own pixels, never a row step.
+///
+/// A rail row and a timeline row are both taller than the center's, and the
+/// platform reports points, so a row is the wrong unit twice over; and a list
+/// that moves in whole rows cannot show the half-row a slow flick is asking
+/// for. The offset convention is the diff's, so the arithmetic is too:
+/// positive pixels move up the document, and the handle clamps to what exists.
+///
+/// The newer intent wins. A request parked by a keyboard-follow scroll but not
+/// yet consumed by the prepaint is dropped, exactly as a wheel drops the
+/// diff's own parked request — otherwise the row lands a frame later and drags
+/// the list back out from under the finger. Returns whether anything moved,
+/// which is what decides a redraw.
+pub fn wheel_pixels(scroll: &UniformListScrollHandle, dy: f32) -> bool {
+    let mut state = scroll.0.borrow_mut();
+    state.deferred_scroll_to_item = None;
+    let offset = state.base_handle.offset();
+    let y = (f32::from(offset.y) + dy).clamp(-f32::from(state.base_handle.max_offset().y), 0.0);
+    if y == f32::from(offset.y) {
+        return false;
+    }
+    state.base_handle.set_offset(point(offset.x, px(y)));
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{point, px, ScrollStrategy};
+    use gpui::ScrollStrategy;
 
     /// The launch destination per the interaction contract: Changes before
     /// any command runs — no toggle to reach it.
@@ -198,54 +170,33 @@ mod tests {
         assert_eq!(ws.destination, Destination::Changes);
     }
 
-    /// A step onto an already-visible row still moves the mirror: two full
-    /// rows down from row 5 walks it to 7 with nothing banked — and the
-    /// wheel path parks that step strict, so the window follows instead of
-    /// sitting still while the mirror walks away from it.
+    /// The rail's wheel is the newer intent, so it drops a keyboard-follow
+    /// request that prepaint has not consumed yet — the way the diff's wheel
+    /// drops its own. Left standing, that request lands a frame later and
+    /// drags the list back out from under the finger that just moved it.
     #[test]
-    fn a_step_onto_an_already_visible_row_still_moves_the_top() {
-        assert_eq!(wheel_step(5, -44.0, 22.0, 39), Some((7, 0.0)));
-        // Sub-row pixels stay banked: no request, no move.
-        assert_eq!(wheel_step(5, -10.0, 22.0, 39), None);
-        // Upward pixels walk toward lower indices, keeping the leftover.
-        assert_eq!(wheel_step(5, 30.0, 22.0, 39), Some((4, 8.0)));
-        // Clamped against the top bound: the top holds and the remainder
-        // is forgotten, or the first flick back jumps.
-        assert_eq!(wheel_step(0, 44.0, 22.0, 39), Some((0, 0.0)));
-    }
+    fn a_wheel_drops_a_parked_keyboard_request() {
+        let ws = Workspace::default();
+        assert!(
+            !wheel_pixels(&ws.sidebar_scroll, -12.5),
+            "nowhere to scroll, nowhere moved"
+        );
 
-    /// The mirror follows a scroll it did not issue: a settled list parked
-    /// at row 10 by another path re-lands a stale mirror of 3 — unless a
-    /// programmatic request is still parked, in which case the mirror names
-    /// the intent and the not-yet-consumed offset must not un-step it.
-    #[test]
-    fn the_mirror_follows_a_scroll_it_did_not_issue() {
-        let scroll = UniformListScrollHandle::new();
-        scroll
-            .0
-            .borrow_mut()
-            .base_handle
-            .set_offset(point(px(0.), px(-220.0)));
-        assert_eq!(reconcile_top(&scroll, 3, 22.0, 39), 10);
-        scroll.scroll_to_item_strict(7, ScrollStrategy::Top);
-        assert_eq!(reconcile_top(&scroll, 7, 22.0, 39), 7);
-    }
-
-    /// Contract pin on the API the wheel path relies on: steps park with
-    /// `scroll_to_item_strict`, so an already-visible target still moves.
-    /// If GPUI ever changes what strict means, this fails loudly instead
-    /// of silently reintroducing the spend-without-moving desync.
-    #[test]
-    fn sidebar_steps_park_strict_requests() {
-        let scroll = UniformListScrollHandle::new();
-        scroll.scroll_to_item_strict(7, ScrollStrategy::Top);
-        let strict = scroll
+        ws.sidebar_scroll.scroll_to_item(3, ScrollStrategy::Nearest);
+        assert!(ws
+            .sidebar_scroll
             .0
             .borrow()
             .deferred_scroll_to_item
-            .as_ref()
-            .map(|d| d.scroll_strict)
-            .unwrap_or(false);
-        assert!(strict, "the parked step must be strict");
+            .is_some());
+        // Headless, the handle has no bounds and reports nowhere to go; the
+        // request must be gone either way.
+        assert!(!wheel_pixels(&ws.sidebar_scroll, -12.5));
+        assert!(ws
+            .sidebar_scroll
+            .0
+            .borrow()
+            .deferred_scroll_to_item
+            .is_none());
     }
 }
