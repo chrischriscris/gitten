@@ -73,7 +73,35 @@ function diff() {const f=files[state.file];return `<section class="diff"><div cl
 function codeRows(rows,h) {let old=h?86:42,newLine=old; if(!state.split)return rows.map(([kind,code])=>`<div class="code-row ${kind==='+'?'addition':kind==='-'?'deletion':''}"><span class="line-no">${kind==='+'?'':old++}</span><span class="line-no">${kind==='-'?'':newLine++}</span><span class="sign">${kind===' '?'':kind}</span><code>${highlight(code)||' '}</code></div>`).join('');const out=[];for(let i=0;i<rows.length;){if(rows[i][0]===' '){out.push([rows[i],rows[i]]);i++;}else{const removed=[],added=[];while(i<rows.length&&rows[i][0]!==' '){(rows[i][0]==='-'?removed:added).push(rows[i++]);}for(let j=0;j<Math.max(removed.length,added.length);j++)out.push([removed[j],added[j]]);}}return out.map(pair=>`<div class="split-row">${pair.map((r,side)=>`<div class="code-row ${r?(r[0]==='+'?'addition':r[0]==='-'?'deletion':''):'missing'}"><span class="line-no">${r?(side?newLine++:old++):''}</span><span class="sign">${r&&r[0]!==' '?r[0]:''}</span><code>${r?highlight(r[1])||' ':''}</code></div>`).join('')}</div>`).join('');}
 function composer() {return `<section class="composer"><div class="composer-heading"><div><h2>Commit</h2></div><span class="staged-pill">${stagedFiles()} files staged</span></div><label class="field-label" for="commit-title">Summary</label><input id="commit-title" aria-label="Commit summary" placeholder="Commit summary" maxlength="120" value="${esc(state.message)}"><label class="field-label" for="commit-description">Description <span>Optional</span></label><textarea id="commit-description" aria-label="Commit description" placeholder="Description (optional)">${esc(state.description)}</textarea><div class="commit-bottom"><span>${state.staged.size?`${state.staged.size} hunks staged`:'No staged changes'}</span>${button('commit','Commit'+icon('chevron'),'primary',(!state.message.trim()||!state.staged.size?'disabled':'')+' title="Commit staged changes · ⌘ Enter"')}</div></section>`;}
 const commits = [{title:'Keep line numbers fixed while panning',hash:'d2f8a31',time:'24 min ago',who:'You',file:0},{title:'Share wrap budgets across layouts',hash:'91be82c',time:'1 hour ago',who:'You',file:1},{title:'Cache diff preparation by blob pair',hash:'6fc043a',time:'Yesterday',who:'Maya',file:2},{title:'Document the row layout contract',hash:'b8a94e1',time:'Yesterday',who:'Maya',file:3}];
-function timeline() {return `<section class="timeline"><div class="list-heading"><strong>Branch history</strong><span class="muted">${icon('branch')}</span></div>${button('changes','<span class="graph-node current"></span><span><strong>Uncommitted changes</strong><small>Working tree · '+(state.commit?'clean':'4 files')+'</small></span>',`timeline-row ${state.view==='changes'?'selected':''}`)}<div class="timeline-date">Today</div>${commits.map((c,i)=>button('select-commit',`<span class="graph-node ${i===2?'other':''}"></span><span><strong>${c.title}</strong><small>${c.who} · ${c.time} <code>${c.hash}</code></small>${i===0?'<span class="ref-tag">fix/scroll-drift</span>':''}${i===2?'<span class="ref-tag neutral">main · origin/main</span>':''}</span>`,`timeline-row ${state.view==='history'&&state.history===i?'selected':''}`,`data-index="${i}"`)).join('')}</section>`;}
+// Real lane geometry, not a single rail: main runs down lane 0 and
+// fix/scroll-drift forks off it at c2 into lane 1, its tip at c0 and its
+// uncommitted row above. The desktop draws the same shape from core's plan.
+const LANE_W = 14;
+const laneX = lane => 7 + lane * LANE_W;
+const MAIN_LANE = '#5a947c';
+const BRANCH_LANE = '#9a88ba';
+const lanePath = (lane, color) => `<path d="M${laneX(lane)} 0V100" stroke="${color}" vector-effect="non-scaling-stroke"/>`;
+const forkPath = `<path d="M${laneX(0)} 50C${laneX(0)} 25 ${laneX(1)} 25 ${laneX(1)} 0" stroke="${BRANCH_LANE}" fill="none" vector-effect="non-scaling-stroke"/>`;
+function graphGutter(paths, nodeLane, nodeClass = '') {
+  const w = 2 * LANE_W;
+  return `<span class="graph-gutter" style="width:${w}px"><svg class="graph-lanes" viewBox="0 0 ${w} 100" preserveAspectRatio="none" aria-hidden="true">${paths.join('')}</svg><span class="graph-node ${nodeClass}" style="left:${laneX(nodeLane)}px"></span></span>`;
+}
+function timeline() {
+  const trunk = lanePath(0, MAIN_LANE);
+  const branch = lanePath(1, BRANCH_LANE);
+  const row = (action, gutter, copy, cls, attrs = '') => button(action, `${gutter}<span class="timeline-copy">${copy}</span>`, `timeline-row ${cls}`, attrs);
+  return `<section class="timeline"><div class="list-heading"><strong>Branch history</strong><span class="muted">${icon('branch')}</span></div>` +
+    row('changes', graphGutter([trunk, branch], 1, 'branch current'), `<strong>Uncommitted changes</strong><small>Working tree · ${state.commit?'clean':'4 files'}</small>`, state.view==='changes'?'selected':'') +
+    `<div class="timeline-date">Today</div>` +
+    commits.map((c, i) => {
+      const gutter = i < 2 ? graphGutter([trunk, branch], 1, 'branch')
+        : i === 2 ? graphGutter([trunk, forkPath], 0)
+          : graphGutter([trunk], 0);
+      const ref = i === 0 ? '<span class="ref-tag">fix/scroll-drift</span>' : i === 2 ? '<span class="ref-tag neutral">main · origin/main</span>' : '';
+      return row('select-commit', gutter, `<strong>${c.title}</strong><small>${c.who} · ${c.time} <code>${c.hash}</code></small>${ref}`, state.view==='history'&&state.history===i?'selected':'', `data-index="${i}"`);
+    }).join('') +
+    `</section>`;
+}
 function historyDetail(){const c=commits[state.history];return `<section class="history-detail"><div class="detail-heading"><span class="section-caption">COMMIT ${c.hash}</span><h2>${c.title}</h2><p><span class="avatar small">${c.who==='You'?'C':'M'}</span> ${c.who} <span class="muted">committed ${c.time}</span></p></div><div class="history-body"><div class="historical-file">${icon('file')} ${files[c.file].dir}/${files[c.file].name}<span class="green">+${files[c.file].added}</span></div><div class="hunk-heading">Commit diff</div><div class="code-table">${codeRows(files[c.file].hunks[0],0)}</div></div><div class="history-detail-foot">Parent <code>${commits[state.history+1]?.hash||'60d3fa2'}</code><span>Authored on fix/scroll-drift</span></div></section>`;}
 function clean(){return `<section class="clean-state">${icon('check')}<h2>Working tree clean</h2><p>Branch: <strong>fix/scroll-drift</strong></p><p class="muted">${esc(state.message)} · ${state.published?'Pushed to origin':'Committed locally'}</p>${button('reset','Reset demo','secondary')}</section>`;}
 function stagedSummary() {

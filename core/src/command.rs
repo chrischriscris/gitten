@@ -329,7 +329,17 @@ impl Keymap {
         // Global and not diff-only: a palette is the whole window's, and the
         // commit graph is drawn out of the same one. Shifted, because cycling a
         // theme is a thing done twice a month and `t` is worth more than that.
+        // `theme.picker` is registered beside it for a client with a picker —
+        // the desktop lists it in Commands and opens it from the title strip —
+        // but the shared binding stays the cycle, which every client answers.
         bind(GLOBAL, "T", "theme.cycle");
+        // The command palette, global because it lists the whole window's
+        // commands. Control, because the platform modifier owns its keys and
+        // never reaches this map — the menu-adapter door in each client
+        // carries cmd-k to the same name. `panes` and `todo` keep their own
+        // ctrl-k rows; a mode overrides the global binding for the same key
+        // and inherits everything else.
+        bind(GLOBAL, "ctrl-k", "commands.palette");
         // ` is unclaimed by every mode and untyped by lazygit's defaults, and
         // the message it opens is read once and dismissed — a key at the edge
         // of the keyboard for a panel at the edge of the app's life.
@@ -1448,6 +1458,11 @@ impl Commands {
         for (name, doc, hint) in [
             ("quit", "leave", Some("quit")),
             ("help", "show the keys", Some("keys")),
+            (
+                "commands.palette",
+                "list every command, by mouse or by key",
+                Some("commands"),
+            ),
             ("settings", "change the settings", Some("settings")),
             ("settings.apply", "use the next value", None),
             ("back", "leave the innermost mode", Some("back")),
@@ -1576,6 +1591,11 @@ impl Commands {
                 Some("move"),
             ),
             ("patch.clear", "empty the patch clipboard", Some("clear patch")),
+            (
+                "theme.picker",
+                "choose a theme from every registered palette",
+                Some("themes"),
+            ),
             ("theme.cycle", "the next theme", None),
             (
                 "commits.open-diff",
@@ -2210,6 +2230,21 @@ impl Commands {
                 None,
             ),
             ("diff.focus", "focus the diff view", None),
+            (
+                "workspace.changes",
+                "enter the workspace's Changes destination",
+                Some("changes"),
+            ),
+            (
+                "workspace.history",
+                "enter the workspace's History destination",
+                Some("history"),
+            ),
+            (
+                "workspace.preview",
+                "re-aim the workspace diff at the selected file",
+                None,
+            ),
             ("input.accept", "accept the text", None),
             ("input.cancel", "discard the text", None),
             ("pane.next", "the next list in the column", None),
@@ -2281,6 +2316,24 @@ impl Commands {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_commands_are_registered_and_bindable() {
+        // The bind path's gate: `apply_keys` refuses any name `known()`
+        // denies, so a `[keys]` entry like `"W" = "workspace.changes"`
+        // loads only while every workspace door is in the builtin table.
+        // (Regression: Phase 2 wired dispatch arms without registering
+        // the names, and the binding was refused at startup.)
+        let commands = Commands::builtin();
+        for name in [
+            "workspace.changes",
+            "workspace.history",
+            "workspace.preview",
+            "commands.palette",
+        ] {
+            assert!(commands.known(name), "{name} is not registered");
+        }
+    }
 
     fn keys(s: &str) -> Chord {
         parse_chord(s).expect("a chord")

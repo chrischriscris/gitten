@@ -233,6 +233,13 @@ impl Selection {
         &self.anchor
     }
 
+    /// The free end, as placed — not in draw order (see [`Selection::ends`]).
+    /// What a layout change carries beside the anchor so a restored
+    /// selection keeps its direction instead of collapsing to it.
+    pub fn head(&self) -> &Caret {
+        &self.head
+    }
+
     /// Moves the free end. The anchor stays put, which is what makes a drag back
     /// past its own start select backwards rather than collapse.
     pub fn extend(&mut self, to: Caret) {

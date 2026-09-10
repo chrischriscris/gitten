@@ -3,7 +3,7 @@
 //! Topology is [`gitten_core::assign_lanes`] and colour is
 //! [`gitten_core::graph::Hues`], both untouched — this file decides only what a
 //! lane *looks like* in a cell grid, which is the same division
-//! `shell/src/graph.rs` has with its Bézier curves. Both frontends therefore
+//! `gui/src/graph.rs` has with its Bézier curves. Both frontends therefore
 //! agree about which branch is amber and where the overflow begins.
 //!
 //! # One row per commit, and what that costs
@@ -40,7 +40,7 @@
 //! commits stay resident: the viewport's row numbers address the *visible*
 //! table, and one lookup at the end of every reader — cursor, copy, mouse,
 //! paint — maps back to the source vector. That is the window's order table
-//! (`shell/src/views/commits.rs`) reduced to a terminal's shape, and it is why
+//! (`gui/src/views/commits.rs`) reduced to a terminal's shape, and it is why
 //! filtering cannot desync what the cursor names from what is drawn, copied or
 //! opened. Search itself runs on edits only, never in a frame.
 
@@ -186,7 +186,7 @@ pub struct Commits {
     /// list, and only the final lookup names a commit. That is what keeps
     /// open-diff, copy, the mouse and painting all agreeing with the cursor
     /// under a filter, and it is the same shape the window keeps in
-    /// `shell/src/views/commits.rs`.
+    /// `gui/src/views/commits.rs`.
     visible: Vec<usize>,
     glyphs: Glyphs,
     /// The honest lane count, uncapped, for the status line.

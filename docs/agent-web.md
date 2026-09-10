@@ -1,9 +1,10 @@
 # The web loopback agent API
 
-`gitten-web` is a proof, not a product — see `architecture.md` — but the proof
-is exactly what an agent needs: the whole pipeline runs in the process you
-started, and a loopback HTTP API exposes it as data. No browser required. This
-page is the complete reference for driving it with `curl`.
+`gitten-web` is a door, not a product — see `architecture.md` — and it is
+exactly what an agent needs: the whole pipeline runs in the process you started,
+and a loopback HTTP API exposes it as data. There is no page; the routes below
+are the whole surface. This page is the complete reference for driving it with
+`curl`.
 
 Boot it the usual way, on either view:
 

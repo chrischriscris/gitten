@@ -87,8 +87,8 @@ bold "── building production binaries (release mode, no stats) ──"
 export GITTEN_STATS=0
 
 # 1. Build cargo release binaries
-dim "Building gitten-shell and gitten-tui..."
-cargo build --release -p gitten-shell -p gitten-tui
+dim "Building gitten-gui and gitten-tui..."
+cargo build --release -p gitten-gui -p gitten-tui
 
 # 2. Build and install macOS .app bundle if on macOS
 IS_DARWIN=0
@@ -106,7 +106,7 @@ if [ "$(uname -s)" = "Darwin" ]; then
                 "512 512x512" "1024 512x512@2x"; do
       set -- $pair
       rm -rf target/.ql && mkdir -p target/.ql
-      qlmanage -t -s "$1" -o target/.ql shell/assets/icon.svg >/dev/null 2>&1 || true
+      qlmanage -t -s "$1" -o target/.ql gui/assets/icon.svg >/dev/null 2>&1 || true
       if [ -f target/.ql/icon.svg.png ]; then
         cp target/.ql/icon.svg.png "target/gitten.iconset/icon_$2.png"
       fi
@@ -116,7 +116,7 @@ if [ "$(uname -s)" = "Darwin" ]; then
     rm -rf target/gitten.iconset
   fi
 
-  cp "target/release/gitten-shell" "$APP_BUNDLE/Contents/MacOS/gitten"
+  cp "target/release/gitten-gui" "$APP_BUNDLE/Contents/MacOS/gitten"
 
   cat > "$APP_BUNDLE/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -148,49 +148,11 @@ fi
 dim "Installing gitten-tui binary to $BIN_DIR/gitten-tui..."
 install -m 755 "target/release/gitten-tui" "$BIN_DIR/gitten-tui"
 
-# Also install standalone gitten-shell binary
-dim "Installing gitten-shell binary to $BIN_DIR/gitten-shell..."
-install -m 755 "target/release/gitten-shell" "$BIN_DIR/gitten-shell"
+# Also install the standalone gitten-gui binary
+dim "Installing gitten-gui binary to $BIN_DIR/gitten-gui..."
+install -m 755 "target/release/gitten-gui" "$BIN_DIR/gitten-gui"
 
-# 4. Install gitten-gui launcher script
-dim "Installing gitten-gui launcher to $BIN_DIR/gitten-gui..."
-cat > "$BIN_DIR/gitten-gui" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-
-# Production default: no stats readout overlay
-export GITTEN_STATS="${GITTEN_STATS:-0}"
-
-# Find the best binary to run:
-# 1. Custom binary override
-if [ -n "${GITTEN_GUI_BIN:-}" ] && [ -x "$GITTEN_GUI_BIN" ]; then
-  exec "$GITTEN_GUI_BIN" "$@"
-fi
-
-# 2. Bundled macOS app (gives Dock icon and proper menu name)
-for app in "/Applications/gitten.app" "$HOME/Applications/gitten.app" "$HOME/.local/share/gitten/gitten.app"; do
-  if [ -x "$app/Contents/MacOS/gitten" ]; then
-    exec "$app/Contents/MacOS/gitten" "$@"
-  fi
-done
-
-# 3. Fallback to standalone gitten-shell
-if command -v gitten-shell >/dev/null 2>&1; then
-  exec "$(command -v gitten-shell)" "$@"
-fi
-
-# 4. Sibling gitten-shell in same directory
-DIR="$(cd "$(dirname "$0")" && pwd)"
-if [ -x "$DIR/gitten-shell" ]; then
-  exec "$DIR/gitten-shell" "$@"
-fi
-
-echo "gitten-gui: could not find gitten.app or gitten-shell. Please run ./export." >&2
-exit 1
-EOF
-chmod 755 "$BIN_DIR/gitten-gui"
-
-# 5. Install gitten unified launcher script
+# 4. Install gitten unified launcher script
 dim "Installing gitten dispatcher to $BIN_DIR/gitten..."
 cat > "$BIN_DIR/gitten" <<'EOF'
 #!/usr/bin/env bash
@@ -255,6 +217,16 @@ case "$CLIENT" in
     exec gitten-tui "$@"
     ;;
   gui)
+    # The bundle carries the icon and the menu name; prefer it when present,
+    # then fall back to the standalone binary this script just installed.
+    if [ -n "${GITTEN_GUI_BIN:-}" ] && [ -x "$GITTEN_GUI_BIN" ]; then
+      exec "$GITTEN_GUI_BIN" "$@"
+    fi
+    for app in "/Applications/gitten.app" "$HOME/Applications/gitten.app" "$HOME/.local/share/gitten/gitten.app"; do
+      if [ -x "$app/Contents/MacOS/gitten" ]; then
+        exec "$app/Contents/MacOS/gitten" "$@"
+      fi
+    done
     exec gitten-gui "$@"
     ;;
   *)

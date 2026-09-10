@@ -1,7 +1,7 @@
 //! The diff view: a viewport over the order table, and the state a keyboard
 //! moves.
 //!
-//! This is `shell/src/views/diff.rs`'s `Diff` with GPUI taken out, and it turns
+//! This is `gui/src/views/diff.rs`'s `Diff` with GPUI taken out, and it turns
 //! out to be much smaller — because `uniform_list` is replaced by a `for` over
 //! the visible rows, and because the pipeline it used to drive now lives in
 //! [`gitten_core::rows`].

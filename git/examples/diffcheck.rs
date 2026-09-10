@@ -293,7 +293,7 @@ fn main() {
         // `core/src/differ.rs` bounds that cost the same way histogram and
         // patience bound their own worst case: past the budget it degrades
         // to "this region was replaced" rather than search forever.
-        // `shell/src/main.rs`'s ~9.4k differing lines, against the whole
+        // `gui/src/main.rs`'s ~9.4k differing lines, against the whole
         // project history, crosses that bound — raising `MAX_STEPS` 100x
         // locally made the drift vanish entirely (+83265/-574 on both
         // sides, exact agreement), which is the evidence this is the

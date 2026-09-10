@@ -6,11 +6,13 @@ can read is a palette in the wrong crate.
 
 ```rust
 pub struct Theme {
-    pub name: String,
+    pub name: String,             // the identity a config file and keymap use
+    pub label: String,            // what a picker calls it — "GitHub Dark"
+    pub family: String,           // the house it belongs to — "GitHub"
     pub min_contrast: f32,        // WCAG 2.1 ratio, the floor for token text
     syntax: [Style; 12],          // per Kind, private because it is resolved
     pub diff: DiffPalette,        // 18 colours: the rows, the words, the furniture
-    pub chrome: ChromePalette,    // 10 colours: window, titles, status, selection
+    pub chrome: ChromePalette,    // 13 colours: window, titles, status, selection
     pub lanes: Vec<Rgb>,          // cycled per branch
     pub lane_overflow: Rgb,       // past the 12-lane cap
     pub authors: Vec<Rgb>,        // cycled per author name
@@ -23,7 +25,7 @@ pub struct Style { pub fg: Rgb, pub bold: bool, pub italic: bool }
 Weight and slant are in `Style` because emphasis in prose is not a colour. A
 Markdown `**word**` that only changed hue would be wrong.
 
-## Seven of them, and where an eighth comes from
+## Nineteen of them, and where the twentieth comes from
 
 `Themes` is the registry and `host.theme` is the one on screen:
 
@@ -46,22 +48,36 @@ answer is `theme`, and `theme.name` is which.
 The consequence is the good one: **a theme written in `gitten.toml` is a theme.**
 The config layer applies the file to whatever `name` selected and then registers
 the result back under that name, so a palette somebody tuned by hand is in the
-same registry — and therefore the same title-bar menu and the same `T` — as the
-seven that ship. A `name` nobody registered is a new entry rather than an error;
-a `name` that *is* registered corrects that entry rather than adding a second one
-called the same thing, exactly as registering a differ does.
+same registry — and therefore the same theme picker and the same `T` — as the
+nineteen that ship. A `name` nobody registered is a new entry rather than an
+error; a `name` that *is* registered corrects that entry rather than adding a
+second one called the same thing, exactly as registering a differ does.
 
-The seven shipped are `dark` (warm, near-black), `light` (the same palette on
-paper), `slate` (cool), `gruvbox` (warm retro), `catppuccin` (lavender Mocha),
-`tokyo-night` (deep blue) and `rose-pine` (dark plum). The second is there to
-make a point the first cannot: warm dark is a taste and not a default, and a
-registry with one dark theme in it proves nothing about the seam. The other
-five are there to prove it again, in hues somebody else chose.
+The first eight are gitten's own: `dark` (warm, near-black), `light` (the same
+palette on paper), `slate` (cool), `gruvbox` (warm retro), `catppuccin-mocha`
+(lavender Mocha), `tokyo-night` (deep blue), `rose-pine` (dark plum) and `guide`
+(the accepted desktop design). The second is there to make a point the first
+cannot: warm dark is a taste and not a default, and a registry with one dark
+theme in it proves nothing about the seam. The rest are there to prove it again,
+in hues somebody else chose.
+
+The next eleven are the guide-v2 reference's own set, added whole:
+`vercel`, `dracula-pro`, `catppuccin-latte`, `github-dark`, `github-light`,
+`bitbucket-dark`, `bitbucket-light`, `vscode-dark`, `vscode-light`,
+`intellij-darcula` and `intellij-light`. Each is one [`GuidePalette`] — the
+reference's flat table of CSS variables — mapped through `Theme::from_guide`,
+which is the one place the reference's twenty-two colours become the desktop's
+ninety-odd. The chrome and diff grounds are the reference's own hexes; the
+word-level tints, the moved blocks, the absent half of a split row and the
+resolved tables are derived with the same ratios the hand-built eight use,
+because the reference defines no syntax palette beyond one token colour and a
+browser is not a window. A palette is therefore data: adding one is a function
+that fills in [`GuidePalette`] and one line in `Themes::builtin`.
 
 ### A second palette is a port of the first, not a new one
 
-Every ratio in the other six is `dark`'s, hue for hue: `added_bg` sits
-about 1.20:1 from its context row in all seven, `file_bg` a visible step above
+Every ratio in the other seven is `dark`'s, hue for hue: `added_bg` sits
+about 1.20:1 from its context row in all eight, `file_bg` a visible step above
 context with the hunk header a smaller one, the changed-word
 background a clear step above the line it is inside, the gutter ~2:1 before it is
 lifted. That is what makes the second theme feel like the first — a floor keeps a
@@ -73,8 +89,8 @@ cargo run -q -p gitten-core --example contrast --release          # every theme
 cargo run -q -p gitten-core --example contrast --release light
 ```
 
-That is the tool the six ported palettes were built with, and it is the one to run
-before adding an eighth: take dark's column as the target, pick the hue, and solve
+That is the tool the hand-built palettes were ported with, and it is the one to run
+before adding one: take dark's column as the target, pick the hue, and solve
 for the tint that lands on the number. Two ratios could not be carried across and
 both are the same point about a light background — the accent is 5.2:1 rather than
 9.1:1, because an amber taken to 9:1 against paper is a brown, and `absent_bg` is
@@ -84,7 +100,7 @@ that decides it is unchanged: 1.25:1 against the row opposite, in every theme.
 
 ## Surfaces, and why one colour per class is not enough
 
-A token is not drawn on "the background". It is drawn on one of eight:
+A token is not drawn on "the background". It is drawn on one of eleven:
 
 ```
   Context       #0e0d0c   the near-black body of the file
@@ -95,11 +111,16 @@ A token is not drawn on "the background". It is drawn on one of eight:
   MovedRemoved  #191d28   the two halves of a block that moved rather than
   MovedAdded    #1d2636     changed — blue-grey, so they recede from the hues
   Selected      #2f3b4a   text the mouse is holding
+  Cursor        #241f1a   the row the keyboard is on
+  Title         #151312   the title strip
+  Status        #131211   the bar across the bottom
 ```
 
-The last one is why a selection is a surface and not a colour the view applies:
-it covers a comment as readily as a keyword, and `comment` at #615a52 on #2f3b4a
-is the one run in the diff nobody could read.
+The `Selected` one is why a selection is a surface and not a colour the view
+applies: it covers a comment as readily as a keyword, and `comment` at #615a52 on
+#2f3b4a is the one run in the diff nobody could read. `Cursor`, `Title` and
+`Status` are the same argument for chrome text: `dim` is read off all three, and
+the raw grey fails the text floor on each.
 
 The comment grey that reads as pleasantly quiet on `Context` measured **1.15:1**
 against the old changed-word background — a grey smear on green, which is how this
@@ -265,8 +286,8 @@ family = "JetBrainsMono Nerd Font Mono"
 size = 14.0
 
 [theme]
-name = "light"                  # dark, light, slate, gruvbox, catppuccin,
-                                # tokyo-night, rose-pine — or a name of your own
+name = "light"                  # the gitten and guide-v2 sets — or a name of
+                                # your own; the picker lists every one
 
 [theme.diff]
 added_bg = "#dde5d7"
@@ -313,12 +334,17 @@ directions cannot drift.
 
 ## Changing it without touching the file
 
-The title bar has a **theme** picker — a pure function of the registry, like the
-other four — and `T` cycles the same list. Both go through the same reload a save
-does: the host is rebuilt from the defaults and the file, and then the pick is
-applied on top. One path, because two would be two orders in which a theme and a
-colour can disagree, and it is what makes a pick survive the next save the way
-the view's own layout and wrap indices do.
+The title strip carries a palette glyph that opens the **theme picker**: a
+filter field and a two-column grid of cards, each a swatch of the palette's own
+surface, accent, add and remove inks. It is a pure function of the registry, so a
+theme an extension registers is a card the day it exists, and **choosing does not
+dismiss it** — the whole point is to try several against the diff behind the
+scrim. `esc`, the `×` and the Commands entry are the ways in and out; `T` still
+cycles the same list for the clients that resolve the shared keymap. Both go
+through the same reload a save does: the host is rebuilt from the defaults and the
+file, and then the pick is applied on top. One path, because two would be two
+orders in which a theme and a colour can disagree, and it is what makes a pick
+survive the next save the way the view's own layout and wrap indices do.
 
 The file still says what the window *opens* on. That is the same division as
 `[diff] layout` and `[diff] wrap`, for the same reason.

@@ -16,15 +16,15 @@
 //!   sidebars and the preview; a binary older than the deferral never prints
 //!   it, and absence is reported, not an error. `q` on the pty master ends
 //!   the run.
-//! - The **desktop** is the wall clock around `target/release/gitten-shell`
+//! - The **desktop** is the wall clock around `target/release/gitten-gui`
 //!   under `GITTEN_START_QUIT=1` — the client ends itself at the first rows
 //!   (`app/src/env.rs`), and the clock around the process is the number. A
 //!   window does appear, for however long the road takes; that is the
 //!   measurement, not a side effect. The side runs only when the binary
-//!   exists (skipped with a note otherwise) and `GITTEN_TTI_SHELL` is on;
+//!   exists (skipped with a note otherwise) and `GITTEN_TTI_GUI` is on;
 //!   `check.sh` turns it off because it opens no windows.
 //!
-//! With a baseline (`GITTEN_BASELINE`, optionally `GITTEN_BASELINE_SHELL`)
+//! With a baseline (`GITTEN_BASELINE`, optionally `GITTEN_BASELINE_GUI`)
 //! the rounds are ABBA-interleaved, the starting side flips every round and
 //! the figure is the median — `docs/measurements.md` has the why; naive
 //! back-to-back A/B has swung +25–95% on this codebase. One warmup per side
@@ -212,7 +212,7 @@ struct TuiRun {
 }
 
 /// The desktop run's timing, one number.
-type ShellRun = f64;
+type GuiRun = f64;
 
 /// A side of the comparison: the binaries it owns and the samples it earns.
 /// `current` and `baseline` are the only two there are.
@@ -220,7 +220,7 @@ type ShellRun = f64;
 struct Side<'a> {
     label: &'a str,
     tui: &'a Path,
-    shell: Option<&'a Path>,
+    gui: Option<&'a Path>,
 }
 
 impl<'a> Side<'a> {
@@ -353,9 +353,9 @@ fn tui_run(binary: &Path, repo: &str) -> Result<TuiRun, String> {
     Ok(TuiRun { first, filled })
 }
 
-/// The desktop: `GITTEN_START_QUIT=1` around the shell binary, wall clock.
+/// The desktop: `GITTEN_START_QUIT=1` around the gui binary, wall clock.
 /// The client quits itself at the first rows; nothing here waits for a human.
-fn shell_run(binary: &Path, repo: &str) -> Result<ShellRun, String> {
+fn gui_run(binary: &Path, repo: &str) -> Result<GuiRun, String> {
     let t0 = Instant::now();
     let mut child = Command::new(binary)
         .arg("commits")
@@ -441,7 +441,7 @@ fn main() {
             "cargo build -q --release -p gitten-tui, then run this again",
         ),
     };
-    let shell = sibling_bin("gitten-shell");
+    let gui = sibling_bin("gitten-gui");
 
     // The baseline side, whole or not at all: a named binary that is missing
     // is a caller's mistake, not a side to quietly drop.
@@ -456,35 +456,32 @@ fn main() {
         ),
         None => None,
     };
-    let baseline_shell = match env::baseline_shell() {
+    let baseline_gui = match env::baseline_gui() {
         Some(p) if p.is_file() => Some(p),
         Some(p) => fail(
             json,
-            &format!(
-                "gitten: GITTEN_BASELINE_SHELL={} is not a file",
-                p.display()
-            ),
+            &format!("gitten: GITTEN_BASELINE_GUI={} is not a file", p.display()),
             "usage",
-            &format!("GITTEN_BASELINE_SHELL={:?} is not a file", p),
-            "point GITTEN_BASELINE_SHELL at a built gitten-shell of the vintage to compare",
+            &format!("GITTEN_BASELINE_GUI={:?} is not a file", p),
+            "point GITTEN_BASELINE_GUI at a built gitten-gui of the vintage to compare",
         ),
         None => None,
     };
 
-    let measure_shell = env::tti_shell();
+    let measure_gui = env::tti_gui();
     let mut notes: Vec<String> = Vec::new();
-    let shell = match (&shell, measure_shell) {
+    let gui = match (&gui, measure_gui) {
         (Some(p), true) => Some(p),
         (None, true) => {
             notes.push(
-                "no target/release/gitten-shell beside the example; the desktop side is skipped \
-                 (build it: cargo build -q --release -p gitten-shell)"
+                "no target/release/gitten-gui beside the example; the desktop side is skipped \
+                 (build it: cargo build -q --release -p gitten-gui)"
                     .into(),
             );
             None
         }
         (_, false) => {
-            notes.push("desktop side off (GITTEN_TTI_SHELL=0)".into());
+            notes.push("desktop side off (GITTEN_TTI_GUI=0)".into());
             None
         }
     };
@@ -492,7 +489,7 @@ fn main() {
     let current = Side {
         label: "current",
         tui: &tui,
-        shell: shell.map(PathBuf::as_path),
+        gui: gui.map(PathBuf::as_path),
     };
     let sides: Vec<Side> = match &baseline_tui {
         Some(b) => vec![
@@ -500,7 +497,7 @@ fn main() {
             Side {
                 label: "baseline",
                 tui: b,
-                shell: baseline_shell.as_deref().map(Path::new),
+                gui: baseline_gui.as_deref().map(Path::new),
             },
         ],
         None => vec![current],
@@ -509,7 +506,7 @@ fn main() {
     // One warmup per measured figure, run and discarded: the first spawn of a
     // binary pays page cache and dyld, and measurements.md's discipline is
     // that the timed rounds start warm. The desktop side warms too — a window
-    // appears for it, as it does for every shell run here.
+    // appears for it, as it does for every gui run here.
     for side in &sides {
         let name = side_name(side);
         tui_run(side.tui, repo)
@@ -518,11 +515,13 @@ fn main() {
                 "the launch itself failed; check the repository path and that both binaries build")
             })
             .unwrap();
-        if let Some(sh) = side.shell {
-            let name = format!("{name} shell");
-            shell_run(sh, repo)
-                .map_err(|e| fail(json, &format!("gitten: {name}: {e}"), "run", &e,
-                    "the window never came up or exited non-zero; run the shell binary once by hand"))
+        if let Some(sh) = side.gui {
+            let name = format!("{name} gui");
+            gui_run(sh, repo)
+                .map_err(|e| {
+                    fail(json, &format!("gitten: {name}: {e}"), "run", &e,
+                    "the window never came up or exited non-zero; run the gui binary once by hand")
+                })
                 .unwrap();
         }
     }
@@ -558,9 +557,9 @@ fn main() {
             if let Some(f) = run.filled {
                 samples[idx][1].push(f);
             }
-            if let Some(sh) = side.shell {
-                let name = format!("{name} shell");
-                let wall = shell_run(sh, repo)
+            if let Some(sh) = side.gui {
+                let name = format!("{name} gui");
+                let wall = gui_run(sh, repo)
                     .map_err(|e| {
                         fail(
                             json,
@@ -606,7 +605,7 @@ fn main() {
         nfield(&mut out, &mut first, "rounds", rounds);
         nfield(&mut out, &mut first, "settleSec", format!("{settle:.1}"));
         sfield(&mut out, &mut first, "profile", "release");
-        let figures = ["tuiFirstFrameMs", "tuiFilledMs", "shellWallMs"];
+        let figures = ["tuiFirstFrameMs", "tuiFilledMs", "guiWallMs"];
         for (i, side) in sides.iter().enumerate() {
             for (f, m) in figures.iter().copied().zip(medians[i]) {
                 // `baseline` glues on with a capital: baselineTuiFirstFrameMs.
@@ -660,7 +659,7 @@ fn main() {
         for note in &notes {
             println!("  note: {note}");
         }
-        let figures = ["tui first frame", "tui filled frame", "shell wall"];
+        let figures = ["tui first frame", "tui filled frame", "gui wall"];
         for (i, side) in sides.iter().enumerate() {
             for (f, m) in figures.iter().copied().zip(medians[i]) {
                 match m {
@@ -694,7 +693,7 @@ fn main() {
             "GITTEN_TTI_MAX_FILLED_MS",
             medians[0][1],
         ),
-        ("shell wall", "GITTEN_TTI_MAX_SHELL_MS", medians[0][2]),
+        ("gui wall", "GITTEN_TTI_MAX_GUI_MS", medians[0][2]),
     ];
     for (what, name, m) in ceilings {
         let Some(limit) = env::ceiling(name) else {

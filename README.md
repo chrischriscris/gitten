@@ -59,9 +59,10 @@ Pre-release, and honest about it:
 | Config | `gitten.toml` hot-reloads on the next frame — colours, font, algorithm, layouts, keybindings |
 | Scale | git/git's 82k-commit history and a 714k-line pull request are fixtures, not stress tests |
 
-Three frontends share one pipeline: the GPUI window (the product), a terminal
-client (`gitten-tui`), and a browser proof (`gitten-web`) whose whole job is to
-keep the boundary honest. Anything two of them need lives in `core`.
+Clients share one pipeline: the GPUI window (the product), a terminal client
+(`gitten-tui`), and a non-interactive agent door (`cli/`). A loopback JSON API
+(`gitten-web`) serves the same pipeline to agents. Anything two of them need
+lives in `core`.
 
 ## Numbers
 
@@ -83,15 +84,15 @@ minutes, once.
 
 ```sh
 git clone https://github.com/chrischriscris/gitten && cd gitten
-./dev desktop commits               # the window, on this repository's history
-./dev desktop diff . HEAD~2..HEAD   # or a diff on any revspec
+./dev gui     commits               # the window, on this repository's history
+./dev gui     diff . HEAD~2..HEAD   # or a diff on any revspec
 ```
 
-`desktop` and `web` rebuild and relaunch on save. Everything else:
+`gui` and `web` rebuild and relaunch on save. Everything else:
 
 ```sh
 ./dev tui    diff . HEAD~2..HEAD    # the terminal client
-./dev web    diff --fixtures        # the browser proof; prints a URL
+./dev web    diff --fixtures        # the loopback agent API; prints a URL
 ./dev dump   commits ~/src/somerepo # one frame on stdout, timing on stderr
 ./dev check                         # everything headless: tests + benchmarks
 ./dev config > gitten.toml           # a complete, correct starting config
@@ -138,7 +139,7 @@ and input, and nothing else.
 ```
 gitten-core                                   zero deps — differs, graph, rows, keys, themes
 gitten-git · gitten-app                        the only git boundary · gitten.toml and the cli
-gitten-shell │ gitten-tui │ gitten-web │ yours  the window │ the tty │ a browser proof │ next
+gitten-gui │ gitten-tui │ gitten-web │ yours    the window │ the tty │ the agent API │ next
 ```
 
 Start reading at [docs/README.md](docs/README.md). `AGENTS.md` holds the

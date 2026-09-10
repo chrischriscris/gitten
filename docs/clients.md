@@ -1,12 +1,13 @@
 # Writing a client
 
-gitten is a core and a set of clients. Three exist, and they are **not** equal:
+gitten is a core and a set of clients. They are **not** equal:
 
 | | |
 |---|---|
-| `gitten-shell` | **the product.** GPUI. A feature asked for without a client named means this one. |
+| `gitten-gui` | **the product.** GPUI. A feature asked for without a client named means this one. |
 | `gitten-tui` | planned, and built; the one that comes after the window. |
-| `gitten-web` | a *proof*, not a plan. It exists because a client written in JavaScript could not exist at all if `core` had leaked anything UI-shaped. |
+| `cli/` | the non-interactive agent door: `inspect` and `dispatch`, text or `--json`. |
+| `gitten-web` | a loopback JSON API, not a plan. It exists because a client written in another language could not exist at all if `core` had leaked anything UI-shaped. |
 
 So read this page as two separate obligations. **The seam belongs in `core`, in
 the same pass as the feature** — that is what makes a fourth client possible and
@@ -47,7 +48,7 @@ twice — and it has been three times already:
 | where a scrollbar's thumb goes | nowhere — no client drew one | `core::view` |
 
 The last two are the ones that mattered most. Before `gitten-app`, the parser for
-`gitten.toml` lived in `shell/src/config.rs` — so the *window* was the only client
+`gitten.toml` lived in `gui/src/config.rs` — so the *window* was the only client
 that could be configured, and `gitten-web` shipped with a comment apologising for
 it. Before `core::command`, a keybinding was three `match` statements that could
 not be made to agree.
@@ -75,7 +76,7 @@ A client with something to draw before its data exists — the desktop — takes
 the client schedules itself through the same `acquire::acquire`.
 
 ```rust
-let configured = Startup::new("gitten-shell", View::Commits)
+let configured = Startup::new("gitten-gui", View::Commits)
     .configure()?;   // args parsed, gitten.toml read and warned about; no repository read yet
 ```
 
@@ -94,11 +95,11 @@ let port = cli::take_value(start.take(), "--port")?;
 ## The arguments are a promise
 
 ```sh
-gitten-shell diff . HEAD~2..HEAD
+gitten-gui diff . HEAD~2..HEAD
 gitten-web   diff . HEAD~2..HEAD
 gitten-tui   diff . HEAD~2..HEAD
 
-./dev desktop diff . HEAD~2..HEAD    # …and one script that reaches all three
+./dev gui     diff . HEAD~2..HEAD    # …and one script that reaches all three
 ./dev web     diff . HEAD~2..HEAD
 ./dev tui     diff . HEAD~2..HEAD
 ```
@@ -133,7 +134,7 @@ So a client writes exactly two input-shaped things:
    GPUI's keystroke spelling.
 2. **A `match` on command names.** `"view.down" => self.down()`. A name it does
    not handle is a key that does nothing, which is what an unbound key does too —
-   so a browser tab ignoring `quit` is not a hole.
+   so an API client ignoring `quit` is not a hole.
 
 Everything between is shared: the modes, the chords, the config file, the
 validation, and the help screen.
@@ -183,7 +184,7 @@ exists and a typo is named.
 
 | client | `render` produces |
 |---|---|
-| `gitten-shell` | `AnyElement` |
+| `gitten-gui` | `AnyElement` |
 | `gitten-tui` | cells, through a `Pen` |
 | `gitten-web` | text pieces on the wire |
 
@@ -198,8 +199,8 @@ rather than mutating the live one, so deleting a line from the file makes the
 default come back instead of leaving the old value in place.
 
 **A column.** How wide one is, and what one is measured in: `Font::advance` for a
-proportional face, `unicode-width` for a terminal cell, whatever CSS says for a
-browser. `Rows::reflow` therefore takes pixels in one client and columns in
+proportional face, `unicode-width` for a terminal cell, and a `?cols=` budget for
+the web API. `Rows::reflow` therefore takes pixels in one client and columns in
 another, and the implementation owns the conversion because it owns the furniture
 it draws around the text.
 
@@ -222,18 +223,11 @@ notice a panic in a presentation.
 
 ## Not there yet
 
-- **`gitten-web` has no selection of its own**, and does not need one: a browser
-  selects text for free. The window and the terminal both drive `core::select`,
-  and the terminal's half of it turned out to be exactly what this entry
-  predicted — `hit` and `selectable` on its own `Rows`, and nothing else. See
-  [decisions/0022](decisions/0022-the-mouse-in-a-terminal.md).
-- **`gitten-web` has no input at all**, so the keymap reaches it only once the
-  browser sends keypresses to an endpoint. It has `j`/`k`/`g`/`G` in its own
-  script, which is exactly the duplication `core::command` exists to end.
-- **`gitten-web` still holds its own row flattening**, and its own copy of
-  `runs`. `core::rows` is canonical everywhere else — the terminal uses it,
-  and the window migrated onto it (`Ordered` plus `RowRef`, so GPUI keeps its
-  refcount-bumped strings and the order table is shared).
+- **`gitten-web` is an API, not a client.** It has no selection and no keymap of
+  its own: `POST /api/dispatch` steps named commands through `core::command`,
+  and the caller draws. The window and the terminal both drive `core::select`;
+  the terminal's half of it is `hit` and `selectable` on its own `Rows` and
+  nothing else. See [decisions/0022](decisions/0022-the-mouse-in-a-terminal.md).
 - **Extension loading.** Every seam takes an implementation, and `Host` is
   reachable from a client's `main`, but nothing loads one from outside the
   binary. Today "an extension" means code compiled in — see

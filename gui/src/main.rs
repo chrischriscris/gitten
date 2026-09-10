@@ -1,0 +1,12473 @@
+mod assets;
+mod chrome;
+mod config;
+mod graph;
+mod input;
+mod menu;
+mod modal;
+mod palette;
+mod panes;
+mod session;
+mod settings;
+mod settings_window;
+mod stats;
+mod theme_picker;
+mod views;
+
+use gitten_app::acquire::{Data, Loaded};
+use gitten_app::cli::{Request, Source, View};
+use gitten_app::jobs::{Event as JobEvent, Generation, Job, Runner, Submitter};
+use gitten_app::{Configured, Started, Startup};
+use gitten_core::differ::{Overrides, Whitespace};
+use gitten_core::host::Host;
+use gitten_core::refs::ResetMode;
+use gitten_core::theme;
+use gitten_core::{Commit, FileDiff};
+use gpui::*;
+use gpui_component::*;
+use stats::Stats;
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+use std::time::Instant;
+
+/// Startup-stage timestamps on stderr, behind `GITTEN_START_LOG=1`.
+///
+/// Time-to-first-frame hides between stages nobody measures: acquisition and
+/// the config were timed, the GPUI window path never was, so a slow launch
+/// could not be attributed to anything. Every mark prints cumulative
+/// milliseconds since the top of [`main`] and the step since the previous
+/// mark, which is what makes a jittery macOS launch readable — three runs of
+/// one number mean nothing; three runs of a table do.
+///
+/// Off by default, and the off path is one relaxed load per mark across about
+/// a dozen marks in a launch. The first mark also pins `T0`, so nothing before
+/// it is miscounted.
+mod start {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    static T0: OnceLock<Instant> = OnceLock::new();
+    static LAST_US: AtomicU64 = AtomicU64::new(0);
+
+    pub fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("GITTEN_START_LOG").is_some_and(|v| v != "0"))
+    }
+
+    /// Pins the epoch. Later than process start by exec and dyld, which no
+    /// user-space code here can move.
+    pub fn begin(now: Instant) {
+        _ = T0.set(now);
+    }
+
+    pub fn mark(stage: &str) {
+        if !on() {
+            return;
+        }
+        let now = Instant::now();
+        let t0 = *T0.get_or_init(|| now);
+        let us = now.duration_since(t0).as_micros() as u64;
+        let prev = LAST_US.swap(us, Relaxed);
+        eprintln!(
+            "[start] {:>8.3}ms  (+{:>8.3}ms)  {stage}",
+            us as f64 / 1e3,
+            (us - prev) as f64 / 1e3,
+        );
+    }
+}
+
+#[global_allocator]
+static ALLOC: stats::Counting = stats::Counting;
+
+// The three keys that stay GPUI actions, and why: they are the platform's.
+// Cmd-Q quits whatever Mac app you are in, Cmd-C and Cmd-A are what the Edit
+// menu exists for, and Cmd-, opens whatever Mac app's settings you are in —
+// a Mac user's fingers already know all four. The menu items below carry
+// them; their handlers call [`DevShell::run_command`] with the *named*
+// commands every other door uses — `quit`, `copy.selection`, `select.all`,
+// `settings` — so a menu item is an adapter and not a second path.
+actions!(
+    gitten,
+    [
+        Quit,
+        CopySelection,
+        SelectAll,
+        OpenSettings,
+        ShowCommands,
+        CommitStaged
+    ]
+);
+
+/// The title strip, which is also the window's titlebar — see the note on
+/// [`window_options`]. Fifty-three pixels per the workspace spec: traffic
+/// lights, branch control, Commands and Push with clear vertical air. The
+/// lights recenter from this constant, so the strip grows without a second
+/// edit wherever they are placed.
+const TITLE_H: f32 = 53.0;
+/// Where the traffic lights start, and therefore how much room they need. macOS
+/// draws three 12px buttons with ~8px between them, so they end around 62; the
+/// repository begins after the 16px cluster gap.
+const LIGHTS_X: f32 = 10.0;
+const LIGHTS_W: f32 = 78.0;
+/// The branch chip follows the title-bar controls' larger target height.
+const CHIP_H: f32 = 28.0;
+/// The shortest a list may be squeezed to: a header and two rows — the
+/// selected one and a neighbour, which is the least a list can show and
+/// still be seen to scroll.
+const SECTION_MIN_H: f32 = chrome::HEADER_H + 2.0 * graph::ROW_H;
+
+/// Four such floors, bracketed by the title and status strips. Below this
+/// height one of the lists would silently lose its promised two visible
+/// rows.
+const WINDOW_MIN_H: f32 = 4.0 * SECTION_MIN_H + TITLE_H + chrome::STATUS_H;
+
+/// The repository as the title strip spells it: `(parent, name)` with the
+/// parent under `~` when it is under home and ending in `/`, so the two halves
+/// concatenate back into the path — `("~/src/", "plait")`. A path with no name
+/// to give (the filesystem root) puts everything in the bright half rather
+/// than drawing nothing.
+fn repo_title(path: &std::path::Path, home: Option<&std::path::Path>) -> (String, String) {
+    let shown = match home.and_then(|home| path.strip_prefix(home).ok()) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    };
+    // Drop a trailing slash so the cut lands on the name — unless the slash
+    // *is* the path, which is the root and the one name it has.
+    let trimmed = shown.trim_end_matches('/');
+    let shown = match trimmed.is_empty() {
+        true => shown.as_str(),
+        false => trimmed,
+    };
+    let (dir, name) = gitten_core::path::split_dir_name(shown);
+    match name.is_empty() {
+        true => (String::new(), format!("{dir}{name}")),
+        false => (dir.to_string(), name.to_string()),
+    }
+}
+
+/// `$HOME`, read once for the process: the title strip asks every frame and an
+/// environment lookup is not a per-frame cost worth paying for a string that
+/// does not change.
+fn home() -> Option<&'static std::path::Path> {
+    static HOME: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
+        .as_deref()
+}
+
+/// Two repository paths naming the same checkout: equal once canonicalised,
+/// or equal as written when one of them cannot be. The recent file and the
+/// window meet through this rather than through strings, because one side
+/// may have recorded a path whose symlink has since moved.
+fn same_project_path(a: &std::path::Path, b: &std::path::Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
+/// What the path field's text means: trimmed, `~`-expanded, and resolved
+/// against the current repository's parent when relative — projects live
+/// beside each other far more often than under the launch directory — with
+/// the launch directory behind that when there is no parent to join.
+fn expand_project_path(text: &str, current: &std::path::Path) -> std::path::PathBuf {
+    let trimmed = text.trim();
+    let expanded = match trimmed.strip_prefix('~') {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => match home() {
+            Some(dir) => dir.join(rest.trim_start_matches('/')),
+            None => std::path::PathBuf::from(trimmed),
+        },
+        _ => std::path::PathBuf::from(trimmed),
+    };
+    if expanded.is_relative() {
+        let base = current
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| current.to_path_buf()));
+        base.join(expanded)
+    } else {
+        expanded
+    }
+}
+/// What only this client has. The two views, the arguments and `gitten.toml` are
+/// documented once, in `gitten_app::cli::usage`, because they are the same in
+/// every client — see that function for why that is a promise and not a
+/// convenience.
+const EXTRA: &str = "  `,` opens the settings: the presentation (unified, side-by-side),
+  where a line too wide for the window breaks (off, word, char), the diff
+  algorithm (histogram, patience, myers), how much whitespace has to match
+  (exact, trailing, change, all — git's default, --ignore-space-at-eol, -b and
+  -w), the theme (the gitten set, the guide-v2 set, and whatever gitten.toml
+  adds), and the rest of the live knobs. Changes apply now and save to
+  gitten.toml. `s` cycles the presentation, `w` the wrap and `T` the theme —
+  all three through `[keys]` in gitten.toml, where `?` lists everything.
+
+  The repository title is itself a control: clicking it (or `o`) opens the
+  recent repositories to switch between in place, and `O` takes a path
+  instead; `Browse…` below the list opens the system file picker.
+  Switching re-reads every pane; the recent file lives beside the
+  session, not in gitten.toml.
+
+  The file is re-read every time it is saved, and colours and font apply on the
+  next frame — no rebuild, no relaunch.
+
+  ./dev.sh <args>  rebuild and relaunch on every source change, landing back
+                   on the row you were reading. Debug build and the overlay by
+                   default; pass --release before trusting a timing.
+
+  GITTEN_STATS=1   frame, row and heap overlay
+";
+
+/// How to acquire the diff again under different overrides.
+///
+/// A closure and not a repository, because the shell does no I/O and must not
+/// learn what one is beyond the single operation it names: the repository path
+/// is captured here in `main`, the revision comes *in* — the startup one, or a
+/// commit whose diff was opened — and the live [`Host`] is passed in rather
+/// than captured, so a config reload cannot leave a stale registry behind it.
+///
+/// `None` means nothing on screen can be re-diffed — a `.diff` fixture was
+/// diffed by somebody else — and the control is drawn inert.
+type Rediff = Rc<dyn Fn(&Host, &Overrides, &str) -> Result<Vec<FileDiff>, String>>;
+
+/// Which menu is open. At most one, because two open menus over a diff is two
+/// things to dismiss.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Open {
+    /// The recent-repositories menu hanging off the title: the MRU list plus
+    /// an `Open other…` row that trades the menu for the path field and a
+    /// `Browse…` row that trades it for the system file picker.
+    /// No strip trigger of its own — the repository title *is* the trigger.
+    Project,
+}
+
+type RefreshValue = Box<dyn std::any::Any + Send>;
+type ApplyRefresh = dyn FnOnce(RefreshValue, &Host, &mut App) -> Result<(), String>;
+
+/// What the open input's accept means, and the only things the shell's prompt
+/// slot can hold tonight. A third consumer becomes a third variant and nothing
+/// else changes: the field routes by what it was opened *for*, never by who is
+/// listening.
+#[derive(Debug)]
+enum Prompt {
+    /// The message a `files.commit` accept turns into a commit job.
+    CommitMessage,
+    /// The same field over the same staged content, aimed one step back:
+    /// what a `files.amend` accept turns into an amend job.
+    AmendMessage,
+    /// A `/` query over one pane, named by its registration name — a name and
+    /// not a type, so the slot stays open to whatever pane learns to answer a
+    /// search next. Every edit filters that pane live (see
+    /// [`DevShell::search_edited`]); accepting keeps the last edit standing,
+    /// cancelling clears it.
+    Search { target: String },
+    /// A branch name gathered over the branches pane — `branches.new` names
+    /// a branch from nothing; `branches.rename` starts from the row's own
+    /// name and accepts a replacement. The target is the pane registration
+    /// name, the same promise [`Prompt::Search`] keeps: the answer belongs
+    /// to the pane it was typed over.
+    BranchName { target: String, what: BranchPrompt },
+    /// A tag name gathered over a pane: accepting names whatever the pane
+    /// had under the keyboard when the field opened, carried as a **revspec**
+    /// — a sha from the commits pane, a branch name from the branches one —
+    /// because `git tag` aims at both the same way. Captured at open time,
+    /// so a cursor move inside the field cannot re-aim it. The target is the
+    /// pane registration name, same as [`Prompt::BranchName`].
+    TagName { target: String, at: String },
+    /// A repository path gathered over the window: accepting switches the
+    /// whole window onto that repository in place. Opened by `project.open`
+    /// and by the project menu's `Open other…` row.
+    ProjectPath,
+}
+
+/// The inspector's unsent commit text, per repository: Summary plus optional
+/// Description. Written on every field edit, read by the Commit button's
+/// gate and the confirmation dialog, cleared only when a commit job
+/// finishes cleanly — a refused commit keeps its words standing.
+#[derive(Debug, Clone, Default)]
+struct CommitDraft {
+    summary: String,
+    description: String,
+}
+
+impl CommitDraft {
+    /// The gate beside the button: staged content is the caller's to check
+    /// (it knows the index); the draft answers whether it names the commit.
+    fn has_message(&self) -> bool {
+        !self.summary.trim().is_empty()
+    }
+
+    /// What `git commit` receives: the summary, then the description as
+    /// git's own second paragraph when one was written. No trailing
+    /// paragraph for an empty description — a commit message with nothing
+    /// after the subject is the ordinary shape, not a missing one.
+    fn message(&self) -> String {
+        match self.description.trim().is_empty() {
+            true => self.summary.clone(),
+            false => format!("{}\n\n{}", self.summary, self.description),
+        }
+    }
+}
+
+/// What an accepted [`Prompt::BranchName`] does with its text.
+#[derive(Debug)]
+enum BranchPrompt {
+    /// Create a branch by this name at HEAD. Creating never checks out.
+    New,
+    /// Create a branch by this name growing from `start` — a revspec, the
+    /// commits pane's way of saying "from the commit I was on". Creating
+    /// never checks out, here either.
+    NewAt { start: String },
+    /// Rename the carried branch — its bytes, exactly as the panel read
+    /// them — to the accepted text.
+    Rename { from: Vec<u8> },
+}
+
+/// The write rails, handed to every pane command: the repository this window
+/// opened on, and the one queue every job rides.
+///
+/// Owned clones rather than borrows — a refcount and a channel sender each —
+/// because a command speaks *between* acquiring the rails and aiming the
+/// write (the discard that clears its own question from the band), and an
+/// extension may want to keep a half past the call. Both copies are cheap by
+/// design; nothing here was meant to be held.
+///
+/// Passed by reference so a command can aim a write without owning either
+/// half — which is what makes rule 1 true for verbs rather than merely said:
+/// a compiled-in extension pane stages through exactly these two things that
+/// `files.stage` does, and a fixture window hands `None`, whose honest answer
+/// is the notice a built-in gives. `None` is also all a drawing-only command
+/// ever sees of them.
+#[derive(Clone)]
+struct Writes {
+    repo: gitten_git::Handle,
+    submit: Submitter,
+}
+
+impl Writes {
+    /// Queues one job. False is the queue rejecting work — the window is
+    /// going away — and saying so is the caller's, who knows what was tried.
+    fn send(&self, job: Box<dyn Job>) -> bool {
+        self.submit.submit(job).is_ok()
+    }
+}
+
+/// `repo.refresh`: the queue's own finish does the re-acquire wave after
+/// every write — the generation bump is what turns every pane stale — and
+/// this job is that finish with no write in front of it. lazygit's `R`,
+/// refreshed: the band says so, because unlike a write nothing on screen
+/// changed to prove it ran.
+struct RefreshAll;
+
+impl Job for RefreshAll {
+    fn name(&self) -> &str {
+        "refresh"
+    }
+
+    fn confirmation(&self) -> Option<String> {
+        Some("refreshed".into())
+    }
+
+    fn run(self: Box<Self>) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// A pane-owned refresh split at the thread boundary: pure blocking load, then
+/// GPUI apply. The shell schedules both halves without knowing the tenant's data
+/// type, which is what lets a files or extension pane refresh without joining a
+/// central acquisition enum.
+struct Refresh {
+    generation: Generation,
+    load: Box<dyn FnOnce() -> Result<RefreshValue, String> + Send>,
+    apply: Box<ApplyRefresh>,
+}
+
+impl Refresh {
+    fn new<T: Send + 'static>(
+        generation: Generation,
+        load: impl FnOnce() -> Result<T, String> + Send + 'static,
+        apply: impl FnOnce(T, &Host, &mut App) -> Result<(), String> + 'static,
+    ) -> Self {
+        Self {
+            generation,
+            load: Box::new(move || load().map(|value| Box::new(value) as RefreshValue)),
+            apply: Box::new(move |value, host, cx| {
+                let value = value
+                    .downcast::<T>()
+                    .map_err(|_| "pane refresh returned the wrong data type".to_string())?;
+                apply(*value, host, cx)
+            }),
+        }
+    }
+}
+
+/// One pane tenant, independent of how the shell lays panes out.
+///
+/// Built-ins and compiled-in extensions enter through the same object-safe
+/// seam. Only drawing, local command behavior and optional repository refresh
+/// live here; stable naming, placement and focus belong to [`panes::Panes`].
+trait Pane {
+    /// Spelled for out-of-tree panes: no in-tree caller since the keymap
+    /// driving went away, but an extension pane implements this seam in a
+    /// production build, so it must exist outside `cfg(test)`.
+    #[allow(dead_code)]
+    fn mode(&self) -> &'static str;
+
+    /// Spelled for tests and out-of-tree panes: no in-tree caller since the
+    /// stack deletion, but an extension pane implements this seam in a
+    /// production build, so it must exist outside `cfg(test)`.
+    #[allow(dead_code)]
+    fn label(&self, cx: &App) -> String;
+
+    /// A tenant-owned repository refresh. The load half must contain every
+    /// blocking operation; the apply half is the only half allowed to touch a
+    /// GPUI entity. A pane not backed by the current repository returns `None`.
+    fn refresh(
+        &self,
+        _generation: Generation,
+        _host: &Host,
+        _overrides: &Overrides,
+        _repo: gitten_git::Handle,
+    ) -> Option<Refresh> {
+        None
+    }
+
+    /// Runs one of this pane's commands. `writes` is [`Writes`] when the
+    /// window sits on a repository — the same handle and queue a built-in
+    /// verb uses — and the pane answers for itself whether it can act on
+    /// them. False is "not one of mine", and the caller says so.
+    fn run(&self, _command: &str, _host: &Host, _writes: Option<&Writes>, _cx: &mut App) -> bool {
+        false
+    }
+
+    fn select(&self, _all: bool, _cx: &mut App) -> bool {
+        false
+    }
+}
+
+/// Which of the window's two regions the keyboard is in.
+///
+/// Two targets, because the design has two: the lists — the left stack's
+/// four panes, all on screen at once — and the diff filling the rest. The focused region carries the accent edge, and
+/// [`Modes`] is rebuilt from this — a list's keys move that list, the diff's
+/// keys scroll the diff — which is why there is no third state to forget to
+/// route.
+///
+/// Which *list* has the keyboard is not a spot of its own: it is
+/// [`panes::Panes`]' focused tenant, the same registry that decides what the
+/// stack's commit section draws when an extension pane takes it over. One
+/// section and another differ in where they draw, never in what the keyboard
+/// means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Spot {
+    /// Some list — a stack section, an extension pane standing in for the
+    /// commit list — holds the keyboard.
+    List,
+    /// The diff main view.
+    Main,
+}
+
+/// One pane tenant. Built-ins keep repository metadata beside their typed GPUI
+/// view; extensions enter through [`Screen::Custom`].
+///
+/// **This is the typed adapter between dispatch and drawing.** [`Modes`] name
+/// what is live, [`Keymap::resolve`] names what a key meant, and the match on
+/// that name lives in exactly one place — [`DevShell::run_command`]. What lands
+/// here is everything a *screen* can be asked to do, as methods, so no command
+/// decision ever has to reach into drawing code to find out what is showing.
+#[derive(Clone)]
+enum Screen {
+    Commits {
+        view: Entity<views::commits::Commits>,
+        source: Source,
+        generation: Rc<Cell<Generation>>,
+        label: Rc<RefCell<String>>,
+    },
+    /// The diff main view. The one tenant that is not a stack list: it fills
+    /// the right side of the window whatever the stack shows.
+    ///
+    /// Its revspec lives behind a cell because it *changes* while the tenant
+    /// does not — every selection change re-aims the same view at another
+    /// commit, so the screen is built once with `None` (nothing loaded yet)
+    /// and re-aimed from [`DevShell::schedule_main_diff`]. A fixture or patch
+    /// launch builds it once with its own source and nothing ever rewrites it.
+    Diff {
+        view: Entity<views::diff::Diff>,
+        source: Rc<RefCell<Option<Source>>>,
+        generation: Rc<Cell<Generation>>,
+        label: Rc<RefCell<String>>,
+    },
+    /// The working tree. No `Source`: it is always about the repository the
+    /// window opened on, and a fixture — which has no working tree at all —
+    /// simply never gets one registered.
+    Files {
+        view: Entity<views::files::Files>,
+        generation: Rc<Cell<Generation>>,
+        label: Rc<RefCell<String>>,
+    },
+    /// The stash stack. Same story as [`Screen::Files`]: always about this
+    /// window's repository, so no `Source`, and a fixture gets none.
+    Stashes {
+        view: Entity<views::stashes::Stashes>,
+        generation: Rc<Cell<Generation>>,
+        label: Rc<RefCell<String>>,
+    },
+    /// The branches. Same story as [`Screen::Files`]: repository-shaped, so
+    /// a fixture never gets one.
+    Branches {
+        view: Entity<views::branches::Branches>,
+        generation: Rc<Cell<Generation>>,
+        label: Rc<RefCell<String>>,
+    },
+    Custom(Rc<dyn Pane>),
+}
+
+impl Screen {
+    fn commits(
+        view: Entity<views::commits::Commits>,
+        source: Source,
+        generation: Generation,
+        label: impl Into<String>,
+    ) -> Self {
+        Self::Commits {
+            view,
+            source,
+            generation: Rc::new(Cell::new(generation)),
+            label: Rc::new(RefCell::new(label.into())),
+        }
+    }
+
+    fn diff(
+        view: Entity<views::diff::Diff>,
+        source: Option<Source>,
+        generation: Generation,
+        label: impl Into<String>,
+    ) -> Self {
+        Self::Diff {
+            view,
+            source: Rc::new(RefCell::new(source)),
+            generation: Rc::new(Cell::new(generation)),
+            label: Rc::new(RefCell::new(label.into())),
+        }
+    }
+
+    fn files(
+        view: Entity<views::files::Files>,
+        generation: Generation,
+        label: impl Into<String>,
+    ) -> Self {
+        Self::Files {
+            view,
+            generation: Rc::new(Cell::new(generation)),
+            label: Rc::new(RefCell::new(label.into())),
+        }
+    }
+
+    fn stashes(
+        view: Entity<views::stashes::Stashes>,
+        generation: Generation,
+        label: impl Into<String>,
+    ) -> Self {
+        Self::Stashes {
+            view,
+            generation: Rc::new(Cell::new(generation)),
+            label: Rc::new(RefCell::new(label.into())),
+        }
+    }
+
+    fn branches(
+        view: Entity<views::branches::Branches>,
+        generation: Generation,
+        label: impl Into<String>,
+    ) -> Self {
+        Self::Branches {
+            view,
+            generation: Rc::new(Cell::new(generation)),
+            label: Rc::new(RefCell::new(label.into())),
+        }
+    }
+
+    /// Which mode's bindings were live. Test-only since the keymap driving
+    /// went away; the workspace destinations name themselves.
+    #[cfg(test)]
+    fn mode(&self) -> &'static str {
+        match self {
+            Screen::Commits { .. } => "commits",
+            Screen::Diff { .. } => "diff",
+            Screen::Files { .. } => "files",
+            Screen::Stashes { .. } => "stashes",
+            Screen::Branches { .. } => "branches",
+            Screen::Custom(pane) => pane.mode(),
+        }
+    }
+
+    /// Spelled for tests only: the old stack's pane headers read this, and
+    /// nothing in the workspace does — the destinations name themselves.
+    /// Kept (not deleted) because the filter-count and extension-label tests
+    /// pin real pane logic through it.
+    #[cfg(test)]
+    fn label(&self, cx: &App) -> String {
+        match self {
+            Screen::Commits { view, label, .. } => {
+                let base = label.borrow().clone();
+                // The filter's count rides on the acquisition label rather
+                // than replacing it — the same shape the working tree uses for
+                // "0 changed" — and the pane cell keeps holding only what the
+                // repository named, so a refresh has nothing to recompose.
+                match view.read(cx).filter_note() {
+                    Some(note) => format!("{base} · {note}"),
+                    None => base,
+                }
+            }
+            Screen::Diff { label, .. } => label.borrow().clone(),
+            Screen::Files { view, label, .. } => {
+                let base = label.borrow().clone();
+                // The filter's count rides on the acquisition label rather
+                // than replacing it — the same shape the commits pane runs,
+                // and the pane cell keeps holding only what the repository
+                // named, so a refresh has nothing to recompose.
+                match view.read(cx).filter_note() {
+                    Some(note) => format!("{base} · {note}"),
+                    None => base,
+                }
+            }
+            Screen::Branches { view, label, .. } => {
+                let base = label.borrow().clone();
+                match view.read(cx).filter_note() {
+                    Some(note) => format!("{base} · {note}"),
+                    None => base,
+                }
+            }
+            Screen::Stashes { view, label, .. } => {
+                let base = label.borrow().clone();
+                match view.read(cx).filter_note() {
+                    Some(note) => format!("{base} · {note}"),
+                    None => base,
+                }
+            }
+            Screen::Custom(pane) => pane.label(cx),
+        }
+    }
+    /// Re-aims a screen at another repository, keeping its entity — and with
+    /// it the keyboard, the scroll and the focus — while the next refresh
+    /// wave re-acquires its rows. True when the screen is repository-bound
+    /// and now aims at `path`: lists without a source always are; a commits
+    /// or diff screen holding a patch or fixture source is not, and keeps
+    /// pointing where it was.
+    fn retarget(&mut self, path: &std::path::Path) -> bool {
+        match self {
+            Screen::Commits { source, .. } => match source {
+                Source::Repo { path: at, .. } => {
+                    *at = path.to_path_buf();
+                    true
+                }
+                _ => false,
+            },
+            Screen::Diff { source, .. } => match source.borrow_mut().as_mut() {
+                Some(Source::Repo { path: at, .. }) => {
+                    *at = path.to_path_buf();
+                    true
+                }
+                _ => false,
+            },
+            Screen::Files { .. } | Screen::Stashes { .. } | Screen::Branches { .. } => true,
+            Screen::Custom(_) => false,
+        }
+    }
+
+    fn refresh(
+        &self,
+        target: Generation,
+        host: &Host,
+        overrides: &Overrides,
+        repo: gitten_git::Handle,
+    ) -> Option<Refresh> {
+        match self {
+            Screen::Commits {
+                view,
+                source,
+                generation,
+                label,
+            } => {
+                if generation.get() >= target || matches!(source, Source::Fixtures) {
+                    return None;
+                }
+                let source = source.clone();
+                let load_host = host.clone();
+                let view = view.clone();
+                let generation = generation.clone();
+                let label = label.clone();
+                Some(Refresh::new(
+                    target,
+                    move || {
+                        let loaded = gitten_app::acquire::reacquire(
+                            View::Commits,
+                            &source,
+                            &load_host,
+                            Some(repo.as_ref()),
+                            &Overrides::default(),
+                        )?;
+                        let Data::Commits(commits) = loaded.data else {
+                            return Err("re-acquisition returned the wrong view".into());
+                        };
+                        Ok((loaded.label, views::commits::prepare(commits, &load_host)))
+                    },
+                    move |(next_label, prepared): (String, views::commits::Prepared), host, cx| {
+                        if generation.get() >= target {
+                            return Ok(());
+                        }
+                        view.update(cx, |view, cx| {
+                            view.replace_prepared(prepared, host);
+                            cx.notify();
+                        });
+                        label.replace(next_label);
+                        generation.set(target);
+                        Ok(())
+                    },
+                ))
+            }
+            Screen::Diff {
+                view,
+                source,
+                generation,
+                label,
+            } => {
+                // `None` is "nothing loaded yet" — a window that opened on a
+                // list before its first selection scheduled a diff — and a
+                // `.diff` fixture was never acquired from a repository at
+                // all. Anything else re-acquires its own revspec, exactly as
+                // the stacked pane did.
+                let source = source.borrow().clone()?;
+                if generation.get() >= target || matches!(source, Source::Fixtures) {
+                    return None;
+                }
+                let load_host = host.clone();
+                let overrides = overrides.clone();
+                let view = view.clone();
+                let generation = generation.clone();
+                let label = label.clone();
+                Some(Refresh::new(
+                    target,
+                    move || {
+                        let loaded = gitten_app::acquire::reacquire(
+                            View::Diff,
+                            &source,
+                            &load_host,
+                            Some(repo.as_ref()),
+                            &overrides,
+                        )?;
+                        let Data::Diff(files) = &loaded.data else {
+                            return Err("re-acquisition returned the wrong view".into());
+                        };
+                        let prepared = views::diff::prepare_files(files, &load_host);
+                        Ok((loaded, prepared))
+                    },
+                    move |(loaded, prepared): (Loaded, gitten_core::prepared::Prepared),
+                          host,
+                          cx| {
+                        if generation.get() >= target {
+                            return Ok(());
+                        }
+                        let Data::Diff(files) = loaded.data else {
+                            return Err("re-acquisition returned the wrong view".into());
+                        };
+                        view.update(cx, |view, cx| {
+                            view.replace_prepared(files, prepared, host, cx)
+                        });
+                        label.replace(loaded.label);
+                        generation.set(target);
+                        Ok(())
+                    },
+                ))
+            }
+            Screen::Files {
+                view,
+                generation,
+                label,
+            } => {
+                if generation.get() >= target {
+                    return None;
+                }
+                let view = view.clone();
+                let generation = generation.clone();
+                let label = label.clone();
+                // The hunk counts' inputs, cloned on the main thread: the
+                // blocking half diffs staged sides through the host's own
+                // registry (a clone shares its answer cache), so a refresh
+                // after an unrelated write re-diffs nothing it already knew.
+                let differs = host.differ.clone();
+                let over = overrides.clone();
+                Some(Refresh::new(
+                    target,
+                    move || {
+                        // The whole of the blocking half: one `git status`,
+                        // then one side read per staged path for the `n/m`
+                        // fractions and the staged summary. The describe rides
+                        // along beside it so the label keeps naming the
+                        // repository, the way acquisition overlaps its own
+                        // pieces.
+                        let described = std::thread::scope(|s| {
+                            let title = s.spawn(|| repo.describe());
+                            let status = repo.status()?;
+                            let counts = gitten_app::acquire::side_hunk_counts(
+                                repo.as_ref(),
+                                &differs,
+                                &over,
+                                &status,
+                            );
+                            Ok::<_, String>(views::files::prepare(
+                                status,
+                                &title.join().unwrap_or_default(),
+                                counts,
+                            ))
+                        })?;
+                        Ok(described)
+                    },
+                    move |prepared: views::files::Prepared, host, cx| {
+                        if generation.get() >= target {
+                            return Ok(());
+                        }
+                        let label_text = prepared.label.clone();
+                        view.update(cx, |v, cx| {
+                            v.replace_prepared(prepared, host);
+                            cx.notify();
+                        });
+                        label.replace(label_text);
+                        generation.set(target);
+                        Ok(())
+                    },
+                ))
+            }
+            Screen::Stashes {
+                view,
+                generation,
+                label,
+            } => {
+                if generation.get() >= target {
+                    return None;
+                }
+                let view = view.clone();
+                let generation = generation.clone();
+                let label = label.clone();
+                Some(Refresh::new(
+                    target,
+                    move || {
+                        // The whole of the blocking half: one `git stash list`
+                        // beside the describe the label keeps naming.
+                        let described = std::thread::scope(|s| {
+                            let title = s.spawn(|| repo.describe());
+                            let stashes = repo.stashes()?;
+                            Ok::<_, String>(views::stashes::prepare(
+                                &stashes,
+                                &title.join().unwrap_or_default(),
+                            ))
+                        })?;
+                        Ok(described)
+                    },
+                    move |prepared: views::stashes::Prepared, host, cx| {
+                        if generation.get() >= target {
+                            return Ok(());
+                        }
+                        let label_text = prepared.label.clone();
+                        view.update(cx, |v, cx| {
+                            v.replace_prepared(prepared, host);
+                            cx.notify();
+                        });
+                        label.replace(label_text);
+                        generation.set(target);
+                        Ok(())
+                    },
+                ))
+            }
+            Screen::Branches {
+                view,
+                generation,
+                label,
+            } => {
+                if generation.get() >= target {
+                    return None;
+                }
+                let view = view.clone();
+                let generation = generation.clone();
+                let label = label.clone();
+                let theme = host.theme.clone();
+                Some(Refresh::new(
+                    target,
+                    move || {
+                        // The whole of the blocking half: the two ref
+                        // listings, HEAD's state and the worktree checkouts,
+                        // run beside each other — five independent processes,
+                        // one spawn floor. The theme rides along because the
+                        // dots are coloured at flatten, once, and not per
+                        // frame.
+                        let prepared = std::thread::scope(|s| {
+                            let title = s.spawn(|| repo.describe());
+                            let local = s.spawn(|| repo.branches());
+                            let remote = s.spawn(|| repo.remote_branches());
+                            let head = s.spawn(|| repo.head());
+                            let taken = s.spawn(|| repo.worktree_branches());
+                            let described = title.join().unwrap_or_default();
+                            let local = local
+                                .join()
+                                .unwrap_or_else(|p| std::panic::resume_unwind(p))?;
+                            let remote = remote
+                                .join()
+                                .unwrap_or_else(|p| std::panic::resume_unwind(p))?;
+                            // A failed HEAD read must not take the listing
+                            // down: the rows are still true, only the top
+                            // row's honesty is lost, and that loss is said.
+                            let head = match head
+                                .join()
+                                .unwrap_or_else(|p| std::panic::resume_unwind(p))
+                            {
+                                Ok(head) => Some(head),
+                                Err(e) => {
+                                    eprintln!("gitten: head read failed, showing attached: {e}");
+                                    None
+                                }
+                            };
+                            // A failed worktree read is a garnish lost, not a
+                            // listing lost: the rows are still true, one word
+                            // of honesty is simply not said.
+                            let taken = taken.join().unwrap_or_default();
+                            Ok::<_, String>(views::branches::prepare(
+                                local, remote, head, taken, &theme, &described,
+                            ))
+                        });
+                        prepared
+                    },
+                    move |prepared: views::branches::Prepared, host, cx| {
+                        if generation.get() >= target {
+                            return Ok(());
+                        }
+                        let label_text = prepared.label.clone();
+                        view.update(cx, |v, cx| {
+                            v.replace_prepared(prepared, host);
+                            cx.notify();
+                        });
+                        label.replace(label_text);
+                        generation.set(target);
+                        Ok(())
+                    },
+                ))
+            }
+            Screen::Custom(pane) => pane.refresh(target, host, overrides, repo),
+        }
+    }
+
+    /// Runs one of the commands a screen owns: the `view.*` family both share
+    /// and each screen's own additions. False is "not one of mine", and the
+    /// caller says so — an unknown command that resolved is worth naming rather
+    /// than swallowing.
+    fn run(&self, command: &str, host: &Host, writes: Option<&Writes>, cx: &mut App) -> bool {
+        match self {
+            Screen::Commits { view, .. } => view.update(cx, |v, c| {
+                let known = v.run_view(command, host);
+                if known {
+                    c.notify();
+                }
+                known
+            }),
+            Screen::Diff { view, .. } => view.update(cx, |d, c| {
+                let known = d.run_view(command, host);
+                if known {
+                    c.notify();
+                }
+                known
+            }),
+            Screen::Files { view, .. } => view.update(cx, |f, c| {
+                let known = f.run_view(command, host);
+                if known {
+                    c.notify();
+                }
+                known
+            }),
+            Screen::Stashes { view, .. } => view.update(cx, |s, c| {
+                let known = s.run_view(command, host);
+                if known {
+                    c.notify();
+                }
+                known
+            }),
+            Screen::Branches { view, .. } => view.update(cx, |b, c| {
+                let known = b.run_view(command, host);
+                if known {
+                    c.notify();
+                }
+                known
+            }),
+            Screen::Custom(pane) => pane.run(command, host, writes, cx),
+        }
+    }
+
+    /// `select.all` / `select.none`, answered by whichever screen is up. A
+    /// commit graph has no selection yet and answers no; a command nothing
+    /// handles there is inert — the same answer an unbound key gives.
+    fn select(&self, all: bool, cx: &mut App) -> bool {
+        match self {
+            Screen::Commits { view, .. } => view.update(cx, |v, _| match all {
+                true => v.select_all(),
+                false => v.select_none(),
+            }),
+            Screen::Diff { view, .. } => view.update(cx, |d, cx| match all {
+                true => {
+                    d.select_all(cx);
+                    true
+                }
+                false => d.select_none(cx),
+            }),
+            Screen::Files { view, .. } => view.update(cx, |f, _| match all {
+                true => f.select_all(),
+                false => f.select_none(),
+            }),
+            Screen::Stashes { view, .. } => view.update(cx, |s, _| match all {
+                true => s.select_all(),
+                false => s.select_none(),
+            }),
+            Screen::Branches { view, .. } => view.update(cx, |b, _| match all {
+                true => b.select_all(),
+                false => b.select_none(),
+            }),
+            Screen::Custom(pane) => pane.select(all, cx),
+        }
+    }
+
+    fn custom(pane: impl Pane + 'static) -> Self {
+        Self::Custom(Rc::new(pane))
+    }
+}
+
+/// What the band says, and why it is saying it. Two, because the two sentences
+/// are not the same sentence: an info describes what was tried, and a question
+/// is the one the keyboard is about to spend — the loudest thing on screen,
+/// because quiet is what hid the arm.
+#[derive(Clone, Debug)]
+enum Notice {
+    Info(String),
+    Question { text: String, answers: Vec<Answer> },
+}
+
+/// One clickable answer to a standing question: the label the band draws
+/// and the command name clicking runs. Clicking is running the name — the
+/// same arm/execute logic, cursor-move disarm, and verbatim errors as the
+/// palette path — so answers stay names, never closures.
+#[derive(Clone, Debug)]
+struct Answer {
+    label: &'static str,
+    command: &'static str,
+}
+
+/// The clickable answers a standing question offers, by the command
+/// that asked it. Every entry is a name the palette runs: same-command
+/// answers re-arm or execute through the view's own arm logic, and the
+/// reset menu's three strengths answer through their own names. A
+/// command with no entry asks text-only — the band still shows the
+/// sentence, and Esc still dismisses it.
+fn question_answers(command: &str) -> &'static [(&'static str, &'static str)] {
+    match command {
+        "diff.discard-hunk" => &[("Discard", "diff.discard-hunk")],
+        "files.discard" => &[("Discard", "files.discard")],
+        "branches.delete" => &[("Delete", "branches.delete")],
+        "stashes.drop" => &[("Drop", "stashes.drop")],
+        "commits.reset-menu" => &[
+            ("Soft", "commits.reset-soft"),
+            ("Mixed", "commits.reset-mixed"),
+            ("Hard", "commits.reset-hard"),
+        ],
+        "commits.squash-up" => &[("Squash", "commits.squash-up")],
+        "commits.fixup-up" => &[("Fixup", "commits.fixup-up")],
+        "commits.drop-commit" => &[("Drop", "commits.drop-commit")],
+        "commits.rebase-onto" => &[("Rebase", "commits.rebase-onto")],
+        _ => &[],
+    }
+}
+
+impl Notice {
+    /// The band's sentence, whichever of the two it is.
+    fn text(&self) -> &str {
+        match self {
+            Notice::Info(text) => text,
+            Notice::Question { text, .. } => text,
+        }
+    }
+}
+
+/// A notice is its text — what `as_deref` hands back out of the band, the same
+/// `&str` a `String` notice did, so a reader cannot tell the two apart and a
+/// test does not have to.
+impl std::ops::Deref for Notice {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        self.text()
+    }
+}
+
+/// A refusal, kept whole. The band shows [`GitError::summary`]; the message
+/// overlay shows [`GitError::full`] — the argv prefix is part of the answer
+/// when the text is being read rather than glanced at, and the summary is the
+/// glance.
+#[derive(Clone, Debug, PartialEq)]
+struct GitError {
+    /// The first line of git's own words, argv prefix stripped.
+    summary: SharedString,
+    /// Everything git said, verbatim — the argv prefix included, because
+    /// "which command" is part of the answer when the text is being read
+    /// rather than glanced at.
+    full: SharedString,
+}
+
+impl GitError {
+    fn new(full: impl Into<SharedString>) -> Self {
+        let full = full.into();
+        // The acquisition layer's shape is `git {args}: {stderr}` — strip that
+        // prefix and the summary is git's first line, not the argv's. An
+        // error that arrived by another road is already its own summary.
+        let body = match full.strip_prefix("git ") {
+            Some(rest) => match rest.find(": ") {
+                Some(at) => &rest[at + ": ".len()..],
+                None => rest,
+            },
+            None => full.as_ref(),
+        };
+        let summary = body
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or(body);
+        Self {
+            summary: summary.into(),
+            full,
+        }
+    }
+}
+
+/// An error reads as its headline: the same `&str` the band shows, so a test
+/// (or a reader) asks the error for words and gets the glance, not the record.
+impl std::ops::Deref for GitError {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.summary
+    }
+}
+
+struct DevShell {
+    /// The app half of the title, drawn bright: which program this is. Which
+    /// *view* it is showing is the focused region's to say, because a commit
+    /// list that handed the keyboard to its diff is still a diff while that
+    /// region owns it.
+    which: &'static str,
+    /// The window's panes, by stable name. The left stack renders four named
+    /// residents at once — files, branches, stashes, commits — or whichever
+    /// extension pane has taken the commit list's region over; focus decides
+    /// whose keys are live, and every list keeps its own cursor and scroll
+    /// state whatever is on screen. See [`DevShell::list_order`] for the
+    /// order the keys walk.
+    panes: panes::Panes<Screen>,
+    /// The diff main view: always on screen, right of the stack. Built once
+    /// at startup (empty when the window opened on a list) and re-aimed at
+    /// each selection through [`DevShell::schedule_main_diff`] — never rebuilt,
+    /// which is what keeps its scroll state and presentation across commits.
+    ///
+    /// A launch whose first acquisition was itself a diff (`gitten diff …`,
+    /// a fixture, a patch file) builds this from those rows instead and has
+    /// no commit list at all — see [`DevShell::has_column`].
+    main: Screen,
+    /// Whether the window has a commit list. False only for a diff/fixture/
+    /// patch launch, where there is no acquired commit list to show; the
+    /// diff then fills the whole width, the stack's other panes still stand
+    /// (a fixture has no repository, so it has none of them either) and the
+    /// spot never leaves [`Spot::Main`] when no list exists at all.
+    has_column: bool,
+    /// Which region holds the keyboard.
+    spot: Spot,
+    /// The commit the main view is of — set the moment a selection is
+    /// scheduled, so the diff header is true during the load, not only after
+    /// it. Its subject shrinks behind the file name in that header; its
+    /// author and sha live in the list row the keyboard came from, which is
+    /// where a reader looks for them. `None` until the first selection (or
+    /// forever, over a fixture).
+    head: RefCell<Option<Commit>>,
+    /// The newest main-view request. Each schedule bumps it; a timer or a
+    /// finished load applies only if it still equals the value it left with,
+    /// which is how a fast cursor run collapses to exactly one load — the
+    /// latest row's.
+    request: Cell<u64>,
+    /// True between scheduling a main-view load and its rows landing.
+    loading: Cell<bool>,
+    stats: Option<Stats>,
+    /// How to fetch the diff again with a different algorithm. `None` for a
+    /// `.diff` fixture, where there is no repository behind the rows at all.
+    rediff: Option<Rediff>,
+    /// The repository path used in labels and the persistent handle used for
+    /// every acquisition. `None` for a fixture, which has no repository behind
+    /// it — and the key then says so, which is what an unbound key does too.
+    repo: Option<(std::path::PathBuf, gitten_git::Handle)>,
+    jobs: Runner,
+    submitter: Submitter,
+    generation: Generation,
+    /// The newest refresh batch and the work still outstanding in it. Older
+    /// batches may finish later; their generation keeps them from changing this
+    /// batch's status or replacing newer pane data.
+    refresh_id: u64,
+    refresh_pending: usize,
+    refresh_error: Option<String>,
+    running: Option<(String, std::time::Instant)>,
+    /// The one native text field over the active screen, if a command is
+    /// gathering input. Consumers subscribe to its accepted/cancelled event.
+    input: Option<Entity<input::Input>>,
+    /// What accepting that input is for — set by whoever opened it, consumed
+    /// by [`DevShell::close_input`]. One at a time, because there is one
+    /// field; a second prompt replaces the first and says what it means.
+    prompt: Option<Prompt>,
+    /// The live half of a [`Prompt::Search`]: the subscription that carries
+    /// each edit to the pane being filtered. Held so it dies with the prompt —
+    /// replaced when another opens, dropped the moment one closes.
+    search_live: Option<Subscription>,
+    /// The live picks. Every field `None` means "whatever the config selected",
+    /// which is what the settings panel shows until somebody changes one — so
+    /// the panel agrees with `gitten.toml` rather than with a copy of it taken
+    /// at startup.
+    over: Overrides,
+    open: Option<Open>,
+    /// A failed re-diff. Shown, not swallowed: the usual cause is a repository
+    /// that moved under the window, and silently keeping the old rows would be a
+    /// diff labelled with an algorithm that did not produce it.
+    error: Option<GitError>,
+    /// True when [`DevShell::error`] names a failed diff load rather than a
+    /// failed write. A preview that lands clears only the former: a write's
+    /// refusal must survive whatever the next cursor move loads, while a
+    /// load's own failure is spent the moment newer rows replace it.
+    error_is_load: bool,
+    /// Whether the error's full text is on screen — `message.show` opened it,
+    /// `esc` or anything that clears the error closes it.
+    show_message: bool,
+    /// One sentence about what a key just did — an unbound chord, a command
+    /// that resolved to nothing this screen can do, or a write that named
+    /// its own finish (the sync verbs: pushed, pulled, fetched). Cleared by
+    /// the next key, so it cannot go stale. Same band as
+    /// [`DevShell::error`], which wins — and an armed question in it is the
+    /// error's ink and not this, because the one sentence a second press
+    /// spends is the one being read: see [`DevShell::set_question`].
+    notice: Option<Notice>,
+    /// Where `gitten.toml` is. Held because picking a theme goes through the same
+    /// reload a save does — see [`config::reload`] for why there is only one
+    /// path.
+    config: std::path::PathBuf,
+    /// The guide-v2 workspace shell: destination, center view and preview
+    /// guard. The sidebar holds no state of its own — it draws the files
+    /// pane's grouped projection under the files pane's cursor, or the
+    /// History destination's CURRENT BRANCH note. See
+    /// [`views::workspace`]; the two destinations are `workspace.changes`
+    /// and `workspace.history`, both inside the workspace.
+    workspace: views::workspace::Workspace,
+    /// The commit composer's drafts, one per repository path: Summary plus
+    /// optional Description, written by the inspector's fields on every
+    /// edit. Outside the single-shot prompt slot on purpose — a prompt is
+    /// spent on accept, while a draft survives navigation, refresh and a
+    /// refused commit, and dies only on a successful one. Keyed by the
+    /// repository path, so switching repositories restores each one's
+    /// unsent words rather than leaking them across.
+    drafts: std::collections::HashMap<String, CommitDraft>,
+    /// The commit confirmation standing over the workspace, if
+    /// `workspace.commit` opened it. Rendered from the draft and the staged
+    /// summary at open time and confirmed through `workspace.commit-confirm`
+    /// — the write itself is [`gitten_app::act::commit_message`]'s, the same
+    /// function the prompt path calls, so there is one commit implementation
+    /// under both doors.
+    commit_confirm: bool,
+    /// The repository key a submitted `commit` job belongs to, if one is
+    /// in flight. The finish line clears exactly that repository's draft —
+    /// the current key would be the wrong one if the window switched
+    /// repositories mid-commit — and a refusal clears nothing, so the
+    /// unsent words stand beside git's verbatim error.
+    pending_commit_key: Option<String>,
+    /// When the last fetch and push finished cleanly — the status bar's
+    /// recency, stamped in [`DevShell::drain_jobs`] by job name. `None` is
+    /// "never this session", said as "never" rather than a blank, because
+    /// a count with no recency beside it reads as current.
+    last_fetch: Option<std::time::Instant>,
+    last_push: Option<std::time::Instant>,
+    /// Spelled status-bar leading segments beside the inputs they were
+    /// spelled from — stamps, staged total, remote, branch label.
+    /// Recomputed when any input moves; every other frame clones three
+    /// refcounts. A frame formats nothing: the bar is drawn at rest for
+    /// long stretches, and a stale minute heals on the next frame.
+    status_memo: RefCell<Option<(StatusMemoKey, Vec<SharedString>)>>,
+    /// Startup logging, and nothing else: whether [`start::mark`] has already
+    /// stamped the first render. One bool read per frame afterwards.
+    first_render: Cell<bool>,
+    /// The title strip's two halves — `("~/src/", "plait")` — cut once per
+    /// repository and read per frame. Keyed on the path, because the tests
+    /// swap `repo` in place and a memo that trusted construction would lie.
+    title_memo: RefCell<Option<(std::path::PathBuf, SharedString, SharedString)>>,
+    /// The Commands palette: open flag, selection into the filtered rows,
+    /// the filter field (built once, subscription included), its
+    /// subscription, and the mirrored query text.
+    palette_open: bool,
+    palette_sel: usize,
+    palette_field: Option<Entity<input::Input>>,
+    palette_sub: Option<Subscription>,
+    palette_query: String,
+    /// The theme picker: the same shape as the palette — an open flag, a
+    /// selection into the filtered cards, and a filter field built once — but
+    /// it stays open across a pick so several palettes can be tried against
+    /// the diff behind the scrim. See [`theme_picker`].
+    theme_picker_open: bool,
+    theme_picker_sel: usize,
+    theme_picker_field: Option<Entity<input::Input>>,
+    theme_picker_sub: Option<Subscription>,
+    theme_picker_query: String,
+    /// The window's one focusable element: this shell itself. Key events reach a
+    /// listener through the focus path, so something has to hold focus, and one
+    /// handle owned here means the views never have to know input exists.
+    focus: FocusHandle,
+    focused: Option<FocusHandle>,
+    /// Which axis the wheel gesture in flight belongs to. `gpui`'s own lock,
+    /// held here — the one place that sees every wheel event first.
+    ongoing: Cell<OngoingScroll>,
+    /// The project menu's rows, loaded when the menu opens and read while it
+    /// stands — never per frame, because reading them is file I/O and the
+    /// render path does none. Most-recent first; the current repository is
+    /// moved to the front at open time when the file does not name it.
+    projects: Vec<std::path::PathBuf>,
+    /// The session key the scroll position is saved under — the command that
+    /// produced the current view — and where it is saved. Both follow a
+    /// repository switch, so one periodic task serves every repository the
+    /// window ever sits on: it reads these fields per tick rather than
+    /// holding the startup values.
+    session_key: String,
+    session_path: std::path::PathBuf,
+    /// A saved row waiting for the switch's refresh wave to land. Set by
+    /// [`DevShell::switch_repo`] from the new repository's session file and
+    /// consumed by [`DevShell::finish_refresh`] once every pane holds new
+    /// rows — scrolling an empty list first would clamp the restore away.
+    pending_restore: Option<usize>,
+}
+
+fn action_file_section(section: views::files::Section) -> gitten_app::act::FileSection {
+    match section {
+        views::files::Section::Staged => gitten_app::act::FileSection::Staged,
+        views::files::Section::Unstaged => gitten_app::act::FileSection::Unstaged,
+        views::files::Section::Untracked => gitten_app::act::FileSection::Untracked,
+        views::files::Section::Conflicts => gitten_app::act::FileSection::Conflicts,
+    }
+}
+
+fn view_file_section(section: gitten_app::act::FileSection) -> views::files::Section {
+    match section {
+        gitten_app::act::FileSection::Staged => views::files::Section::Staged,
+        gitten_app::act::FileSection::Unstaged => views::files::Section::Unstaged,
+        gitten_app::act::FileSection::Untracked => views::files::Section::Untracked,
+        gitten_app::act::FileSection::Conflicts => views::files::Section::Conflicts,
+    }
+}
+
+struct WindowActs<'shell, 'context, 'app> {
+    shell: &'shell mut DevShell,
+    cx: &'context mut Context<'app, DevShell>,
+}
+
+impl gitten_app::act::Client for WindowActs<'_, '_, '_> {
+    fn say(&mut self, message: String) {
+        self.shell.set_notice(message);
+    }
+
+    fn ask(&mut self, question: String) {
+        self.shell.set_question(question);
+    }
+
+    fn repo(&self) -> Option<gitten_git::Handle> {
+        self.shell.writes().map(|writes| writes.repo)
+    }
+
+    fn submit(&mut self, job: Box<dyn Job>) -> bool {
+        self.shell.notice = None;
+        self.shell.writes().is_some_and(|writes| writes.send(job))
+    }
+}
+
+impl gitten_app::act::BranchClient for WindowActs<'_, '_, '_> {
+    fn branch_target(&self) -> Option<views::branches::Target> {
+        self.shell.branches_target(self.cx)
+    }
+
+    fn confirm_or_arm_branch(&mut self, target: &views::branches::Target) -> bool {
+        match self.shell.active() {
+            Some(Screen::Branches { view, .. }) => view.update(self.cx, |branches, _| {
+                branches.confirm_or_arm_delete(target)
+            }),
+            _ => false,
+        }
+    }
+}
+
+impl gitten_app::act::FileClient for WindowActs<'_, '_, '_> {
+    fn selected_file(&self) -> Option<gitten_app::act::SelectedFile> {
+        let Some(Screen::Files { view, .. }) = self.shell.active() else {
+            return None;
+        };
+        view.read(self.cx)
+            .current_file()
+            .map(|file| gitten_app::act::SelectedFile {
+                section: action_file_section(file.section),
+                path: file.path.clone(),
+                shown: file.path_text.to_string(),
+            })
+    }
+
+    fn cursor_section(&self) -> Option<gitten_app::act::FileSection> {
+        let Some(Screen::Files { view, .. }) = self.shell.active() else {
+            return None;
+        };
+        view.read(self.cx).cursor_section().map(action_file_section)
+    }
+
+    fn paths_in(
+        &self,
+        section: gitten_app::act::FileSection,
+    ) -> Vec<gitten_core::status::PathBytes> {
+        let Some(Screen::Files { view, .. }) = self.shell.active() else {
+            return Vec::new();
+        };
+        view.read(self.cx).paths_in(view_file_section(section))
+    }
+
+    fn confirm_or_arm_file(&mut self, target: &gitten_app::act::SelectedFile) -> bool {
+        match self.shell.active() {
+            Some(Screen::Files { view, .. }) => view.update(self.cx, |files, _| {
+                files.confirm_or_arm_discard(view_file_section(target.section), &target.path)
+            }),
+            _ => false,
+        }
+    }
+}
+
+/// One of the four screens a search prompt can drive. [`SearchPane::apply`]
+/// is the whole of what the live half and accept differ by; the prompt
+/// itself is the shell's, the matcher belongs where the flatten rows live.
+enum SearchPane {
+    Commits(Entity<views::commits::Commits>),
+    Files(Entity<views::files::Files>),
+    Branches(Entity<views::branches::Branches>),
+    Stashes(Entity<views::stashes::Stashes>),
+}
+
+impl SearchPane {
+    /// Meets the list where its last drag left it, before anything reads the
+    /// cursor — the discipline every list shares.
+    fn reconcile(&self, host: &Host, cx: &mut Context<DevShell>) {
+        match self {
+            SearchPane::Commits(view) => view.update(cx, |v, _| v.reconcile(host)),
+            SearchPane::Files(view) => view.update(cx, |v, _| v.reconcile(host)),
+            SearchPane::Branches(view) => view.update(cx, |v, _| v.reconcile(host)),
+            SearchPane::Stashes(view) => view.update(cx, |v, _| v.reconcile(host)),
+        }
+    }
+
+    /// Writes `query` into the pane's list — the one verb the prompt's live
+    /// half and its accept both end in.
+    fn apply(&self, query: &str, cx: &mut Context<DevShell>) {
+        match self {
+            SearchPane::Commits(view) => view.update(cx, |v, _| v.apply_query(query)),
+            SearchPane::Files(view) => view.update(cx, |v, _| v.apply_query(query)),
+            SearchPane::Branches(view) => view.update(cx, |v, _| v.apply_query(query)),
+            SearchPane::Stashes(view) => view.update(cx, |v, _| v.apply_query(query)),
+        }
+    }
+}
+
+/// The status bar's recency scale: under a minute is news, under an hour
+/// counts in minutes, after that in hours. Floored, never rounded up —
+/// "1m ago" at sixty seconds, not fifty-nine claiming two.
+fn ago_text(secs: u64) -> String {
+    match secs {
+        0..60 => "just now".into(),
+        60..3600 => format!("{}m ago", secs / 60),
+        _ => format!("{}h ago", secs / 3600),
+    }
+}
+
+/// The bar's single sync sentence: whichever of fetch and push ran last
+/// this session wins — a push that landed a minute ago is newer news than
+/// a fetch from an hour back. Nothing ran yet reads as an honest absence,
+/// not a blank. `now` rides along so tests can hold the clock still.
+fn sync_text(
+    fetch: Option<std::time::Instant>,
+    push: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> SharedString {
+    // `None` sorts below every `Some`: push wins when it exists and is
+    // newer, or when fetch never ran at all.
+    if push > fetch {
+        let at = push.expect("compared Some");
+        return format!(
+            "Last push {}",
+            ago_text(now.saturating_duration_since(at).as_secs())
+        )
+        .into();
+    }
+    match fetch {
+        None => "Never fetched".into(),
+        Some(at) => format!(
+            "Last fetched {}",
+            ago_text(now.saturating_duration_since(at).as_secs())
+        )
+        .into(),
+    }
+}
+
+/// The Push button's label from the loaded upstream distance: `None` is
+/// unknowable — upstream gone, never fetched — and reads as an em-dash,
+/// never `0`, which would invite a useless push.
+fn push_label(ahead: Option<u32>) -> SharedString {
+    match ahead {
+        None => "Push \u{2014}".into(),
+        Some(0) => "Published".into(),
+        Some(n) => format!("Push {n}").into(),
+    }
+}
+
+/// A registry name as a control spells it: `unified` -> `Unified`. The
+/// registry's own name is the identity `gitten.toml` and `[keys]` use and is
+/// never rewritten — this is presentation, applied where the name is drawn.
+fn title_case(name: &str) -> SharedString {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) => SharedString::from(format!("{}{}", first.to_uppercase(), chars.as_str())),
+        None => SharedString::from(""),
+    }
+}
+
+/// The staging count's noun: the one case the plural would embarrass.
+fn staging_text(staged: u32) -> SharedString {
+    match staged {
+        1 => "1 staged hunk".into(),
+        n => format!("{n} staged hunks").into(),
+    }
+}
+
+/// The status-bar memo's key: the stamps, the staged total, the remote,
+/// the branch label. Everything a frame's spelling depends on, and
+/// nothing it does not.
+type StatusMemoKey = (
+    Option<std::time::Instant>,
+    Option<std::time::Instant>,
+    u32,
+    SharedString,
+    Option<SharedString>,
+);
+
+impl DevShell {
+    /// The screen commands act on: the focused list, or the diff, by where
+    /// the keyboard is. Every dispatch decision reads through here,
+    /// which is what makes routing a change of [`Spot`] and nothing else.
+    fn active(&self) -> Option<&Screen> {
+        Some(match self.spot {
+            Spot::List => self.panes.focused(),
+            Spot::Main => &self.main,
+        })
+    }
+
+    /// The commits list. With the stack holding the other lists, the commit
+    /// list is on screen whatever the keyboard is doing — so main-view
+    /// loading reads its selection from here even while the files pane is
+    /// focused, which is the design's point: moving through the working tree
+    /// does not take the commit list away. `None` only while an extension
+    /// pane has taken its region over, or on a launch with no commit list at
+    /// all.
+    fn column_commits(&self) -> Option<Entity<views::commits::Commits>> {
+        if !self.has_column || matches!(self.panes.focused(), Screen::Custom(_)) {
+            return None;
+        }
+        match self.panes.get("commits") {
+            Some(Screen::Commits { view, .. }) => Some(view.clone()),
+            _ => None,
+        }
+    }
+
+    /// List pane names in the order the number keys and stack name them, then
+    /// extension panes in registration order. Both pane walking and cycling
+    /// read this table.
+    fn list_order(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = ["files", "branches", "commits", "stashes"]
+            .into_iter()
+            .filter(|name| self.panes.position(name).is_some())
+            .collect();
+        let builtins = ["files", "branches", "stashes", "commits"];
+        names.extend(self.panes.names().filter(|name| !builtins.contains(name)));
+        names
+    }
+
+    /// Moves the keyboard to a region. A fixture window has no list to give
+    /// the keyboard back to, so a `Spot::Main` there is forever.
+    fn set_spot(&mut self, spot: Spot, cx: &mut App) {
+        if spot == Spot::List && self.list_order().is_empty() {
+            return;
+        }
+        if spot == Spot::List && self.list_order().is_empty() {
+            return;
+        }
+        if self.spot != spot {
+            self.spot = spot;
+            // A menu belongs to the pane it was opened over: focus moving
+            // closes it, or it stands invisible and swallows the wheel.
+            self.open = None;
+            self.sync_focus(cx);
+        }
+    }
+
+    /// Tells every list whether it holds the keyboard. A row's bar is accent
+    /// only in the focused pane and the view cannot ask the shell during
+    /// render, so this runs from the two places focus actually moves —
+    /// [`DevShell::set_spot`] and [`DevShell::focus_pane`] — and once at
+    /// startup. The keyboard is in exactly one list when `spot` is the list
+    /// region, and in none when it is the diff.
+    fn sync_focus(&mut self, cx: &mut App) {
+        let at = match self.spot {
+            Spot::List => Some(self.panes.focused_index()),
+            Spot::Main => None,
+        };
+        for (i, screen) in self.panes.iter().enumerate() {
+            let focused = at == Some(i);
+            match screen {
+                Screen::Files { view, .. } => view.update(cx, |v, _| v.set_focused(focused)),
+                Screen::Branches { view, .. } => view.update(cx, |v, _| v.set_focused(focused)),
+                Screen::Stashes { view, .. } => view.update(cx, |v, _| v.set_focused(focused)),
+                Screen::Commits { view, .. } => view.update(cx, |v, _| v.set_focused(focused)),
+                Screen::Diff { view, .. } => view.update(cx, |v, _| v.set_focused(focused)),
+                Screen::Custom(_) => {}
+            }
+        }
+        // The workspace center is not a pane, so it is not in the loop:
+        // its bar is accent exactly when the keyboard sits in the diff
+        // region.
+        if let Some(center) = self.workspace.center.clone() {
+            let focused = self.spot == Spot::Main;
+            center.update(cx, |v, _| v.set_focused(focused));
+        }
+    }
+
+    /// The view name the title strip shows: the active screen's mode — which
+    /// is also the name `[keys]` groups its bindings under. Falls back to what
+    /// launched the window only if there were no screens at all, which does
+    /// not happen; the fallback keeps the type honest rather than the UI.
+    /// Test-only: the workspace destinations name themselves.
+    #[cfg(test)]
+    fn active_view_name(&self) -> &'static str {
+        self.active().map_or(self.which, Screen::mode)
+    }
+
+    /// The live host, rebuilt per event from the render-path accessor.
+    fn fresh_host(&mut self, cx: &mut Context<Self>) -> Rc<Host> {
+        config::host(cx)
+    }
+
+    fn set_notice(&mut self, message: impl Into<String>) {
+        self.notice = Some(Notice::Info(message.into()));
+    }
+
+    /// An armed question — the sentence a second press spends, asked once in
+    /// the band and answered by the next press or a move of the cursor.
+    /// Answers start empty; the dispatch attaches them from the command
+    /// that asked, so every button is a name the palette could run.
+    fn set_question(&mut self, message: impl Into<String>) {
+        self.notice = Some(Notice::Question {
+            text: message.into(),
+            answers: Vec::new(),
+        });
+    }
+
+    fn open_input(&mut self, input: Entity<input::Input>, cx: &mut Context<Self>) {
+        // Whatever the previous prompt was filtering live stops now; what its
+        // last edit did to its pane is that prompt's close to decide.
+        self.search_live = None;
+        if let Some(previous) = self.input.replace(input) {
+            previous.update(cx, |input, cx| input.cancel(cx));
+        }
+        // The field speaks its own exits — Enter to accept, Esc to cancel —
+        // because a prompt that hides how to leave it is a modal with no
+        // door. Fixed native text now, not a keymap lookup: no chord state
+        // survives to answer what a press means.
+        if let Some(field) = self.input.as_ref() {
+            field.update(cx, |field, _| {
+                field.set_exits(Some("enter".into()), Some("esc".into()))
+            });
+        }
+        cx.notify();
+    }
+
+    /// Closes the field, accepting or cancelling it — and hands the accepted
+    /// text to whatever opened it. The consumer is a slot rather than a
+    /// subscription because the answer has exactly one destination: the
+    /// prompt that is closing as it fires.
+    fn close_input(&mut self, accept: bool, cx: &mut Context<Self>) {
+        let Some(input) = self.input.take() else {
+            return;
+        };
+        // The live feed dies with the prompt; the routing below settles what
+        // the last edit left on the pane.
+        self.search_live = None;
+        // Read before the entity confirms its own event: the value is what the
+        // consumer asked for; accept only closes.
+        let text = input.read(cx).value().to_string();
+        input.update(cx, |input, cx| match accept {
+            true => input.accept(cx),
+            false => input.cancel(cx),
+        });
+        match (accept, self.prompt.take()) {
+            (true, Some(Prompt::CommitMessage)) => self.commit_message(text, cx),
+            (true, Some(Prompt::AmendMessage)) => self.amend_message(text, cx),
+            // A search keeps what was typed on accept and clears on cancel —
+            // `esc` means "forget it", not "keep half of it".
+            (_, Some(Prompt::Search { target })) => {
+                self.finish_search(&target, accept.then_some(text), cx)
+            }
+            // A name is spent only on accept, and only if the pane it was
+            // opened over still exists — the registration name in the slot
+            // is the promise about where the answer belongs.
+            (true, Some(Prompt::BranchName { target, what })) => {
+                self.branch_named(&target, what, text)
+            }
+            (true, Some(Prompt::TagName { target, at })) => self.tag_named(&target, at, text),
+            // A repository path is spent only on accept. The switch validates
+            // before it moves anything, so a typo costs a sentence, never the
+            // window's contents.
+            (true, Some(Prompt::ProjectPath)) => self.project_path_entered(text, cx),
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    /// The write rails as every pane command receives them: this window's
+    /// repository and its queue, or `None` over a fixture. The shell's own
+    /// verbs go through the same value — there is no second path for a
+    /// built-in.
+    fn writes(&self) -> Option<Writes> {
+        let (_, repo) = self.repo.as_ref()?;
+        Some(Writes {
+            repo: gitten_git::Handle::clone(repo),
+            submit: self.submitter.clone(),
+        })
+    }
+
+    /// `files.stage`: act on the row the keyboard is on, by the side of the
+    /// index it sits on. Staged means unstage; everything else — unstaged,
+    /// untracked, a conflict whose resolution is being recorded — means stage.
+    /// That is lazygit's rule and git's own asymmetry: `add` is the one word
+    /// for "the index should hold this". Read through the workspace's twins,
+    /// the same verb stages a partial row's remainder — see
+    /// [`gitten_app::act::stage_remainder_or_unstage`], which this calls —
+    /// because a whole-file stage of a twin lands exactly the remainder.
+    ///
+    /// Like every verb's I/O, this reads its context from the focused view and
+    /// then leaves the screen alone: the write runs on the job thread, and a
+    /// successful finish bumps the generation so all repository panes
+    /// re-acquire at once.
+    fn stage_or_unstage(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.active(), Some(Screen::Files { .. })) {
+            self.set_notice("files.stage is not supported here");
+            return;
+        }
+        let mut client = WindowActs { shell: self, cx };
+        gitten_app::act::stage_remainder_or_unstage(&mut client);
+    }
+
+    /// `files.commit`: gather a message over the pane, then commit on accept.
+    ///
+    /// The input owns the keyboard while it is open — the field takes every
+    /// press the window does not consume — and [`DevShell::close_input`]
+    /// routes the text back here through the prompt slot.
+    /// `workspace.commit`: the inspector's commit door — the Commit button,
+    /// the `CommitStaged` menu action and cmd-enter all arrive here. Opens
+    /// the confirmation dialog when the gate holds (staged content and a
+    /// non-whitespace summary); otherwise says which half is missing. The
+    /// write itself is [`gitten_app::act::commit_message`]'s — one commit
+    /// implementation under both this door and the prompt's.
+    fn open_commit_confirm(&mut self, cx: &mut Context<Self>) {
+        if self.repo.is_none() {
+            self.set_notice("a fixture has no repository to commit in");
+            return;
+        }
+        self.ensure_inspector_fields(cx);
+        self.sync_fields_to_draft(cx);
+        if self.files_staged(cx).1 == 0 {
+            self.set_notice("nothing staged to commit");
+            return;
+        }
+        let has = self
+            .draft_key()
+            .as_ref()
+            .and_then(|key| self.drafts.get(key))
+            .is_some_and(CommitDraft::has_message);
+        if !has {
+            self.set_notice("a commit needs a message");
+            return;
+        }
+        self.commit_confirm = true;
+        cx.notify();
+    }
+
+    /// `workspace.commit-confirm`: the dialog's Commit button. Re-gates —
+    /// staging may have moved while the dialog stood — then submits the
+    /// draft's message through `act::commit_message`: staged-only, unstaged
+    /// retained, the refresh wave re-acquiring afterwards. The draft clears
+    /// only on the job's clean finish (see `drain_jobs`); a refusal keeps
+    /// its words standing beside git's verbatim error.
+    fn confirm_commit(&mut self, cx: &mut Context<Self>) {
+        if !self.commit_confirm {
+            return;
+        }
+        self.sync_fields_to_draft(cx);
+        let key = self.draft_key();
+        let (message, has) = match key.as_ref().and_then(|k| self.drafts.get(k)) {
+            Some(draft) => (draft.message(), draft.has_message()),
+            None => {
+                self.commit_confirm = false;
+                self.set_notice("a fixture has no repository to commit in");
+                self.focus_named("files", cx);
+                return;
+            }
+        };
+        if self.files_staged(cx).1 == 0 {
+            self.commit_confirm = false;
+            self.set_notice("nothing staged to commit");
+            self.focus_named("files", cx);
+            return;
+        }
+        if !has {
+            self.commit_confirm = false;
+            self.set_notice("a commit needs a message");
+            self.focus_named("files", cx);
+            return;
+        }
+        self.commit_confirm = false;
+        self.pending_commit_key = key;
+        let mut client = WindowActs { shell: self, cx };
+        gitten_app::act::commit_message(&mut client, message);
+        self.focus_named("files", cx);
+    }
+
+    /// `workspace.commit-cancel`, and Esc over the standing dialog: dismiss
+    /// with the draft untouched, and hand the keyboard back to the files
+    /// pane — the same focus restoration the prompt path keeps.
+    fn cancel_commit_confirm(&mut self, cx: &mut Context<Self>) {
+        self.commit_confirm = false;
+        self.focus_named("files", cx);
+        cx.notify();
+    }
+
+    fn begin_commit_message(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.active(), Some(Screen::Files { .. })) {
+            self.set_notice("files.commit is not supported here");
+            return;
+        }
+        if self.repo.is_none() {
+            self.set_notice("a fixture has no repository to commit in");
+            return;
+        }
+        let input = cx.new(|cx| input::Input::new("commit", "commit message", "", cx));
+        self.open_input(input, cx);
+        // After `open_input`, which may have cancelled a previous prompt.
+        self.prompt = Some(Prompt::CommitMessage);
+    }
+
+    /// The accepted commit text, as a job. Empty refused again here — the
+    /// trait refuses it too, but saying so beside the field that just closed
+    /// beats making the reader find out twice.
+    fn commit_message(&mut self, message: String, cx: &mut Context<Self>) {
+        let mut client = WindowActs { shell: self, cx };
+        gitten_app::act::commit_message(&mut client, message);
+    }
+
+    /// `files.amend`: the same field commit's key opens, aimed one step back
+    /// — accepting rewrites HEAD to hold the staged changes under this text.
+    /// The refusals are shared on purpose: no repository, an empty message.
+    /// Whether HEAD has anything to amend is the trait's to answer, where
+    /// the honest "no commits yet" lives next to git's own errors.
+    fn begin_amend_message(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.active(), Some(Screen::Files { .. })) {
+            self.set_notice("files.amend is not supported here");
+            return;
+        }
+        if self.repo.is_none() {
+            self.set_notice("a fixture has no repository to amend in");
+            return;
+        }
+        let input = cx.new(|cx| input::Input::new("amend", "amend message", "", cx));
+        self.open_input(input, cx);
+        // After `open_input`, which may have cancelled a previous prompt.
+        self.prompt = Some(Prompt::AmendMessage);
+    }
+
+    /// The accepted amend text, as a job. Empty refused again here — the
+    /// trait refuses it too, but saying so beside the field that just closed
+    /// beats making the reader find out twice. Amending a commit some remote
+    /// already holds is tonight the reader's own decision: nothing tracks
+    /// push state yet, and saying so beats a guard that guesses.
+    fn amend_message(&mut self, message: String, cx: &mut Context<Self>) {
+        let mut client = WindowActs { shell: self, cx };
+        gitten_app::act::amend_message(&mut client, message);
+    }
+
+    /// `files.discard`: the one destructive verb, and it confirms on the
+    /// keyboard because no dialog exists to confirm anywhere else. First
+    /// press arms the row the keyboard is on and asks once, here in the
+    /// band; second press on the same row builds the job; any cursor move,
+    /// wheel or refresh disarms before it can lie (`Files` owns that state;
+    /// this side only asks whether the press was the second one).
+    ///
+    /// Two refusals said up front rather than answered badly: a staged row,
+    /// whose unstaged side may be empty and whose undo is unstage; and a
+    /// conflict, whose working-tree side is the merge's open question.
+    fn discard_selected(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.active(), Some(Screen::Files { .. })) {
+            self.set_notice("files.discard is not supported here");
+            return;
+        }
+        let mut client = WindowActs { shell: self, cx };
+        gitten_app::act::discard_file(&mut client);
+    }
+
+    /// `files.stage-all`: every row, on the side of the index the keyboard
+    /// sits in — the one rule `space` keeps for a single row, at scale.
+    /// Staged row or staged heading: unstage everything staged. Anything
+    /// else — unstaged, untracked, their headings, an empty tree: stage
+    /// everything unstaged and untracked. Deterministic and visible (you
+    /// can see where the cursor is), which is why it wins over a toggle:
+    /// pressed twice in one place, it answers the same both times.
+    ///
+    /// Conflicts belong to neither direction — staging one records a
+    /// resolution, which is its own decision. One job either way, so one
+    /// generation bump and one re-acquire wave per keypress.
+    fn stage_all(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.active(), Some(Screen::Files { .. })) {
+            self.set_notice("files.stage-all is not supported here");
+            return;
+        }
+        let mut client = WindowActs { shell: self, cx };
+        gitten_app::act::stage_all(&mut client);
+    }
+
+    /// `files.ignore`: append the untracked file to the root `.gitignore`,
+    /// creating that file when it is absent, and let the refresh do the
+    /// rest — git stops listing ignored files on its own, so the entry
+    /// leaves the pane without anything being deleted or moved.
+    ///
+    /// Only an untracked row answers. `.gitignore` governs files git does
+    /// not yet track, so answering over a tracked change would be a no-op
+    /// wearing a success badge.
+    fn ignore_selected(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.active(), Some(Screen::Files { .. })) {
+            self.set_notice("files.ignore is not supported here");
+            return;
+        }
+        let mut client = WindowActs { shell: self, cx };
+        gitten_app::act::ignore_file(&mut client);
+    }
+
+    /// `diff.stage-hunk` / `diff.unstage-hunk` / `diff.discard-hunk`: act on
+    /// the hunk the keyboard sits on, wherever in it the cursor is — header,
+    /// context, changed line, all one address.
+    ///
+    /// Three gates before anything runs, each said rather than answered
+    /// badly. Only a working-tree diff has an index to aim at; a commit's
+    /// diff is between two snapshots and has neither an index nor a worktree
+    /// in reach. A file git tracks nowhere — untracked work — cannot travel
+    /// as a patch, because `git apply --cached` creates an entry only from a
+    /// patch carrying its mode and the line model does not carry one;
+    /// whole-file verbs already serve it from the files pane, and status —
+    /// the same read the files pane draws from — is what tells the two
+    /// apart, because absence of old line numbers cannot: at `[diff] context
+    /// = 0` an addition to a tracked file carries none either. And discard
+    /// confirms exactly as `files.discard` does: first press arms the row
+    /// and asks once, any move of the keyboard disarms, second press builds
+    /// the job.
+    fn hunk_verb(&mut self, command: &str, cx: &mut Context<Self>) {
+        let Some(Screen::Diff { view, source, .. }) = self.active() else {
+            self.set_notice(format!("{command} is not supported here"));
+            return;
+        };
+        // Copied out of the cell before the refusals: the match arms below
+        // speak into the band, and the borrow must not be alive while they do.
+        let source = source.borrow().clone();
+        match source.as_ref() {
+            None => {
+                self.set_notice("no diff is showing");
+                return;
+            }
+            Some(Source::Repo { arg, .. }) if arg.is_empty() => {}
+            Some(Source::Repo { .. }) => {
+                self.set_notice(
+                    "only the working-tree diff can act on hunks — this one is between commits",
+                );
+                return;
+            }
+            Some(Source::Fixtures) => {
+                self.set_notice("a fixture has no repository behind it");
+                return;
+            }
+            Some(Source::Patch { .. }) => {
+                self.set_notice("a patch file has no repository behind it");
+                return;
+            }
+        }
+        let view = view.clone();
+        let host = config::host(cx);
+        // Meet the list where its last drag left it, like every reader of the
+        // cursor: the hunk acted on is the one being *looked at*.
+        view.update(cx, |d, _| d.reconcile(&host));
+        let row = view.read(cx).cursor_row_id();
+        let Some((path, hunk)) = view.read(cx).current_hunk() else {
+            self.set_notice("the keyboard is not on a hunk");
+            return;
+        };
+        // The two-press arm lives in the shared tail, after the creation
+        // refusal: arming first would set a live question on a hunk no verb
+        // can serve (an untracked file's), and a standing question that can
+        // never be spent is worse than a refusal.
+        self.submit_hunk_patch(command, &path, &hunk, cx, Some((view, row)));
+    }
+
+    /// The shared tail of every hunk write — the keyboard's verb and the
+    /// workspace strip's button alike: the creation refusal, the discard
+    /// two-press, patch synthesis, and the one `Write` constructor per verb.
+    /// Gates about *where* (which screen, which side) stay with the callers;
+    /// everything about *what* (the patch, the job) is here, once, so a
+    /// button and a keypress cannot stage different bytes. The optional armer
+    /// carries the keyboard's row for the discard ask-twice; `None` (the
+    /// strip never discards) counts as already armed and runs.
+    fn submit_hunk_patch(
+        &mut self,
+        command: &str,
+        path: &str,
+        hunk: &gitten_core::Hunk,
+        cx: &mut Context<Self>,
+        arm: Option<(Entity<views::diff::Diff>, (u16, u32))>,
+    ) {
+        let Some(writes) = self.writes() else {
+            self.set_notice("no repository is open");
+            return;
+        };
+        // A hunk whose every line is an addition *looks* like a creation —
+        // but only status knows whether it is one. Absence of old line
+        // numbers is not evidence: at `[diff] context = 0` a mid-file
+        // addition to a tracked modified file carries no old numbers either,
+        // and refusing it here would claim "adds a new file" over work that
+        // is merely new rows. So ask the same read the files pane draws from,
+        // and only for hunks that could be creations — every other shape
+        // pays nothing. An untracked path keeps the refusal that names the
+        // pane serving whole-file verbs; anything else synthesizes normally,
+        // and if the patch still cannot land, git's own refusal says why.
+        let creation = !hunk.lines.iter().any(|l| l.old_no.is_some())
+            && writes
+                .repo
+                .status()
+                .map(|s| {
+                    s.untracked
+                        .iter()
+                        .any(|e| e.path.as_bytes() == path.as_bytes())
+                })
+                // A status that cannot be read is not evidence of a
+                // creation: send the patch and let git answer it.
+                .unwrap_or(false);
+        if creation {
+            self.set_notice(match command {
+                "diff.stage-hunk" | "diff.unstage-hunk" => {
+                    "that hunk adds a new file — stage or unstage it whole from the files pane"
+                }
+                _ => "that hunk creates the file — discard it whole from the files pane",
+            });
+            return;
+        }
+        // DESTRUCTIVE asks twice, on the same spot — after the refusal
+        // above, so the question is only ever asked where it can be spent.
+        if command == "diff.discard-hunk" {
+            let armed = match &arm {
+                Some((view, row)) => view.update(cx, |d, _| d.confirm_or_arm_discard_hunk(*row)),
+                None => true,
+            };
+            if !armed {
+                self.set_question(format!(
+                    "discard this hunk of {path}? press again to confirm"
+                ));
+                return;
+            }
+            self.notice = None; // the question is spent; the running band speaks next
+        }
+        let patch = gitten_core::patch::emit(path, &[hunk]);
+        let built = match command {
+            "diff.stage-hunk" => gitten_app::verbs::Write::stage_patch(&writes.repo, patch),
+            "diff.unstage-hunk" => gitten_app::verbs::Write::unstage_patch(&writes.repo, patch),
+            _ => gitten_app::verbs::Write::discard_patch(&writes.repo, patch),
+        };
+        match built {
+            Ok(job) => {
+                if !writes.send(Box::new(job)) {
+                    self.set_notice("the job queue is shutting down");
+                }
+            }
+            Err(e) => self.set_notice(e),
+        }
+    }
+
+    /// The workspace hunk strip's verb: stage (or unstage) one hunk of the
+    /// file the center shows, addressed by the button's row — never the
+    /// keyboard's. The side on screen decides the verb through the same
+    /// preview key the center loaded from: a staged twin unstages, every
+    /// other side stages. Untracked files keep the whole-file refusal, and
+    /// git's own refusal still says why — all through
+    /// [`DevShell::submit_hunk_patch`], the keyboard's own tail.
+    fn workspace_stage_hunk(&mut self, path: String, hunk_no: usize, cx: &mut Context<Self>) {
+        let Some(center) = self.workspace.center.clone() else {
+            return;
+        };
+        // The strip and the preview must agree: a button for a file the
+        // center has since left would stage bytes nobody is looking at.
+        let staged_side = match &self.workspace.last {
+            Some((section, previewed, _)) if previewed.as_bytes() == path.as_bytes() => {
+                matches!(section, views::files::Section::Staged)
+            }
+            _ => {
+                self.set_notice("the preview moved under the hunk strip");
+                return;
+            }
+        };
+        let Some(hunk) = center.read(cx).hunk_content(&path, hunk_no) else {
+            self.set_notice("that hunk is gone — the file changed under the strip");
+            return;
+        };
+        // Staging moves the sides, so the preview re-aims the way the
+        // dispatch tail re-aims it after every keyboard verb.
+        self.submit_hunk_patch(
+            match staged_side {
+                true => "diff.unstage-hunk",
+                false => "diff.stage-hunk",
+            },
+            &path,
+            &hunk,
+            cx,
+            None,
+        );
+        self.sync_workspace_preview(cx);
+    }
+
+    /// `files.stash`: park what the tracked working tree holds on the stash
+    /// stack and start again from HEAD. No message tonight — the entry gets
+    /// git's own `WIP on …`, which is honest about what it was; a prompt for
+    /// one is future work. Nothing here reads the pane: parking addresses the
+    /// repository, whatever pane the key was pressed over.
+    fn stash_working_tree(&mut self, cx: &mut Context<Self>) {
+        let mut client = WindowActs { shell: self, cx };
+        gitten_app::act::stash_working_tree(&mut client);
+    }
+
+    // ---------------------------------------------------- the branch verbs
+
+    /// `commits.reset-soft` / `commits.reset-mixed` / `commits.reset-hard`:
+    /// move the branch onto the commit the keyboard is on. The target goes
+    /// through [`Commits::current`] — the sha under the keyboard, wherever
+    /// filtering left it — never a row index.
+    ///
+    /// Every strength asks twice, and asks exactly as `files.discard` does:
+    /// first press arms the row and says so in the band, any cursor move,
+    /// wheel or refresh disarms, second press on the same commit builds the
+    /// job. Soft and mixed destroy nothing — every abandoned commit stays in
+    /// the reflog — but "recoverable" is a promise to someone who knows where
+    /// the reflog is, and the keypress gives no hint it moved history at all.
+    /// A commit list that silently loses its top rows reads as data loss no
+    /// matter what the reflog knows, so the question is asked in the band
+    /// where the eyes are.
+    /// `commits.reset-menu`: open the reset question on the selected commit.
+    /// The question is the pane's armed slot; the band names the three
+    /// answers, `esc` drops it, and the answering command spends it.
+    /// Asking while one already stands closes it.
+    fn reset_menu(&mut self, cx: &mut Context<Self>) {
+        let Some(Screen::Commits { view, .. }) = self.active() else {
+            self.set_notice("commits.reset-menu is not supported here");
+            return;
+        };
+        let view = view.clone();
+        let host = config::host(cx);
+        view.update(cx, |v, _| v.reconcile(&host));
+        let Some(commit) = view.read(cx).current().cloned() else {
+            self.set_notice("nothing selected to reset to");
+            return;
+        };
+        if view.update(cx, |v, _| v.confirm_or_arm_reset(&commit.sha)) {
+            // The question was standing and this press spent it.
+            self.set_notice("reset cancelled");
+            return;
+        }
+        self.set_question(Self::reset_question(&commit));
+    }
+
+    /// The band's sentence for a standing reset question: the target and
+    /// the three answers, each named as the Commands entry that runs it —
+    /// the band is `dim`, and the names are read, not hunted.
+    fn reset_question(commit: &Commit) -> String {
+        format!(
+            "reset to {}? Commands: soft · mixed · hard · esc cancels",
+            commit.short
+        )
+    }
+
+    fn reset_selected(&mut self, command: &str, cx: &mut Context<Self>) {
+        let Some(Screen::Commits { view, .. }) = self.active() else {
+            self.set_notice(format!("{command} is not supported here"));
+            return;
+        };
+        let view = view.clone();
+        let host = config::host(cx);
+        // Meet the list where it actually is, like open-diff: a scrollbar
+        // drag moved the offset without moving the cursor.
+        view.update(cx, |v, _| v.reconcile(&host));
+        let Some(commit) = view.read(cx).current().cloned() else {
+            self.set_notice("nothing selected to reset to");
+            return;
+        };
+        let Some(writes) = self.writes() else {
+            self.set_notice("a fixture has no repository to reset in");
+            return;
+        };
+        let mode = match command {
+            "commits.reset-soft" => ResetMode::Soft,
+            "commits.reset-mixed" => ResetMode::Mixed,
+            _ => ResetMode::Hard,
+        };
+        // An answering command spends a standing question and does nothing
+        // else. The check is *before* any arming — the arm is the menu
+        // command's to set, and an answer that opened a question by itself
+        // would be two presses deciding a hard reset.
+        if !view.read(cx).armed() {
+            self.set_notice("no reset is being asked — run commits.reset-menu from Commands");
+            return;
+        }
+        if !view.update(cx, |v, _| v.confirm_or_arm_reset(&commit.sha)) {
+            // Armed on a different commit — the cursor moved since `g`
+            // without a command running to drop the arm. The row moved; the
+            // question asks again rather than landing on the wrong sha.
+            self.set_question(Self::reset_question(&commit));
+            return;
+        }
+        self.notice = None; // the question is spent; the running band speaks next
+        let job =
+            gitten_app::verbs::Write::reset(&writes.repo, mode, commit.sha.clone().into_bytes());
+        if !writes.send(Box::new(job)) {
+            self.set_notice("the job queue is shutting down");
+        }
+    }
+
+    /// `commits.revert`: land the inverse of the commit the keyboard is on
+    /// as a new commit. Nothing existing moves or is destroyed — dropping
+    /// the result undoes the undo — so there is no confirmation dance; a
+    /// conflicted revert refuses with git's own words and leaves its
+    /// question in the working tree.
+    fn revert_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(Screen::Commits { view, .. }) = self.active() else {
+            self.set_notice("commits.revert is not supported here");
+            return;
+        };
+        let view = view.clone();
+        let host = config::host(cx);
+        view.update(cx, |v, _| v.reconcile(&host));
+        let Some(commit) = view.read(cx).current().cloned() else {
+            self.set_notice("nothing selected to revert");
+            return;
+        };
+        let Some(writes) = self.writes() else {
+            self.set_notice("a fixture has no repository to revert in");
+            return;
+        };
+        let job = gitten_app::verbs::Write::revert(&writes.repo, commit.sha.into_bytes());
+        if !writes.send(Box::new(job)) {
+            self.set_notice("the job queue is shutting down");
+        }
+    }
+
+    /// `commits.cherry-pick`: apply the commit under the keyboard onto the
+    /// current branch as a new commit. Nothing existing moves and the
+    /// original stays where it is — dropping the copy undoes the pick — so
+    /// there is no confirmation dance; a conflicted pick refuses with git's
+    /// own words and leaves its question in the working tree, found by the
+    /// re-acquire every finish schedules.
+    ///
+    /// Detached HEAD refuses here rather than in git's sentence: a pick
+    /// lands on *the current branch*, and the reader aimed at a row of
+    /// history, so the honest answer names where the result would have gone.
+    fn cherry_pick_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(Screen::Commits { view, .. }) = self.active() else {
+            self.set_notice("commits.cherry-pick is not supported here");
+            return;
+        };
+        let view = view.clone();
+        let host = config::host(cx);
+        // Meet the list where it actually is, like every verb above: a
+        // scrollbar drag moved the offset without moving the cursor.
+        view.update(cx, |v, _| v.reconcile(&host));
+        let Some(commit) = view.read(cx).current().cloned() else {
+            self.set_notice("nothing selected to cherry-pick");
+            return;
+        };
+        let Some(writes) = self.writes() else {
+            self.set_notice("a fixture has no repository to cherry-pick in");
+            return;
+        };
+        use gitten_core::refs::HeadState;
+        match writes.repo.head() {
+            Ok(HeadState::Branch { .. }) => {}
+            Ok(HeadState::Detached { .. }) => {
+                self.set_notice("HEAD is detached here; a cherry-pick needs a branch to land on");
+                return;
+            }
+            Err(e) => {
+                self.set_notice(e);
+                return;
+            }
+        }
+        let job = gitten_app::verbs::Write::cherry_pick(&writes.repo, commit.sha.into_bytes());
+        if !writes.send(Box::new(job)) {
+            self.set_notice("the job queue is shutting down");
+        }
+    }
+
+    /// `commits.squash-up` / `commits.fixup-up` / `commits.drop-commit`:
+    /// rewrite the branch with the commit under the keyboard folded into
+    /// its parent or gone entirely.
+    ///
+    /// The plan is composed over the same window of history the pane drew —
+    /// [`gitten_core::rebase::compose`] refuses anything it cannot cover
+    /// whole: merges (a rebase would flatten them), side commits
+    /// interleaved into the window (a wholesale plan would drop their
+    /// changes), a root under the keyboard. Those refusals arrive here as
+    /// sentences instead of jobs.
+    ///
+    /// All three rewrite history — commits leave the branch, recoverable
+    /// only through the reflog — so each asks twice, exactly as reset-hard
+    /// does: first press arms the row and says so, any cursor move, wheel
+    /// or refresh disarms, second press on the same commit builds the job.
+    fn rewrite_selected(&mut self, command: &str, cx: &mut Context<Self>) {
+        use gitten_core::rebase::{compose, Rewrite};
+        let kind = match command {
+            "commits.squash-up" => Rewrite::SquashUp,
+            "commits.fixup-up" => Rewrite::FixupUp,
+            _ => Rewrite::Drop,
+        };
+        let Some(Screen::Commits { view, .. }) = self.active() else {
+            self.set_notice(format!("{command} is not supported here"));
+            return;
+        };
+        let view = view.clone();
+        let host = config::host(cx);
+        // Meet the list where it actually is, like every verb above: a
+        // scrollbar drag moved the offset without moving the cursor.
+        view.update(cx, |v, _| v.reconcile(&host));
+        let Some(commit) = view.read(cx).current().cloned() else {
+            self.set_notice("nothing selected to rewrite");
+            return;
+        };
+        let Some(writes) = self.writes() else {
+            self.set_notice("a fixture has no repository to rewrite");
+            return;
+        };
+        if !view.update(cx, |v, _| v.confirm_or_arm_rewrite(&commit.sha)) {
+            let asked = match kind {
+                Rewrite::SquashUp => format!(
+                    "squash {} into its parent? press again to confirm",
+                    commit.short
+                ),
+                Rewrite::FixupUp => format!(
+                    "fixup {} into its parent? press again to confirm",
+                    commit.short
+                ),
+                Rewrite::Drop => format!("drop {}? press again to confirm", commit.short),
+            };
+            self.set_question(asked);
+            return;
+        }
+        self.notice = None; // the question is spent; the running band speaks next
+
+        // The same window acquisition loaded the pane from; composing over
+        // less would be composing over a lie.
+        const LOG_WINDOW: usize = 5000;
+        let history = match writes.repo.log(LOG_WINDOW) {
+            Ok(history) => history,
+            Err(e) => {
+                self.set_notice(e);
+                return;
+            }
+        };
+        let index = history.iter().position(|c| c.sha == commit.sha);
+        let (upstream, script) = match index.map(|i| compose(kind, &history, i)) {
+            Some(Ok(composed)) => composed,
+            Some(Err(reason)) => {
+                self.set_notice(reason);
+                return;
+            }
+            None => {
+                self.set_notice(format!(
+                    "{} is older than the {} commits loaded, so a plan built \
+                     from this window could not be complete",
+                    commit.short, LOG_WINDOW
+                ));
+                return;
+            }
+        };
+        let job = gitten_app::verbs::Write::rebase_todo(&writes.repo, upstream, script);
+        if !writes.send(Box::new(job)) {
+            self.set_notice("the job queue is shutting down");
+        }
+    }
+
+    /// `rebase.abort` / `rebase.continue`: drive the rebase git is holding
+    /// mid-flight. Abort puts branch, index and working tree back where the
+    /// rewrite started; continue carries it onward once a human has
+    /// resolved whatever stopped it — and a further conflict comes back
+    /// refused in git's words with the state standing, ready to drive again.
+    /// Neither reads a pane and neither asks twice: both only ever mean
+    /// something while a stranded state exists, and git answers "no rebase
+    /// in progress" verbatim when there is none.
+    fn rebase_abort_command(&mut self, _cx: &mut Context<Self>) {
+        let Some(writes) = self.writes() else {
+            self.set_notice("a fixture has no repository to abort in");
+            return;
+        };
+        if !writes.send(Box::new(gitten_app::verbs::Write::rebase_abort(
+            &writes.repo,
+        ))) {
+            self.set_notice("the job queue is shutting down");
+        }
+    }
+
+    fn rebase_continue_command(&mut self, _cx: &mut Context<Self>) {
+        let Some(writes) = self.writes() else {
+            self.set_notice("a fixture has no repository to continue in");
+            return;
+        };
+        if !writes.send(Box::new(gitten_app::verbs::Write::rebase_continue(
+            &writes.repo,
+        ))) {
+            self.set_notice("the job queue is shutting down");
+        }
+    }
+
+    /// `commits.cherry-pick-abort` / `commits.cherry-pick-continue`: drive
+    /// the cherry-pick git is holding mid-flight — the same door as
+    /// rebase.abort / rebase.continue, on its own names. Rebase's capitals
+    /// answer a *rebase* state; run over `CHERRY_PICK_HEAD` they come back
+    /// "no rebase in progress", true and useless. Abort puts branch, index
+    /// and working tree back where the pick started; continue carries it
+    /// onward once conflicts are resolved, a further conflict refused in
+    /// git's words with the state standing.
+    fn cherry_pick_abort_command(&mut self, _cx: &mut Context<Self>) {
+        let Some(writes) = self.writes() else {
+            self.set_notice("a fixture has no repository to abort in");
+            return;
+        };
+        if !writes.send(Box::new(gitten_app::verbs::Write::cherry_pick_abort(
+            &writes.repo,
+        ))) {
+            self.set_notice("the job queue is shutting down");
+        }
+    }
+
+    fn cherry_pick_continue_command(&mut self, _cx: &mut Context<Self>) {
+        let Some(writes) = self.writes() else {
+            self.set_notice("a fixture has no repository to continue in");
+            return;
+        };
+        if !writes.send(Box::new(gitten_app::verbs::Write::cherry_pick_continue(
+            &writes.repo,
+        ))) {
+            self.set_notice("the job queue is shutting down");
+        }
+    }
+
+    /// `commits.rebase-onto`: move the branch HEAD is on onto the row the
+    /// keyboard is on — plain rebase, no plan, on the same terms as every
+    /// other write: a dirty tree is git's refusal verbatim, a conflict
+    /// leaves its state standing for [`Write::rebase_abort`] to undo.
+    ///
+    /// The key lives in [branches], because that is where the thing aimed at
+    /// lives — lazygit keeps its rebase key there too. Rewrites this
+    /// branch's own commits, so it asks twice like the fold verbs do.
+    fn rebase_branch_selected(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.active(), Some(Screen::Branches { .. })) {
+            self.set_notice("commits.rebase-onto is not supported here");
+            return;
+        }
+        let Some(target) = self.branches_target(cx) else {
+            self.set_notice("nothing selected to rebase onto");
+            return;
+        };
+        let shown = match &target {
+            views::branches::Target::Local(name) => name.to_string_lossy().into_owned(),
+            views::branches::Target::Remote { remote, branch } => {
+                format!("{}/{}", remote.to_string_lossy(), branch.to_string_lossy())
+            }
+            views::branches::Target::Detached => String::from("(detached)"),
+        };
+        let Some(Screen::Branches { view, .. }) = self.active() else {
+            unreachable!("checked above");
+        };
+        if matches!(target, views::branches::Target::Detached) {
+            self.set_notice("HEAD is detached here; check out a branch first");
+            return;
+        }
+        let Some(writes) = self.writes() else {
+            self.set_notice("a fixture has no repository to rebase in");
+            return;
+        };
+        if !view.update(cx, |b, _| b.confirm_or_arm_rebase(&target)) {
+            self.set_question(format!(
+                "rebase this branch onto {shown}? press again to confirm"
+            ));
+            return;
+        }
+        self.notice = None; // the question is spent; the running band speaks next
+        let upstream = match target {
+            views::branches::Target::Local(name) => name.as_bytes().to_vec(),
+            views::branches::Target::Remote { remote, branch } => {
+                // The full refname git resolves, joined from the halves the
+                // model keeps apart because either may hold a slash.
+                let mut full = remote.as_bytes().to_vec();
+                full.push(b'/');
+                full.extend_from_slice(branch.as_bytes());
+                full
+            }
+            views::branches::Target::Detached => unreachable!("refused above"),
+        };
+        let job = gitten_app::verbs::Write::rebase_onto(&writes.repo, upstream);
+        if !writes.send(Box::new(job)) {
+            self.set_notice("the job queue is shutting down");
+        }
+    }
+
+    // ---------------------------------------------------- the branch verbs
+
+    /// The focused branches pane's target — what the keyboard is on, as
+    /// verbs aim at it. `None` when the pane is not up at all.
+    fn branches_target(&self, cx: &App) -> Option<views::branches::Target> {
+        match self.active() {
+            Some(Screen::Branches { view, .. }) => view.read(cx).current(),
+            _ => None,
+        }
+    }
+
+    /// `branches.checkout`: move HEAD onto the row the keyboard is on.
+    ///
+    /// A remote-tracking row checks out too, and detaches onto the fetched
+    /// commit — git's own answer to "look at what the server has", and the
+    /// reason [`views::branches::Target`] carries remotes at all. The one
+    /// refusal said here is the detached row itself: already a place, not a
+    /// branch to move to. Everything else — dirty tree, unknown name — is
+    /// git's sentence, surfaced verbatim by the job.
+    fn checkout_branch(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.active(), Some(Screen::Branches { .. })) {
+            self.set_notice("branches.checkout is not supported here");
+            return;
+        }
+        let Some(target) = self.branches_target(cx) else {
+            self.set_notice("nothing selected to check out");
+            return;
+        };
+        if matches!(target, views::branches::Target::Detached) {
+            self.set_notice("HEAD is already detached here");
+            return;
+        }
+        let Some(writes) = self.writes() else {
+            self.set_notice("a fixture has no repository to check out in");
+            return;
+        };
+        let name = match target {
+            views::branches::Target::Local(name) => name,
+            views::branches::Target::Remote { remote, branch } => {
+                // The full refname git resolves: `origin/main`, joined from
+                // the halves the model keeps apart because either may hold
+                // a slash.
+                let mut full = remote.as_bytes().to_vec();
+                full.push(b'/');
+                full.extend_from_slice(branch.as_bytes());
+                gitten_core::status::PathBytes::from_bytes(&full)
+            }
+            views::branches::Target::Detached => unreachable!("refused above"),
+        };
+        let job = gitten_app::verbs::Write::checkout(&writes.repo, name.as_bytes().to_vec());
+        if !writes.send(Box::new(job)) {
+            self.set_notice("the job queue is shutting down");
+        }
+    }
+
+    /// `repo.push` / `repo.pull` / `repo.fetch`: the repository's sync verbs.
+    /// No row is read and none is needed — pull lets git resolve the current
+    /// branch's own upstream, fetch takes every remote, and push's aiming is
+    /// [`Write::push_current`](gitten_app::verbs::Write::push_current)'s,
+    /// whose refusals arrive here as sentences instead of jobs.
+    fn sync_remote(&mut self, command: &str, _cx: &mut Context<Self>) {
+        let Some(writes) = self.writes() else {
+            self.set_notice("a fixture has no repository to sync");
+            return;
+        };
+        let job = match command {
+            "repo.pull" => gitten_app::verbs::Write::pull(&writes.repo),
+            "repo.fetch" => gitten_app::verbs::Write::fetch(&writes.repo, None),
+            _ => match gitten_app::verbs::Write::push_current(&writes.repo) {
+                Ok(job) => job,
+                Err(reason) => {
+                    self.set_notice(reason);
+                    return;
+                }
+            },
+        };
+        if !writes.send(Box::new(job)) {
+            self.set_notice("the job queue is shutting down");
+        }
+    }
+
+    /// `stashes.apply` / `stashes.pop` / `stashes.drop`: act on the row the
+    /// keyboard is on, addressed by its index — which is also why only the
+    /// drop asks twice. Apply and pop are recoverable in every direction that
+    /// matters (a kept entry, an apply that refused); a drop is final, so it
+    /// arms like a discard and any cursor move, wheel or refresh disarms it —
+    /// after a drop the numbers shift, and a yes aimed at yesterday's
+    /// numbering is exactly the accident the double press exists to prevent.
+    fn stash_selected(&mut self, command: &str, cx: &mut Context<Self>) {
+        let Some(Screen::Stashes { view, .. }) = self.active() else {
+            self.set_notice(format!("{command} is not supported here"));
+            return;
+        };
+        let under = view
+            .read(cx)
+            .current()
+            .map(|r| (r.index, r.title.to_string()));
+        let Some((index, shown)) = under else {
+            self.set_notice("nothing selected on the stash stack");
+            return;
+        };
+        let Some(writes) = self.writes() else {
+            self.set_notice("a fixture has no stash stack to act on");
+            return;
+        };
+        if command == "stashes.drop" && !view.update(cx, |s, _| s.confirm_or_arm_drop(index)) {
+            // First press on this row: asked, not acted.
+            self.set_question(views::stashes::drop_question(&shown));
+            return;
+        }
+        if command == "stashes.drop" {
+            self.notice = None; // the question is spent; the running band speaks next
+        }
+        let job = match command {
+            "stashes.apply" => gitten_app::verbs::Write::stash_apply(&writes.repo, index),
+            "stashes.pop" => gitten_app::verbs::Write::stash_pop(&writes.repo, index),
+            _ => gitten_app::verbs::Write::stash_drop(&writes.repo, index),
+        };
+        if !writes.send(Box::new(job)) {
+            self.set_notice("the job queue is shutting down");
+        }
+    }
+
+    /// `branches.new`: gather a name over the pane; accept creates at HEAD.
+    /// Creating never checks out — HEAD stays where it was, which is why
+    /// this needs no confirmation dance.
+    fn begin_branch_new(&mut self, cx: &mut Context<Self>) {
+        self.begin_branch_prompt(BranchPrompt::New, "branch name", "", cx);
+    }
+
+    /// `commits.new-branch`: the branches pane's own field, aimed one pane
+    /// over — the branch grows from the commit under the keyboard, whose sha
+    /// is captured at open time like a tag's. Same pane guard, said the same
+    /// way: a verb is its pane's, and the sentence names it.
+    fn begin_commit_branch_prompt(&mut self, cx: &mut Context<Self>) {
+        let Some(Screen::Commits { view, .. }) = self.active() else {
+            self.set_notice("commits.new-branch is not supported here");
+            return;
+        };
+        let host = config::host(cx);
+        view.update(cx, |v, _| v.reconcile(&host));
+        let Some(commit) = view.read(cx).current().cloned() else {
+            self.set_notice("nothing selected to branch from");
+            return;
+        };
+        if self.writes().is_none() {
+            self.set_notice("a fixture has no repository to create branches in");
+            return;
+        }
+        self.begin_named_branch_prompt(
+            BranchPrompt::NewAt { start: commit.sha },
+            "new branch from commit",
+            cx,
+        );
+    }
+
+    /// Opens the shared field for a [`BranchPrompt`] over *this* pane,
+    /// whichever kind it is — the branches variant pins the guard to its own
+    /// pane; this one trusts the caller, who has already checked.
+    fn begin_named_branch_prompt(
+        &mut self,
+        what: BranchPrompt,
+        label: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if self.repo.is_none() {
+            self.set_notice("a fixture has no repository to create branches in");
+            return;
+        }
+        let input = cx.new(|cx| input::Input::new(label, "branch name", "", cx));
+        self.open_input(input, cx);
+        // After `open_input`, which may have cancelled a previous prompt.
+        self.prompt = Some(Prompt::BranchName {
+            target: self.panes.focused_name().to_string(),
+            what,
+        });
+    }
+
+    /// `branches.new-tag`: the commits pane's tag field, aimed at the branch
+    /// row. The tag's target is the branch *name* — a revspec git resolves
+    /// the same way it resolves a sha — so no commit read rides along, and
+    /// the tag moves with the branch the way a branch-shaped tag should.
+    fn begin_branch_tag_prompt(&mut self, cx: &mut Context<Self>) {
+        let Some(views::branches::Target::Local(name)) = self.branches_target(cx) else {
+            self.set_notice("only a local branch can be tagged here");
+            return;
+        };
+        if self.writes().is_none() {
+            self.set_notice("a fixture has no repository to tag in");
+            return;
+        }
+        let shown = name.to_string_lossy().into_owned();
+        let input = cx.new(|cx| input::Input::new("new tag", "tag name", "", cx));
+        self.open_input(input, cx);
+        // After `open_input`, which may have cancelled a previous prompt.
+        self.prompt = Some(Prompt::TagName {
+            target: self.panes.focused_name().to_string(),
+            at: shown,
+        });
+    }
+
+    /// `commits.checkout`: detach onto the commit under the keyboard,
+    /// lazygit's space. Not asked twice — nothing is destroyed, HEAD's old
+    /// branch keeps its name and the branches pane's space walks back — and
+    /// refused over a fixture like every write, by the absence of rails.
+    fn checkout_commit(&mut self, cx: &mut Context<Self>) {
+        let Some(Screen::Commits { view, .. }) = self.active() else {
+            self.set_notice("commits.checkout is not supported here");
+            return;
+        };
+        let host = config::host(cx);
+        view.update(cx, |v, _| v.reconcile(&host));
+        let Some(commit) = view.read(cx).current().cloned() else {
+            self.set_notice("nothing selected to check out");
+            return;
+        };
+        let Some(writes) = self.writes() else {
+            self.set_notice("a fixture has no repository to check out in");
+            return;
+        };
+        let job = gitten_app::verbs::Write::checkout(&writes.repo, commit.sha.clone().into_bytes());
+        if !writes.send(Box::new(job)) {
+            self.set_notice("the job queue is shutting down");
+        }
+    }
+
+    /// `branches.rename`: the same field, pre-filled with the row's own
+    /// name — editing what is there beats retyping it, and accepting
+    /// unchanged text answers with git's "already exists", which says more
+    /// than a client-side veto would.
+    fn begin_branch_rename(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.active(), Some(Screen::Branches { .. })) {
+            self.set_notice("branches.rename is not supported here");
+            return;
+        }
+        let Some(views::branches::Target::Local(name)) = self.branches_target(cx) else {
+            self.set_notice("only a local branch can be renamed");
+            return;
+        };
+        // Pre-fill only when the bytes *are* text. A legal Latin-1 name
+        // decodes lossily into something with U+FFFD in it — a different
+        // name than the branch has — and accepting the field unchanged
+        // would then rename the branch to its own mojibake. The bytes are
+        // carried in the prompt regardless; an empty field is the honest
+        // shape for a name this field cannot show.
+        let initial = std::str::from_utf8(name.as_bytes()).unwrap_or("");
+        self.begin_branch_prompt(
+            BranchPrompt::Rename {
+                from: name.as_bytes().to_vec(),
+            },
+            "rename branch",
+            initial,
+            cx,
+        );
+    }
+
+    /// Opens the shared field for a [`BranchPrompt`]. The slot carries the
+    /// pane registration name so the answer routes back to its pane, the
+    /// same promise `/` keeps.
+    fn begin_branch_prompt(
+        &mut self,
+        what: BranchPrompt,
+        label: &str,
+        initial: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if !matches!(self.active(), Some(Screen::Branches { .. })) {
+            self.set_notice("this command belongs to the branches pane");
+            return;
+        }
+        if self.repo.is_none() {
+            self.set_notice("a fixture has no repository to create branches in");
+            return;
+        }
+        let input = cx.new(|cx| {
+            let mut input = input::Input::new(label, "branch name", initial, cx);
+            // A pre-filled name arrives selected: typing replaces it, which
+            // is what a rename wants — editing beats retyping, but keeping
+            // the old name glued to the front of whatever was typed serves
+            // nobody.
+            if !initial.is_empty() {
+                input.select_all_text(true, cx);
+            }
+            input
+        });
+        self.open_input(input, cx);
+        // After `open_input`, which may have cancelled a previous prompt.
+        self.prompt = Some(Prompt::BranchName {
+            target: self.panes.focused_name().to_string(),
+            what,
+        });
+    }
+
+    /// The accepted branch name, as a job. Empty refused again here — the
+    /// trait refuses it too, but saying so beside the field that just closed
+    /// beats making the reader find out twice.
+    fn branch_named(&mut self, target: &str, what: BranchPrompt, text: String) {
+        if text.trim().is_empty() {
+            self.set_notice("a branch needs a name");
+            return;
+        }
+        if self.panes.position(target).is_none() {
+            self.set_notice("the pane the branch was asked over is gone");
+            return;
+        }
+        let Some(writes) = self.writes() else {
+            self.set_notice("a fixture has no repository to create branches in");
+            return;
+        };
+        let job = match what {
+            BranchPrompt::New => {
+                gitten_app::verbs::Write::create_branch(&writes.repo, text.into_bytes(), None)
+            }
+            BranchPrompt::NewAt { start } => gitten_app::verbs::Write::create_branch(
+                &writes.repo,
+                text.into_bytes(),
+                Some(start.into_bytes()),
+            ),
+            BranchPrompt::Rename { from } => {
+                gitten_app::verbs::Write::rename_branch(&writes.repo, from, text.into_bytes())
+            }
+        };
+        if !writes.send(Box::new(job)) {
+            self.set_notice("the job queue is shutting down");
+        }
+    }
+
+    /// `commits.new-tag`: gather a name over the pane; accept names the
+    /// commit under the keyboard. The sha is captured when the field opens,
+    /// so nothing a cursor does while the field holds the keyboard can
+    /// re-aim the tag.
+    ///
+    /// Tonight's tag is lightweight: the shared field gathers a name and
+    /// nothing else, and an annotated tag wants a message field — a second
+    /// prompt away, not invented here ahead of a pane that asks for it.
+    fn begin_tag_prompt(&mut self, cx: &mut Context<Self>) {
+        let Some(Screen::Commits { view, .. }) = self.active() else {
+            self.set_notice("commits.new-tag is not supported here");
+            return;
+        };
+        let host = config::host(cx);
+        // Meet the list where its last drag left it, like every verb above.
+        view.update(cx, |v, _| v.reconcile(&host));
+        let Some(commit) = view.read(cx).current().cloned() else {
+            self.set_notice("nothing selected to tag");
+            return;
+        };
+        if self.writes().is_none() {
+            self.set_notice("a fixture has no repository to tag in");
+            return;
+        }
+        let input = cx.new(|cx| input::Input::new("new tag", "tag name", "", cx));
+        self.open_input(input, cx);
+        // After `open_input`, which may have cancelled a previous prompt.
+        self.prompt = Some(Prompt::TagName {
+            target: self.panes.focused_name().to_string(),
+            at: commit.sha,
+        });
+    }
+
+    /// The accepted tag name, as a job. Empty refused again here — the trait
+    /// refuses it too, but saying so beside the field that just closed beats
+    /// making the reader find out twice — and what is queued is the trimmed
+    /// text, because git would hold the padding as part of the name. A
+    /// duplicate rides on to git and comes back in its words ("tag 'v1'
+    /// already exists"), which says more than a client-side veto would.
+    fn tag_named(&mut self, target: &str, at: String, text: String) {
+        let name = text.trim();
+        if name.is_empty() {
+            self.set_notice("a tag needs a name");
+            return;
+        }
+        if self.panes.position(target).is_none() {
+            self.set_notice("the pane the tag was asked over is gone");
+            return;
+        }
+        let Some(writes) = self.writes() else {
+            self.set_notice("a fixture has no repository to tag in");
+            return;
+        };
+        let job = gitten_app::verbs::Write::create_tag(
+            &writes.repo,
+            name.as_bytes().to_vec(),
+            at.into_bytes(),
+            None,
+        );
+        if !writes.send(Box::new(job)) {
+            self.set_notice("the job queue is shutting down");
+        }
+    }
+
+    /// `branches.delete`: the destructive verb of this pane, confirmed on
+    /// the keyboard exactly as `files.discard` is. First press arms the row
+    /// and asks once in the band; second press on the same row deletes —
+    /// merged work only, because an unmerged branch comes back refused in
+    /// git's own words ("not fully merged") and that sentence is the force
+    /// decision's proper home, not tonight's keymap.
+    ///
+    /// Remote rows refuse outright, on purpose: a tracking ref is the
+    /// remote's shadow, and deleting it here would be a fetch's prune done
+    /// by hand under a key that reads as something stronger.
+    fn delete_branch_selected(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.active(), Some(Screen::Branches { .. })) {
+            self.set_notice("branches.delete is not supported here");
+            return;
+        }
+        // The desktop deliberately does not delete remote branches: a
+        // tracking ref is its remote's shadow, pruned by fetch. The TUI
+        // owns that verb (LG-075); this door keeps refusing it.
+        if matches!(
+            self.branches_target(cx),
+            Some(views::branches::Target::Remote { .. })
+        ) {
+            self.set_notice("a remote-tracking row is its remote's shadow, pruned by fetch");
+            return;
+        }
+        let mut client = WindowActs { shell: self, cx };
+        gitten_app::act::delete_branch(&mut client);
+    }
+
+    /// `*.search`: gather a query over the focused list pane — commits,
+    /// files, branches or stashes; the one verb every list answers.
+    ///
+    /// While the field is open every edit filters that pane's list live — the
+    /// subscription installed here forwards each [`input::Event::Edited`] to
+    /// [`DevShell::search_edited`] — so accept and cancel differ only in
+    /// whether the last edit stands. A second `/` finds the current query
+    /// already in the field, because the pane still holds it; an empty accept
+    /// is how a filter comes off.
+    ///
+    /// The target is the pane's registration name taken at open, not "the
+    /// focused screen" read again at close: a click can move focus while the
+    /// field holds the keyboard's *mode*, and the query belongs to the pane it
+    /// was typed over.
+    fn begin_search(&mut self, command: &str, cx: &mut Context<Self>) {
+        let initial = match self.active() {
+            Some(Screen::Commits { view, .. }) => {
+                view.read(cx).query().unwrap_or_default().to_string()
+            }
+            Some(Screen::Files { view, .. }) => {
+                view.read(cx).query().unwrap_or_default().to_string()
+            }
+            Some(Screen::Branches { view, .. }) => {
+                view.read(cx).query().unwrap_or_default().to_string()
+            }
+            Some(Screen::Stashes { view, .. }) => {
+                view.read(cx).query().unwrap_or_default().to_string()
+            }
+            _ => {
+                self.set_notice(format!("{command} is not supported here"));
+                return;
+            }
+        };
+        let target = self.panes.focused_name().to_string();
+        let input = cx.new(|cx| input::Input::new("search", "search", initial, cx));
+        self.open_input(input.clone(), cx);
+        // After `open_input`, which may have cancelled a previous prompt.
+        self.prompt = Some(Prompt::Search { target });
+        self.search_live = Some(cx.subscribe(&input, Self::search_edited));
+    }
+
+    /// One edit in an open search: into the pane, before the next frame. Runs
+    /// per keystroke and only while a search prompt lives — never per render.
+    fn search_edited(
+        &mut self,
+        _: Entity<input::Input>,
+        event: &input::Event,
+        cx: &mut Context<Self>,
+    ) {
+        let input::Event::Edited(text) = event else {
+            return;
+        };
+        let Some(Prompt::Search { target }) = &self.prompt else {
+            return;
+        };
+        if let Some(pane) = self.search_pane(target) {
+            // Meet the list where its last drag left it — the order
+            // `open_diff` and `copy` read in — before anchoring. Otherwise
+            // typing right after a scrollbar drag anchors to the cursor as it
+            // froze, not to the row now being looked at.
+            let host = config::host(cx);
+            pane.reconcile(&host, cx);
+            pane.apply(text, cx);
+            // Filtering re-anchors the cursor; when the anchor does not
+            // survive, the keyboard lands somewhere else — and only the
+            // commits pane's cursor is what the main view loads, so only
+            // there does the main view follow.
+            if matches!(pane, SearchPane::Commits(_)) {
+                self.sync_main_diff(cx);
+            }
+            cx.notify();
+        }
+    }
+
+    /// Accept or cancel of a search prompt: what the last edit left standing,
+    /// or its absence. Same routing as the live half, one last time.
+    fn finish_search(&mut self, target: &str, query: Option<String>, cx: &mut Context<Self>) {
+        let Some(pane) = self.search_pane(target) else {
+            return;
+        };
+        let query = query.unwrap_or_default();
+        pane.apply(&query, cx);
+        if matches!(pane, SearchPane::Commits(_)) {
+            self.sync_main_diff(cx);
+        }
+    }
+
+    /// The named pane's searchable screen, when that is what the name
+    /// registers: the one place search routing learns which screens answer. A
+    /// closed pane or a kind with no search answers nothing, quietly — the
+    /// prompt is closing anyway. The entities are cloned out, refcounts and
+    /// nothing more, so routing never holds a borrow across an update.
+    fn search_pane(&self, target: &str) -> Option<SearchPane> {
+        let at = self.panes.position(target)?;
+        match self.panes.iter().nth(at)? {
+            Screen::Commits { view, .. } => Some(SearchPane::Commits(view.clone())),
+            Screen::Files { view, .. } => Some(SearchPane::Files(view.clone())),
+            Screen::Branches { view, .. } => Some(SearchPane::Branches(view.clone())),
+            Screen::Stashes { view, .. } => Some(SearchPane::Stashes(view.clone())),
+            _ => None,
+        }
+    }
+
+    /// The one registration path built-ins and compiled-in extensions share.
+    #[allow(dead_code)]
+    fn register_pane(
+        &mut self,
+        name: impl Into<String>,
+        pane: impl Pane + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        self.panes.register(name, Screen::custom(pane));
+        cx.notify();
+    }
+
+    /// The one queue future built-ins and compiled-in extensions share.
+    #[allow(dead_code)]
+    fn submit(&self, job: Box<dyn Job>) -> Result<(), Box<dyn Job>> {
+        self.submitter.submit(job)
+    }
+
+    fn drain_jobs(&mut self, cx: &mut Context<Self>) {
+        let mut changed = false;
+        while let Some(event) = self.jobs.try_next() {
+            changed = true;
+            match event {
+                JobEvent::Started { name } => {
+                    self.running = Some((format!("running {name}"), Instant::now()));
+                    self.error = None;
+                    self.error_is_load = false;
+                    // The seconds will not tick by themselves — GPUI draws
+                    // nothing at rest — so a job that runs longer than a
+                    // heartbeat needs a notifier of its own. It dies with the
+                    // job: one tick past `running` going `None` at most.
+                    cx.spawn(async move |shell, cx| loop {
+                        cx.background_executor().timer(Duration::from_secs(1)).await;
+                        let live = shell.update(cx, |shell, cx| {
+                            if shell.running.is_some() {
+                                cx.notify();
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                        if !live.unwrap_or(false) {
+                            break;
+                        }
+                    })
+                    .detach();
+                }
+                JobEvent::Finished {
+                    outcome: Err(error),
+                    generation,
+                    name,
+                    ..
+                } => {
+                    self.running = None;
+                    // A refused commit keeps its draft standing: the words
+                    // stay filed for the retry beside git's verbatim error,
+                    // but the dialog must not stand over a finished job.
+                    if name == "commit" {
+                        self.pending_commit_key = None;
+                        self.commit_confirm = false;
+                    }
+                    self.error = Some(GitError::new(error));
+                    self.error_is_load = false;
+                    // A refusal is not proof the repository stood still: git
+                    // can answer nonzero with work already left behind, and
+                    // the conflicted revert is the case that proves it — its
+                    // unmerged paths sit in the index waiting for a human,
+                    // who cannot resolve what no pane shows. Nothing on this
+                    // queue reads, so every finish schedules the same
+                    // re-acquire wave a success does.
+                    if generation > self.generation {
+                        self.generation = generation;
+                        self.refresh_stale(cx);
+                    }
+                }
+                JobEvent::Finished {
+                    outcome: Ok(()),
+                    generation,
+                    done,
+                    name,
+                    ..
+                } => {
+                    self.running = None;
+                    // A clean commit finish spends its draft: exactly the
+                    // repository the job ran for, never the current one by
+                    // accident. The fields refill empty — `set_text` emits
+                    // nothing, so the refill never writes back into the
+                    // store it just cleared.
+                    if name == "commit" {
+                        let key = self.pending_commit_key.take().or_else(|| self.draft_key());
+                        if let Some(key) = key {
+                            self.drafts.remove(&key);
+                        }
+                        self.commit_confirm = false;
+                        if let Some(field) = self.workspace.summary.clone() {
+                            field.update(cx, |field, cx| field.set_text(String::new(), cx));
+                        }
+                        if let Some(field) = self.workspace.description.clone() {
+                            field.update(cx, |field, cx| field.set_text(String::new(), cx));
+                        }
+                    }
+                    // Sync recency for the status bar's leading segments: a
+                    // clean finish only. A refusal leaves the previous
+                    // recency standing beside the band's verbatim error —
+                    // stamping it would claim a push happened that did
+                    // not. `pull` fetches before it merges, so it stamps
+                    // the fetch side; `push …` names carry their remote
+                    // and branch, matched by prefix.
+                    if name == "pull" || name.starts_with("fetch") {
+                        self.last_fetch = Some(Instant::now());
+                    } else if name.starts_with("push ") {
+                        self.last_push = Some(Instant::now());
+                    }
+                    if generation > self.generation {
+                        self.generation = generation;
+                        self.refresh_stale(cx);
+                    }
+                    // A job that named its finish gets its sentence in this
+                    // band — the sync verbs' pushed/pulled/fetched. Said
+                    // once, beside the facts the refresh above puts back on
+                    // screen; the next key clears it like any other notice.
+                    if let Some(done) = done {
+                        // A write's finish is the band's own sentence: said
+                        // once, beside the facts the refresh puts back on
+                        // screen, and cleared by the next key like any other.
+                        self.notice = Some(Notice::Info(done));
+                    }
+                }
+            }
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+
+    fn refresh_stale(&mut self, cx: &mut Context<Self>) {
+        let Some((_, repo)) = self.repo.as_ref().cloned() else {
+            return;
+        };
+        self.invalidate_refresh();
+        let refresh_id = self.refresh_id;
+        let host = config::host(cx);
+        let target = self.generation;
+        let refreshes: Vec<Refresh> = self
+            .panes
+            .iter()
+            // The diff main view rides the same wave: a working-tree revspec
+            // in the main view is exactly as stale as any pane's after a
+            // write. Commit-sha sources pay one cheap no-op re-acquire.
+            .chain(std::iter::once(&self.main))
+            .filter_map(|screen| screen.refresh(target, &host, &self.over, repo.clone()))
+            .collect();
+        if refreshes.is_empty() {
+            return;
+        }
+
+        self.refresh_pending = refreshes.len();
+        self.refresh_error = None;
+        for refresh in refreshes {
+            let Refresh {
+                generation,
+                load,
+                apply,
+            } = refresh;
+            let loaded = cx.background_spawn(async move { load() });
+            cx.spawn(async move |shell, cx: &mut AsyncApp| {
+                let result = loaded.await;
+                _ = shell.update(cx, move |shell, cx| {
+                    let result = if refresh_id != shell.refresh_id || generation < shell.generation
+                    {
+                        Ok(())
+                    } else {
+                        result.and_then(|value| {
+                            let host = config::host(cx);
+                            apply(value, &host, cx)
+                        })
+                    };
+                    shell.finish_refresh(refresh_id, result, cx);
+                });
+            })
+            .detach();
+        }
+    }
+
+    fn finish_refresh(
+        &mut self,
+        refresh_id: u64,
+        result: Result<(), String>,
+        cx: &mut Context<Self>,
+    ) {
+        if refresh_id != self.refresh_id {
+            return;
+        }
+        if let Err(error) = result {
+            self.refresh_error.get_or_insert(error);
+        }
+        self.refresh_pending = self.refresh_pending.saturating_sub(1);
+        if self.refresh_pending == 0 {
+            if self.error.is_none() {
+                self.error = self.refresh_error.take().map(GitError::new);
+                self.error_is_load = self.error.is_some();
+            } else {
+                self.refresh_error = None;
+            }
+            // A repository switch saved its session row for this moment: the
+            // wave has landed, new rows are standing, and the cursor still
+            // sits where the old repository left it. Restored before the
+            // schedule below, so the main view loads the restored commit
+            // rather than row zero's.
+            if let Some(top) = self.pending_restore.take() {
+                self.restore_session_top(top, cx);
+            }
+            // The wave is a fresh load, and the overlay was built on the
+            // skeleton's: an empty list's "0 commits" and a zero total,
+            // which nothing else ever replaces — `reloaded` rides the
+            // rediff and layout paths, and neither runs here. The last
+            // apply has landed by now, so the refreshed view's own
+            // numbers are the ones the overlay should carry.
+            if let Some(Screen::Commits { view, .. }) = self.panes.get("commits") {
+                let v = view.read(cx);
+                let (load, total) = (v.load.clone(), v.total());
+                if let Some(stats) = &mut self.stats {
+                    stats.reloaded(load);
+                    stats.total_rows.set(total);
+                }
+            }
+        }
+        // A refresh may have re-anchored the commits cursor — the list it was
+        // on changed under it — which is a selection change as far as the
+        // main view is concerned.
+        self.sync_main_diff(cx);
+        // And a refresh re-lands the files cursor the same way: a staging
+        // write's wave carries the side that just moved, and the preview
+        // follows it without another keystroke.
+        self.sync_workspace_preview(cx);
+        cx.notify();
+    }
+
+    fn invalidate_refresh(&mut self) {
+        self.refresh_id = self.refresh_id.saturating_add(1);
+        self.refresh_pending = 0;
+        self.refresh_error = None;
+    }
+
+    /// One of the platform's menu actions: named dispatch through
+    /// [`DevShell::run_command`], with the pending chord cleared first — a menu
+    /// item is an intervening event, and a chord is a promise about what is on
+    /// screen that survives none of them.
+    fn native(&mut self, command: &str, cx: &mut Context<Self>) {
+        self.run_command(command, cx);
+    }
+
+    /// Re-acquires the diff under `next` and swaps it in.
+    ///
+    /// The whole cost is one acquisition plus one `prepare` — 40–120 ms and
+    /// 8–250 ms respectively, on a click. Cheap enough not to need a spinner and
+    /// not cheap enough to do on a keystroke repeat, which is why these are menus
+    /// and only the layout is bound to a key.
+    ///
+    /// The main view is the only diff there is, so this reads its revspec off
+    /// [`DevShell::main`] directly rather than off whatever holds the
+    /// keyboard: the settings panel acts on what the diff view describes.
+    fn set_overrides(&mut self, next: Overrides, cx: &mut Context<Self>) {
+        if next == self.over {
+            return;
+        }
+        if self.rediff_with(&next, cx) {
+            self.over = next;
+        }
+    }
+
+    /// Re-acquires the diff under the current overrides — what a context,
+    /// move-floor or indent-heuristic change runs after patching the live
+    /// host, where [`DevShell::set_overrides`] would early-return on an
+    /// unchanged `over`.
+    fn rediff_current(&mut self, cx: &mut Context<Self>) {
+        let over = self.over.clone();
+        self.rediff_with(&over, cx);
+    }
+
+    /// Re-acquires the diff under `over` and swaps it in. True when the new
+    /// rows are on screen — the caller stores the overrides it just applied.
+    fn rediff_with(&mut self, over: &Overrides, cx: &mut Context<Self>) -> bool {
+        let Some(rediff) = self.rediff.clone() else {
+            return false;
+        };
+        let Some(revision) = (match &self.main {
+            Screen::Diff { source, .. } => match source.borrow().as_ref() {
+                Some(Source::Repo { arg, .. }) => Some(arg.clone()),
+                _ => None,
+            },
+            _ => None,
+        }) else {
+            return false;
+        };
+        let host = config::host(cx);
+        match rediff(&host, over, &revision) {
+            Ok(files) => {
+                self.invalidate_refresh();
+                self.error = None;
+                self.error_is_load = false;
+                let Screen::Diff { view, .. } = &self.main else {
+                    return false;
+                };
+                let view = view.clone();
+                view.update(cx, |d, cx| d.replace(files, &host, cx));
+                let load = view.read(cx).load.clone();
+                if let Some(stats) = &mut self.stats {
+                    stats.reloaded(load);
+                }
+                cx.notify();
+                true
+            }
+            // The old rows stay on screen, which is the right failure: they are
+            // still a true diff, just not the one that was asked for.
+            Err(e) => {
+                self.error = Some(GitError::new(e));
+                self.error_is_load = true;
+                cx.notify();
+                false
+            }
+        }
+    }
+
+    /// Costs no re-diff and no `prepare` — only where the lines break moves —
+    /// which is why this one needs none of `set_overrides`' machinery.
+    fn set_wrap(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Screen::Diff { view, .. } = &self.main else {
+            return;
+        };
+        let view = view.clone();
+        let host = config::host(cx);
+        view.update(cx, |d, cx| d.set_wrap(index, &host, cx));
+        cx.notify();
+    }
+
+    fn set_layout(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Screen::Diff { view, .. } = &self.main else {
+            return;
+        };
+        let view = view.clone();
+        // A layout change is a fresh look at the same diff, so a message about
+        // an algorithm that failed to load is no longer describing the screen.
+        self.error = None;
+        self.error_is_load = false;
+        let host = config::host(cx);
+        view.update(cx, |d, cx| d.set_layout(index, &host, cx));
+        let load = view.read(cx).load.clone();
+        if let Some(stats) = &mut self.stats {
+            stats.reloaded(load);
+        }
+        cx.notify();
+    }
+
+    /// Swaps the whole palette, by name.
+    ///
+    /// Through [`config::reload`] and not by editing the host in place, because
+    /// there is no host to edit: it is an `Rc` every view is holding, replaced
+    /// wholesale precisely so nobody can see half a theme. So a pick is a
+    /// rebuild from the file with the pick applied on top — which is also what
+    /// makes it survive the next save, and what makes a colour in `gitten.toml`
+    /// still count after one.
+    fn set_theme(&mut self, name: String, cx: &mut Context<Self>) {
+        cx.set_global(config::Chosen(Some(name)));
+        for w in config::reload(&self.config, cx) {
+            eprintln!("gitten: {w}");
+        }
+        cx.notify();
+    }
+
+    /// `theme.cycle`. On the shell and not on a screen, because a palette is the
+    /// window's — the commit graph is drawn out of the same one.
+    fn cycle_theme(&mut self, cx: &mut Context<Self>) {
+        let host = config::host(cx);
+        let Some(next) = host.themes.after(&host.theme.name).map(|t| t.name.clone()) else {
+            return;
+        };
+        drop(host);
+        self.set_theme(next, cx);
+    }
+
+    /// The settings window's rows, spelled from the live state: the view's own
+    /// layout and wrap lists with their current indices, the *effective*
+    /// algorithm and whitespace — the live override where there is one, the
+    /// configured default otherwise — and everything else off the host. The
+    /// panel must agree with what is on screen rather than with the file.
+    fn settings_sections(&self, cx: &App) -> Vec<settings::Section> {
+        let host = config::host(cx);
+        // Both lists hand out `&'static str` — registry names, not borrows —
+        // so the rows can hold them without holding the view.
+        let (layouts, layout, wraps, wrap, from_repo) = match &self.main {
+            Screen::Diff { view, source, .. } => {
+                let cell = view.read(cx);
+                let out = (
+                    cell.layout_names(),
+                    cell.layout_index(),
+                    cell.wrap_names(&host),
+                    cell.wrap_index(),
+                );
+                let repo = self.rediff.is_some()
+                    && matches!(source.borrow().as_ref(), Some(Source::Repo { .. }));
+                (out.0, out.1, out.2, out.3, repo)
+            }
+            _ => (Vec::new(), 0, Vec::new(), 0, false),
+        };
+        let algorithm = self
+            .over
+            .algorithm
+            .as_deref()
+            .unwrap_or(host.differ.selected());
+        let whitespace = self.over.whitespace.unwrap_or(host.differ.whitespace);
+        settings::build(
+            &host, &layouts, layout, &wraps, wrap, algorithm, whitespace, from_repo,
+        )
+    }
+
+    /// One knob, turned. Every arm ends in the same two halves: the live
+    /// change through the route the old strip controls took, and the file
+    /// write that makes it the default — [`DevShell::save_default`]. The
+    /// settings window calls this per row, so the selection lives there and
+    /// the knob logic lives here, once.
+    fn settings_apply(&mut self, setting: settings::Setting, dir: i32, cx: &mut Context<Self>) {
+        use settings::Setting as S;
+        let host = config::host(cx);
+        match setting {
+            S::Layout => {
+                let Screen::Diff { view, .. } = &self.main else {
+                    return;
+                };
+                let view = view.clone();
+                let (names, index) = (view.read(cx).layout_names(), view.read(cx).layout_index());
+                let next = settings::cycle(names.len(), index, dir);
+                let name = names.get(next).map(|s| s.to_string());
+                self.set_layout(next, cx);
+                if let Some(name) = name {
+                    self.save_default("diff", "layout", format!("{name:?}"), cx);
+                }
+            }
+            S::Wrap => {
+                let Screen::Diff { view, .. } = &self.main else {
+                    return;
+                };
+                let view = view.clone();
+                let (names, index) = (view.read(cx).wrap_names(&host), view.read(cx).wrap_index());
+                let next = settings::cycle(names.len(), index, dir);
+                let name = names.get(next).map(|s| s.to_string());
+                self.set_wrap(next, cx);
+                if let Some(name) = name {
+                    self.save_default("diff", "wrap", format!("{name:?}"), cx);
+                }
+            }
+            S::Algorithm => {
+                let names = host.differ.names();
+                let current = self
+                    .over
+                    .algorithm
+                    .as_deref()
+                    .unwrap_or(host.differ.selected());
+                let at = names.iter().position(|n| *n == current).unwrap_or(0);
+                let name = names
+                    .get(settings::cycle(names.len(), at, dir))
+                    .map(|s| s.to_string());
+                if let Some(name) = name {
+                    let next = Overrides {
+                        algorithm: Some(name.clone()),
+                        ..self.over.clone()
+                    };
+                    self.set_overrides(next, cx);
+                    self.save_default("diff", "algorithm", format!("{name:?}"), cx);
+                }
+            }
+            S::Whitespace => {
+                let at = Whitespace::ALL
+                    .iter()
+                    .position(|w| *w == self.over.whitespace.unwrap_or(host.differ.whitespace))
+                    .unwrap_or(0);
+                let next = Whitespace::ALL[settings::cycle(Whitespace::ALL.len(), at, dir)];
+                self.set_overrides(
+                    Overrides {
+                        whitespace: Some(next),
+                        ..self.over.clone()
+                    },
+                    cx,
+                );
+                self.save_default("diff", "whitespace", format!("{:?}", next.name()), cx);
+            }
+            S::Context => {
+                let next = (host.differ.context as i32 + dir).clamp(0, 100) as usize;
+                self.save_live("diff", "context", next.to_string(), cx, |live| {
+                    live.differ.context = next;
+                });
+                self.rediff_current(cx);
+            }
+            S::Moves => {
+                let next = (host.differ.min_moved as i32 + dir).clamp(0, 1000) as usize;
+                self.save_live("diff", "moves", next.to_string(), cx, |live| {
+                    live.differ.min_moved = next;
+                });
+                self.rediff_current(cx);
+            }
+            S::IndentHeuristic => {
+                let next = !host.differ.indent_heuristic;
+                self.save_live("diff", "indent_heuristic", next.to_string(), cx, |live| {
+                    live.differ.indent_heuristic = next;
+                });
+                self.rediff_current(cx);
+            }
+            S::Theme => {
+                let names = host.themes.names();
+                let at = names
+                    .iter()
+                    .position(|n| *n == host.theme.name)
+                    .unwrap_or(0);
+                let name = names
+                    .get(settings::cycle(names.len(), at, dir))
+                    .map(|s| s.to_string());
+                if let Some(name) = name {
+                    self.set_theme(name.clone(), cx);
+                    self.save_default("theme", "name", format!("{name:?}"), cx);
+                }
+            }
+            S::FontSize => {
+                let next = (host.font.size + dir as f32).clamp(4.0, 96.0);
+                let spelled = format!("{next}");
+                self.save_live("font", "size", spelled, cx, |live| {
+                    live.font.size = next;
+                });
+            }
+            S::FontFamily => {
+                let mut families = vec![host.font.family.clone()];
+                for known in ["JetBrainsMono Nerd Font Mono", "Menlo"] {
+                    if !families.iter().any(|f| f == known) {
+                        families.push(known.to_string());
+                    }
+                }
+                let at = 0;
+                let next = families[settings::cycle(families.len(), at, dir)].clone();
+                if next != host.font.family {
+                    self.save_live("font", "family", format!("{next:?}"), cx, |live| {
+                        live.font.family = next.clone();
+                    });
+                }
+            }
+            S::Scroll => {
+                let next = (host.view.rows as i32 + dir).clamp(1, 100) as usize;
+                self.save_live("view", "scroll", next.to_string(), cx, |live| {
+                    live.view.rows = next;
+                });
+            }
+            S::Scrolloff => {
+                let next = (host.view.scrolloff as i32 + dir).clamp(0, 50) as usize;
+                self.save_live("view", "scrolloff", next.to_string(), cx, |live| {
+                    live.view.scrolloff = next;
+                });
+            }
+            S::Scrollbar => {
+                let next = !host.view.scrollbar;
+                self.save_live("view", "scrollbar", next.to_string(), cx, |live| {
+                    live.view.scrollbar = next;
+                });
+            }
+            S::Sidebar => {
+                let next = (host.sidebar_share + dir as f32 * 0.01).clamp(
+                    gitten_core::host::SIDEBAR_MIN,
+                    gitten_core::host::SIDEBAR_MAX,
+                );
+                self.save_live("view", "sidebar", format!("{next}"), cx, |live| {
+                    live.sidebar_share = next;
+                });
+                // The workspace lays out at fixed px widths, so this takes
+                // effect on the next window, not the one sitting behind
+                // the panel.
+            }
+            S::CopyOnSelect => {
+                let next = !host.mouse.copy_on_select;
+                self.save_live("mouse", "copy_on_select", next.to_string(), cx, |live| {
+                    live.mouse.copy_on_select = next;
+                });
+            }
+        }
+        cx.notify();
+    }
+
+    /// Writes one panel change back to `gitten.toml` as the new default.
+    /// Best effort, the way [`gitten_app::config::load`] reads: a change that
+    /// cannot be saved still applies to the window behind the panel, and says
+    /// so once in the band rather than failing.
+    fn save_default(&mut self, section: &str, key: &str, value: String, cx: &mut Context<Self>) {
+        if let Some(warning) = gitten_app::config::save_setting(&self.config, section, key, &value)
+        {
+            self.set_notice(warning);
+            cx.notify();
+        }
+    }
+
+    /// Opens `gitten.toml` in `$EDITOR`, detached — the settings window's
+    /// file-fallback row. Portable on purpose: no platform branch, just the
+    /// environment the shell already inherits. `$EDITOR` unset is a sentence
+    /// for the window's footer, not a guess about which editor was meant.
+    fn open_config_in_editor(&self) -> std::io::Result<()> {
+        let editor = std::env::var("EDITOR").map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "$EDITOR is not set — nothing to open gitten.toml with",
+            )
+        })?;
+        std::process::Command::new(editor)
+            .arg(&self.config)
+            .spawn()
+            .map(|_| ())
+    }
+
+    /// [`DevShell::save_default`] plus a live-host patch for a knob whose
+    /// route *is* the host: the file carries the default, the patched global
+    /// carries tonight. `tune` must set the same value that was spelled —
+    /// the file and the window must not disagree about what was chosen.
+    fn save_live(
+        &mut self,
+        section: &str,
+        key: &str,
+        value: String,
+        cx: &mut Context<Self>,
+        tune: impl FnOnce(&mut Host),
+    ) {
+        self.save_default(section, key, value, cx);
+        config::patch(cx, tune);
+    }
+
+    /// `project.switch`. Opens the recent-repositories menu off the title —
+    /// or closes it, when it is what is open. The rows are loaded here and
+    /// read while the menu stands, never per frame: reading them is file
+    /// I/O, and the render path does none.
+    fn toggle_project_menu(&mut self, cx: &mut Context<Self>) {
+        if self.open == Some(Open::Project) {
+            self.open = None;
+            cx.notify();
+            return;
+        }
+        let Some((current, _)) = self.repo.clone() else {
+            self.set_notice("this view has no repository to switch from");
+            return;
+        };
+        // Current first: the menu reads most-recent-first, and the window
+        // just touched this one. The file names what was opened; the window
+        // names where it is — a record that failed still gets its tick in
+        // its own menu.
+        let mut listed = vec![current];
+        for found in gitten_app::projects::load() {
+            if !listed.iter().any(|at| same_project_path(at, &found)) {
+                listed.push(found);
+            }
+        }
+        self.projects = listed;
+        self.open = Some(Open::Project);
+        cx.notify();
+    }
+
+    /// `project.open`, and the project menu's `Open other…` row. A path
+    /// field over the window, starting from the current repository so a
+    /// sibling is a filename away; accepting switches, cancelling keeps.
+    fn begin_project_path(&mut self, cx: &mut Context<Self>) {
+        let Some((path, _)) = self.repo.clone() else {
+            self.set_notice("this view has no repository to switch from");
+            return;
+        };
+        self.open = None;
+        let start = path.to_string_lossy().to_string();
+        let input = cx.new(|cx| input::Input::new("project", "repository path", start, cx));
+        self.open_input(input, cx);
+        // After `open_input`, which may have cancelled a previous prompt.
+        self.prompt = Some(Prompt::ProjectPath);
+    }
+
+    /// The accepted path-field text: expanded against the current
+    /// repository and switched onto, or a sentence when it opens nothing.
+    fn project_path_entered(&mut self, text: String, cx: &mut Context<Self>) {
+        let Some((current, _)) = self.repo.clone() else {
+            return;
+        };
+        if text.trim().is_empty() {
+            return;
+        }
+        self.switch_repo(expand_project_path(&text, &current), cx);
+    }
+
+    /// `project.browse`: the system file picker aimed at a repository. The
+    /// panel is the platform's own — `NSOpenPanel` on macOS, whatever GPUI
+    /// sits on elsewhere — so no dependency and no `cfg` buys it, and the
+    /// typed path stays on `project.open` for the keyboard. A choice lands
+    /// in [`DevShell::switch_repo`], which validates before it moves
+    /// anything; cancelling lands nowhere.
+    fn browse_for_project(&mut self, cx: &mut Context<Self>) {
+        if self.repo.is_none() {
+            self.set_notice("this view has no repository to browse from");
+            return;
+        }
+        self.open = None;
+        let picked = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Choose a repository".into()),
+        });
+        cx.spawn(async move |shell, cx| {
+            // Cancelled, or the platform refused: the first is silence, the
+            // second a sentence — a picker that cannot open says so once.
+            let chosen = match picked.await {
+                Ok(Ok(Some(mut paths))) => paths.pop(),
+                Ok(Ok(None)) | Err(_) => None,
+                Ok(Err(problem)) => {
+                    _ = shell.update(cx, |shell, cx| {
+                        shell.set_notice(format!("the file picker failed: {problem}"));
+                        cx.notify();
+                    });
+                    None
+                }
+            };
+            if let Some(path) = chosen {
+                _ = shell.update(cx, |shell, cx| shell.switch_repo(path, cx));
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// A pick in the project menu. Repository rows switch; the two footer
+    /// rows leave the menu for the path field and the system picker.
+    fn pick_project(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.projects.len() {
+            // The footers, in order: the typed path first, then the file
+            // manager. Both close the menu on their way through.
+            if index == self.projects.len() {
+                self.begin_project_path(cx);
+            } else {
+                self.browse_for_project(cx);
+            }
+            return;
+        }
+        let next = self.projects[index].clone();
+        self.open = None;
+        self.switch_repo(next, cx);
+    }
+
+    /// `project.next` / `project.prev`. Steps through the recent file from
+    /// the current repository, wrapping; a file naming only this window
+    /// says so instead of switching in place.
+    fn cycle_project(&mut self, by: isize, cx: &mut Context<Self>) {
+        let Some((current, _)) = self.repo.clone() else {
+            self.set_notice("this view has no repository to switch from");
+            return;
+        };
+        let listed = gitten_app::projects::load();
+        if listed.is_empty() {
+            self.set_notice("no recent projects");
+            return;
+        }
+        let count = listed.len();
+        // From the current repository when it is listed, else from outside
+        // the file on the side being left — an unlisted window cycles the
+        // file from its head either way.
+        let mut at = match listed.iter().position(|p| same_project_path(p, &current)) {
+            Some(i) => i as isize,
+            None => {
+                if by > 0 {
+                    -1
+                } else {
+                    count as isize
+                }
+            }
+        };
+        for _ in 0..count {
+            at = (at + by).rem_euclid(count as isize);
+            if !same_project_path(&listed[at as usize], &current) {
+                let next = listed[at as usize].clone();
+                self.switch_repo(next, cx);
+                return;
+            }
+        }
+        self.set_notice("no other recent project");
+    }
+
+    /// Moves the whole window onto another repository, in place.
+    ///
+    /// The entities stay: each screen is re-aimed at the new path and the
+    /// next refresh wave re-acquires every row through the same
+    /// generation-guarded rails a write's finish rides. What cannot ride
+    /// along is named and reset: the main view's rows (a commits window's
+    /// diff has no source of its own), the pending diff request, the memos
+    /// keyed on the old path, and the session key. A path that opens no
+    /// repository costs a sentence in the band — the old repository stands
+    /// untouched — and drops out of the recent file.
+    fn switch_repo(&mut self, path: std::path::PathBuf, cx: &mut Context<Self>) {
+        let Some((old_path, _)) = self.repo.clone() else {
+            self.set_notice("this view has no repository to switch from");
+            return;
+        };
+        // A prompt or menu may still stand over the old repository; both
+        // decide about rows that are about to be somebody else's.
+        if self.input.is_some() {
+            self.close_input(false, cx);
+        }
+        self.open = None;
+        let path = path.canonicalize().unwrap_or(path);
+        if same_project_path(&path, &old_path) {
+            gitten_app::projects::record(&path);
+            let (dir, name) = repo_title(&path, home());
+            self.set_notice(format!("already in {dir}{name}"));
+            cx.notify();
+            return;
+        }
+        let handle = gitten_git::open(&path);
+        if let Err(problem) = handle.status() {
+            gitten_app::projects::remove(&path);
+            self.set_notice(format!("cannot open {}: {problem}", path.display()));
+            cx.notify();
+            return;
+        }
+        // The old position is saved under the old key before anything moves.
+        if let Some(top) = self.session_top(cx) {
+            session::save(
+                &session::Session {
+                    key: self.session_key.clone(),
+                    top,
+                },
+                &self.session_path,
+            );
+        }
+        // A new epoch: in-flight batches from the old repository fail both
+        // guards — `refresh_id` here, the generation in their apply halves —
+        // and every screen below the new target re-acquires.
+        self.generation = self.generation.advance();
+        self.invalidate_refresh();
+        self.repo = Some((path.clone(), handle.clone()));
+        let for_diff = handle.clone();
+        self.rediff = Some(Rc::new(
+            move |host: &Host, over: &Overrides, revision: &str| {
+                gitten_git::diff(for_diff.as_ref(), revision, &host.differ, over)
+            },
+        ));
+        for screen in self.panes.iter_mut() {
+            screen.retarget(&path);
+        }
+        self.main.retarget(&path);
+        // The main view's rows belong to the old repository, and a commits
+        // window's diff carries no source to re-acquire from — it loads off
+        // the cursor — so it is rebuilt empty. The wave below ends in
+        // `finish_refresh`, which schedules the new HEAD's diff through the
+        // ordinary rails; scheduling here would aim at the old cursor.
+        if self.has_column {
+            let host = config::host(cx);
+            let view = cx.new(|cx| views::diff::Diff::new(Vec::new(), host, cx));
+            self.main = Screen::diff(view, None, self.generation, "");
+        }
+        *self.head.borrow_mut() = None;
+        self.request.set(self.request.get().saturating_add(1));
+        self.loading.set(false);
+        self.error = None;
+        self.error_is_load = false;
+        self.title_memo.borrow_mut().take();
+        // The scroll the new repository file remembers, applied once the
+        // wave lands — scrolling an empty list first would clamp it away.
+        let view = View::parse(self.which).unwrap_or(View::Commits);
+        let source = match self.panes.get("commits") {
+            Some(Screen::Commits { source, .. }) => Some(source.clone()),
+            _ => match &self.main {
+                Screen::Diff { source, .. } => source.borrow().clone(),
+                _ => None,
+            },
+        };
+        let key = source
+            .as_ref()
+            .map(|s| s.key(view))
+            .unwrap_or_else(|| format!("{}:{}:", self.which, path.to_string_lossy()));
+        self.session_key = key.clone();
+        self.pending_restore = session::restore(&key, &self.session_path).map(|r| r.top);
+        gitten_app::projects::record(&path);
+        self.refresh_stale(cx);
+        let (dir, name) = repo_title(&path, home());
+        self.set_notice(format!("switched to {dir}{name}"));
+        cx.notify();
+    }
+
+    /// The first visible row of whichever view the session file tracks: the
+    /// commit list's, when the window has one, else the main diff's — the
+    /// same two places startup restores from.
+    fn session_top(&self, cx: &App) -> Option<usize> {
+        if let Some(Screen::Commits { view, .. }) = self.panes.get("commits") {
+            return Some(view.read(cx).top.get());
+        }
+        if let Screen::Diff { view, .. } = &self.main {
+            return Some(view.read(cx).top.get());
+        }
+        None
+    }
+
+    /// Scrolls the session-tracked view back to a saved row: the commit
+    /// list's cursor and viewport, or the main diff's. Runs after a switch's
+    /// refresh wave, when new rows are standing to be scrolled through.
+    fn restore_session_top(&mut self, top: usize, cx: &mut Context<Self>) {
+        let host = config::host(cx);
+        if let Some(Screen::Commits { view, .. }) = self.panes.get("commits") {
+            let view = view.clone();
+            let held = view.read(cx);
+            held.scroll_to(top, &host);
+            held.go_to(top, &host);
+        } else if let Screen::Diff { view, .. } = &self.main {
+            let view = view.clone();
+            let held = view.read(cx);
+            held.scroll_to(top, &host);
+            held.go_to(top, &host);
+        }
+        cx.notify();
+    }
+
+    /// The project menu's floating list: the recent repositories under the
+    /// title that opened it, plus an `Open other…` row that trades the menu
+    /// for the path field and a `Browse…` row that trades it for the system
+    /// file picker. Hung below the strip at the title's own inset and
+    /// clamped to the window, like the context menu; deferred past the
+    /// regions and occluding, for the same reasons. The rows come from
+    /// [`DevShell::projects`], loaded when the menu opened — building them
+    /// reads no file.
+    fn project_menu(&self, host: &Host, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let c = &host.theme.chrome;
+        let f = &host.font;
+        let me = cx.entity().downgrade();
+        let listed = self.projects.len();
+        let mut labels: Vec<String> = self
+            .projects
+            .iter()
+            .map(|path| {
+                let (dir, name) = repo_title(path, home());
+                format!("{dir}{name}")
+            })
+            .collect();
+        labels.push("Open other…".to_string());
+        labels.push("Browse…".to_string());
+        // Wide enough for the longest row, from the font rather than a
+        // constant — the same reason `font.advance` exists at all.
+        let widest = labels.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+        let w = (widest as f32 + 4.0) * f.advance * f.size + 16.0;
+        let h = labels.len() as f32 * menu::ROW_H + 2.0 * 4.0 + 2.0;
+        let at = crate::menu::clamped(
+            point(px(LIGHTS_W), px(TITLE_H)),
+            window.viewport_size(),
+            w,
+            h,
+        );
+        let list = div()
+            .id("project-menu")
+            .absolute()
+            .top(at.y)
+            .left(at.x)
+            .w(px(w))
+            .py_1()
+            .bg(rgb(c.title_bg))
+            .border_1()
+            .border_color(rgb(c.faint))
+            .rounded(px(chrome::RADIUS))
+            .text_size(px(f.size))
+            .font_family(f.family.clone())
+            // Without this the menu is drawn but the rows beneath it get the
+            // clicks: hit-testing is paint order, and an absolutely
+            // positioned child claims nothing it covers on its own.
+            .occlude()
+            // A menu that only closes by choosing something is a menu you
+            // cannot change your mind about; the backdrop above already
+            // stands for any open menu.
+            .on_mouse_down_out({
+                let me = me.clone();
+                move |_, _, cx| {
+                    _ = me.update(cx, |this, cx| {
+                        this.open = None;
+                        cx.notify();
+                    });
+                }
+            })
+            .children(labels.iter().enumerate().map(|(i, label)| {
+                let me = me.clone();
+                // Row zero is the window's own repository — the menu opens
+                // with it first — and carries the tick.
+                let here = i == 0 && listed > 0;
+                div()
+                    .id(("project-row", i))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .h(px(menu::ROW_H))
+                    .px_2()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(c.status_bg)))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(rgb(if here { c.accent } else { c.fg }))
+                            .child(label.clone()),
+                    )
+                    .children(here.then(|| {
+                        Icon::new(IconName::Check)
+                            .size(px(14.0))
+                            .text_color(rgb(c.accent))
+                    }))
+                    .on_click(move |_, _, cx| {
+                        _ = me.update(cx, |this, cx| {
+                            this.pick_project(i, cx);
+                        });
+                    })
+            }));
+        deferred(list).with_priority(1).into_any_element()
+    }
+
+    /// One named command, run. **This is the one dispatch path**: the keymap
+    /// resolves to a name, and whatever resolved it — a key, a chord, a menu
+    /// item — arrives here and nowhere else.
+    ///
+    /// The client's own commands first, then the screen's. That order is what
+    /// lets a screen override `back` one day without this file having to know.
+    fn run_command(&mut self, command: &str, cx: &mut Context<Self>) {
+        // A question asked below carries no answers of its own — the asking
+        // verb only knows its sentence — so the dispatch attaches them from
+        // the command that asked. Buttons are then a view of the notice:
+        // same names the palette runs, vanishing with it.
+        let had_question = matches!(self.notice, Some(Notice::Question { .. }));
+        let before = self.notice.as_ref().map(|n| n.text().to_string());
+        self.run_command_from(command, None, cx);
+        let fresh = match &self.notice {
+            Some(Notice::Question { text, answers }) if answers.is_empty() => {
+                !had_question || before.as_deref() != Some(text.as_str())
+            }
+            _ => false,
+        };
+        if fresh {
+            let answers: Vec<Answer> = question_answers(command)
+                .iter()
+                .map(|&(label, command)| Answer { label, command })
+                .collect();
+            if let Some(Notice::Question { answers: slot, .. }) = &mut self.notice {
+                *slot = answers;
+            }
+        }
+    }
+
+    /// [`DevShell::run_command`] with the pane the event came *over*. The
+    /// keyboard omits it and falls through to the focused pane, exactly as it
+    /// always has; the wheel supplies the pane under the pointer, so a glance
+    /// scrolls that list without moving the keyboard. App-wide commands keep
+    /// their ordinary meaning regardless of where their binding originated —
+    /// only the screen's own verbs read the target — which is the same rule
+    /// the terminal's `dispatch_to` runs under.
+    fn run_command_from(&mut self, command: &str, over: Option<&Screen>, cx: &mut Context<Self>) {
+        match command {
+            "message.show" => {
+                // Only meaningful while an error stands: the overlay is the
+                // error's full text, and there is nothing else to show.
+                if self.error.is_some() {
+                    self.show_message = !self.show_message;
+                }
+            }
+            "quit" => cx.quit(),
+            "help" | "commands.palette" => self.open_palette(cx),
+            // Settings stand in their own window now, not over this one: the
+            // command opens (or activates) it, and the window owns its own
+            // keyboard from there. Every door — `,`, the gear, the menu,
+            // `cmd-,` — arrives here, so this stays the one opener.
+            "settings" => {
+                settings_window::open(cx.entity(), cx);
+            }
+            "back" => self.back(cx),
+            "theme.picker" => self.open_theme_picker(cx),
+            "theme.cycle" => self.cycle_theme(cx),
+            "input.accept" => self.close_input(true, cx),
+            "input.cancel" => self.close_input(false, cx),
+            // Focus lists without pointing: cycle the registry in drawing
+            // order, or walk one stop over toward the diff. Tab covers
+            // regions; these cover lists.
+            "pane.next" => self.cycle_pane(1, cx),
+            "pane.prev" => self.cycle_pane(-1, cx),
+            "pane.left" => self.pane_walk(-1, cx),
+            "pane.right" => self.pane_walk(1, cx),
+            // Refresh everything. The wave itself is the queue
+            // finish's; this just rings the bell.
+            "repo.refresh" => {
+                let sent = self.writes().map(|w| w.send(Box::new(RefreshAll)));
+                match sent {
+                    Some(true) => {}
+                    Some(false) => self.set_notice("the job queue is shutting down"),
+                    None => self.set_notice("a fixture has nothing to refresh"),
+                }
+            }
+            // The repository the window sits on is itself switchable: the
+            // title opens the recent menu, `o` does the same from the
+            // keyboard, `O` skips the menu for the path field, `browse`
+            // skips it for the system file picker, and the unbound
+            // next/prev cycle the MRU for whoever binds them.
+            "project.switch" => self.toggle_project_menu(cx),
+            "project.open" => self.begin_project_path(cx),
+            "project.browse" => self.browse_for_project(cx),
+            "project.next" => self.cycle_project(1, cx),
+            "project.prev" => self.cycle_project(-1, cx),
+            // lazygit's 0: the main view, from wherever the keyboard was.
+            "diff.focus" => self.set_spot(Spot::Main, cx),
+            "commits.focus" => self.focus_named("commits", cx),
+            "files.focus" => self.focus_named("files", cx),
+            "stashes.focus" => self.focus_named("stashes", cx),
+            "branches.focus" => self.focus_named("branches", cx),
+            "commits.open-diff" => self.focus_main(cx),
+            "commits.search" | "files.search" | "branches.search" | "stashes.search" => {
+                self.begin_search(command, cx)
+            }
+            // History's verbs, aimed at the selected commit. Reset
+            // and revert read the pane; the write goes through the queue.
+            // The reset question is answered from Commands: `reset-menu`
+            // opens it, and the three strengths answer it while it stands.
+            "commits.reset-menu" => self.reset_menu(cx),
+            "commits.reset-soft" | "commits.reset-mixed" | "commits.reset-hard" => {
+                self.reset_selected(command, cx)
+            }
+            "commits.revert" => self.revert_selected(cx),
+            "commits.cherry-pick" => self.cherry_pick_selected(cx),
+            "commits.new-tag" => self.begin_tag_prompt(cx),
+            "commits.new-branch" => self.begin_commit_branch_prompt(cx),
+            // lazygit's space on a commit: detached checkout. HEAD's old
+            // branch keeps its name, so the branches pane walks you back.
+            "commits.checkout" => self.checkout_commit(cx),
+            // History's rewrites, composed over the pane's own window of
+            // log and run through the queue. All three ask twice.
+            "commits.squash-up" | "commits.fixup-up" | "commits.drop-commit" => {
+                self.rewrite_selected(command, cx)
+            }
+            // The working tree's verbs. Context comes from the focused pane,
+            // the write from the job queue — and where either is missing, the
+            // same honest sentence an unknown command gets.
+            "workspace.changes" => self.enter_workspace(cx),
+            "workspace.history" => self.enter_history(cx),
+            "workspace.preview" => self.sync_workspace_preview(cx),
+            "files.stage" => self.stage_or_unstage(cx),
+            "files.commit" => self.begin_commit_message(cx),
+            "files.amend" => self.begin_amend_message(cx),
+            "files.discard" => self.discard_selected(cx),
+            "files.stage-all" => self.stage_all(cx),
+            "files.ignore" => self.ignore_selected(cx),
+            "files.stash" => self.stash_working_tree(cx),
+            // The diff pane's verbs, aimed at the hunk under its keyboard.
+            "diff.stage-hunk" | "diff.unstage-hunk" | "diff.discard-hunk" => {
+                self.hunk_verb(command, cx)
+            }
+            // The stash stack's verbs.
+            "stashes.apply" | "stashes.pop" | "stashes.drop" => self.stash_selected(command, cx),
+            // The branches panel's verbs, over the same two rails.
+            "branches.checkout" => self.checkout_branch(cx),
+            "branches.new" => self.begin_branch_new(cx),
+            "branches.rename" => self.begin_branch_rename(cx),
+            "branches.new-tag" => self.begin_branch_tag_prompt(cx),
+            "branches.delete" => self.delete_branch_selected(cx),
+            // Aimed at the branch row the keyboard is on, so it lives with
+            // the branches verbs even though the command name sits in the
+            // commits family — the name says what happens to history; the
+            // pane says where the aim comes from.
+            "commits.rebase-onto" => self.rebase_branch_selected(cx),
+            // The way out of a stranded rebase. Repository-level like the
+            // sync verbs: whichever pane the keyboard sits over, they act
+            // on the rebase state git is holding, never on a row.
+            "rebase.abort" => self.rebase_abort_command(cx),
+            "rebase.continue" => self.rebase_continue_command(cx),
+            // The way out of a stranded cherry-pick — the same repository-
+            // level shape, on its own names: rebase's answer to a pick state
+            // is git's "no rebase in progress".
+            "commits.cherry-pick-abort" => self.cherry_pick_abort_command(cx),
+            "commits.cherry-pick-continue" => self.cherry_pick_continue_command(cx),
+
+            // The repository-level sync verbs: whatever pane the keyboard
+            // sits over, they act on the branch HEAD is on — which is why
+            // their keys are globals.
+            "repo.push" | "repo.pull" | "repo.fetch" => self.sync_remote(command, cx),
+            // The inspector's commit door: the button, the key and the
+            // dialog confirm all arrive here or below, and the write is
+            // always `act::commit_message`'s — never a second
+            // implementation beside the prompt path.
+            "workspace.commit" => self.open_commit_confirm(cx),
+            "workspace.commit-confirm" => self.confirm_commit(cx),
+            "workspace.commit-cancel" => self.cancel_commit_confirm(cx),
+            "copy.selection" => self.copy_selection(cx),
+            // Both are answered by whichever screen is up; a commit graph has no
+            // selection yet, and a command nothing handles there is inert — the
+            // same answer an unbound key gives.
+            "select.all" | "select.none" => {
+                if let Some(input) = self.input.clone() {
+                    input.update(cx, |input, cx| {
+                        input.select_all_text(command == "select.all", cx)
+                    });
+                } else if let Some(screen) = self.active() {
+                    screen.select(command == "select.all", cx);
+                }
+            }
+            // The workspace center is not a Screen, so its keyboard verbs
+            // need an explicit door: workspace up with a built center and
+            // keyboard in the diff region, and the view/diff movement names
+            // go to the center view. The flag alone is not enough — a fresh
+            // shell names the workspace before its first entry builds the
+            // center, and swallowing keys for a view that does not exist
+            // yet is the silent kind of wrong. The files pane keeps its
+            // names through the ordinary path while spot is List; the
+            // hidden main view keeps none.
+            "view.down" | "view.up" | "view.page-down" | "view.page-up" | "view.scroll-down"
+            | "view.scroll-up" | "view.top" | "view.bottom" | "view.left" | "view.right"
+            | "diff.next-file" | "diff.prev-file" | "diff.cycle-layout" | "diff.cycle-wrap"
+                if self.workspace.center.is_some() && self.spot == Spot::Main =>
+            {
+                if let Some(center) = self.workspace.center.clone() {
+                    let host = config::host(cx);
+                    center.update(cx, |v, _| {
+                        v.run_view(command, &host);
+                    });
+                }
+            }
+            _ => {
+                let known = match over.or_else(|| self.active()) {
+                    Some(screen) => {
+                        let host = config::host(cx);
+                        let writes = self.writes();
+                        screen.run(command, &host, writes.as_ref(), cx)
+                    }
+                    None => false,
+                };
+                if !known {
+                    // Resolvable, registered — and not implemented by anything
+                    // this client ships. Said, not swallowed: an extension's
+                    // command reaches this exact point without one line changing
+                    // here, and the honest answer to it is a sentence.
+                    self.set_notice(format!("{command} is not supported here"));
+                }
+            }
+        }
+        // The keyboard may just have moved the commits cursor — or a refresh
+        // may have re-anchored it under the last command. Either way this is
+        // the one hook every command leaves through, so it is where the main
+        // view learns its selection changed. One read on the no-op path.
+        self.sync_main_diff(cx);
+        // The workspace center learns the same way, off the files cursor.
+        // Disabled is one bool read; a refresh wave re-lands the same
+        // selection with a newer generation, which the guard below counts
+        // as new — staging a hunk re-aims the preview at the moved side.
+        self.sync_workspace_preview(cx);
+        cx.notify();
+    }
+
+    /// Closes the topmost thing — the palette, the message overlay, an
+    /// error, an open menu, the input field, or the diff region's hold on
+    /// the keyboard — innermost first, or a menu left open after its
+    /// context is popped keeps occluding nothing: invisible, but still in
+    /// `self.open`, where [`DevShell::on_wheel`] swallows every event for
+    /// it forever. So an open menu is the whole of this `esc`: closed.
+    ///
+    /// With nothing stacked above, `esc` hands the keyboard back from the
+    /// diff to the stack — lazygit's way out of a main view. The lists
+    /// themselves are never closed any more: they are the stack's residents,
+    /// and closing one would leave the window half empty rather than one pane
+    /// lighter. A selection is inside a list, so it goes after the region
+    /// switch; the diff's own selection stays until its rows are replaced.
+    fn back(&mut self, cx: &mut Context<Self>) {
+        if self.theme_picker_open {
+            self.close_theme_picker(cx);
+            return;
+        }
+        if self.palette_open {
+            self.close_palette(cx);
+            return;
+        }
+        if self.show_message {
+            self.show_message = false;
+            cx.notify();
+            return;
+        }
+        // An error is a message, not a context: it stands until dismissed, and
+        // `esc` dismisses it before `back` moves anything else.
+        if self.error.is_some() {
+            self.error = None;
+            self.error_is_load = false;
+            cx.notify();
+            return;
+        }
+        if self.open.take().is_some() {
+            cx.notify();
+            return;
+        }
+        // A standing question dismisses before anything it overlaid: Esc
+        // is "never mind", and the Cancel button beside the question runs
+        // this same path. The commits timeline disarms with its text, as
+        // before; every other view's arm is row-anchored and lapses on a
+        // cursor move, so answering again re-arms honestly.
+        if matches!(self.notice, Some(Notice::Question { .. })) {
+            if let Some(Screen::Commits { view, .. }) = self.active() {
+                if view.read(cx).armed() {
+                    view.update(cx, |v, _| v.disarm());
+                }
+            }
+            self.notice = None;
+            cx.notify();
+            return;
+        }
+        if self.input.is_some() {
+            self.close_input(false, cx);
+            return;
+        }
+        if self.spot == Spot::Main {
+            self.set_spot(Spot::List, cx);
+            cx.notify();
+            return;
+        }
+        // The reset question, before anything else a list could say: `esc`
+        // on a standing question is "never mind", not "move the cursor".
+        if let Some(Screen::Commits { view, .. }) = self.active() {
+            if view.read(cx).armed() {
+                view.update(cx, |v, _| v.disarm());
+                cx.notify();
+                return;
+            }
+        }
+        if let Some(screen) = self.active() {
+            if screen.select(false, cx) {
+                // There was a selection and it is gone; that is the whole of
+                // this `esc`.
+                cx.notify();
+            }
+        }
+    }
+
+    fn focus_pane(&mut self, at: usize, cx: &mut Context<Self>) {
+        // Focusing a list means looking at that list: the keyboard goes
+        // with it, out of the diff if it was there. The spot moves even
+        // when the tenant was *already* the focused one — which is why the
+        // registry's "no change" answer is not allowed to end this method
+        // before the spot has.
+        if self.panes.focus(at) || self.spot != Spot::List {
+            self.set_spot(Spot::List, cx);
+            self.sync_focus(cx);
+            cx.notify();
+        }
+    }
+
+    /// Tab's walk: the list, the center, the composer fields, and back —
+    /// the regions a mouse reaches by pointing, in reading order.
+    /// Shift-Tab walks it backwards. The list is the destination's own
+    /// (files in Changes, commits in History); stops with no entity yet
+    /// are skipped, so a fresh shell tabs between what stands.
+    fn cycle_focus(&mut self, by: isize, window: &mut Window, cx: &mut Context<Self>) {
+        #[derive(Clone, Copy)]
+        enum Stop {
+            List,
+            Center,
+            Summary,
+            Description,
+        }
+        let list = match self.workspace.destination {
+            views::workspace::Destination::History => "commits",
+            _ => "files",
+        };
+        let mut stops = vec![Stop::List];
+        if self.workspace.center.is_some() {
+            stops.push(Stop::Center);
+        }
+        if self.workspace.summary.is_some() {
+            stops.push(Stop::Summary);
+        }
+        if self.workspace.description.is_some() {
+            stops.push(Stop::Description);
+        }
+        let current = match self.workspace_field_focused(window, cx) {
+            Some(true) => stops.iter().position(|s| matches!(s, Stop::Description)),
+            Some(false) => stops.iter().position(|s| matches!(s, Stop::Summary)),
+            None if self.spot == Spot::Main => stops.iter().position(|s| matches!(s, Stop::Center)),
+            None => Some(0),
+        }
+        .unwrap_or(0);
+        let next = stops[(current as isize + by).rem_euclid(stops.len() as isize) as usize];
+        match next {
+            Stop::List => self.focus_named(list, cx),
+            Stop::Center => {
+                self.set_spot(Spot::Main, cx);
+                cx.notify();
+            }
+            Stop::Summary => {
+                if let Some(field) = self.workspace.summary.clone() {
+                    window.focus(&field.read(cx).focus_handle(), cx);
+                }
+            }
+            Stop::Description => {
+                if let Some(field) = self.workspace.description.clone() {
+                    window.focus(&field.read(cx).focus_handle(), cx);
+                }
+            }
+        }
+    }
+
+    /// Cycles the lists in drawing order, then any pane an extension
+    /// registered: the Commands way to move focus between lists without
+    /// pointing. With fewer than two lists there is nowhere to go, and
+    /// that is said rather than silently staying.
+    fn cycle_pane(&mut self, by: isize, cx: &mut Context<Self>) {
+        let order: Vec<String> = self.list_order().iter().map(|s| s.to_string()).collect();
+        if order.len() < 2 {
+            self.set_notice("this window has no second list to cycle to");
+            return;
+        }
+        // The focused pane's place in that order; a diff standing in as the
+        // root of a diff-shaped launch is not in it, and cycling from there
+        // starts at the first sidebar pane.
+        let focused = self.panes.focused_name().to_string();
+        let current = order.iter().position(|name| *name == focused).unwrap_or(0);
+        let next = (current as isize + by).rem_euclid(order.len() as isize) as usize;
+        let name = order[next].clone();
+        self.focus_named(&name, cx);
+    }
+
+    /// Walks focus one stop over, in the window's reading order: the lists
+    /// ([`DevShell::list_order`]) then the diff as the last stop. Left of
+    /// the diff is the last list; right of the last list is the diff; an
+    /// edge answers and stays. The Tab walk ([`DevShell::cycle_focus`])
+    /// covers regions; this covers lists.
+    fn pane_walk(&mut self, by: isize, cx: &mut Context<Self>) {
+        let order: Vec<String> = self.list_order().iter().map(|s| s.to_string()).collect();
+        if order.is_empty() {
+            // A diff-shaped launch: the diff is the only pane there is.
+            return;
+        }
+        match self.spot {
+            Spot::Main => {
+                if by < 0 {
+                    let name = order[order.len() - 1].clone();
+                    self.focus_named(&name, cx);
+                }
+            }
+            Spot::List => {
+                let focused = self.panes.focused_name().to_string();
+                let Some(at) = order.iter().position(|name| *name == focused) else {
+                    // The focused tenant is not in the walk order — it can
+                    // only be an extension registered after this frame's
+                    // order was read. The first list is the honest home.
+                    if by < 0 {
+                        self.focus_named(&order[0], cx);
+                    }
+                    return;
+                };
+                let next = at as isize + by;
+                if next >= order.len() as isize {
+                    self.set_spot(Spot::Main, cx);
+                } else if next >= 0 {
+                    let name = order[next as usize].clone();
+                    self.focus_named(&name, cx);
+                }
+            }
+        }
+    }
+
+    /// Focuses a tenant by its stable registration name — what `files.focus`
+    /// and friends run: the named pane takes the keyboard, wherever it draws.
+    /// Said, not swallowed, when nothing is registered under the name: a
+    /// fixture has no working tree to show, and the honest answer to the key
+    /// is the same sentence an unbound one gets.
+    fn focus_named(&mut self, name: &str, cx: &mut Context<Self>) {
+        match self.panes.position(name) {
+            Some(at) => self.focus_pane(at, cx),
+            None => self.set_notice(format!("no {name} pane")),
+        }
+    }
+
+    /// `commits.open-diff`: hand the keyboard to the diff region, carrying the
+    /// commit under the cursor. The load for this row is already in flight
+    /// from the cursor move or click that got here — enter only escalates it
+    /// when it is still loading, and moves the keyboard either way. From the
+    /// diff, `esc` walks back through [`DevShell::back`].
+    fn focus_main(&mut self, cx: &mut Context<Self>) {
+        let Some(view) = self.column_commits() else {
+            self.set_notice("no commit selected");
+            return;
+        };
+        let host = config::host(cx);
+        // Meet the list where it actually is: a scrollbar drag moved the
+        // offset without moving the cursor, and the model should start from
+        // the offset now on screen. "This commit" stays the keyboard's row
+        // — a drag pans, it never selects, like the terminal.
+        view.update(cx, |v, _| v.reconcile(&host));
+        if let Some(commit) = view.read(cx).current().cloned() {
+            self.schedule_main_diff(commit, true, cx);
+        }
+        self.set_spot(Spot::Main, cx);
+        cx.notify();
+    }
+
+    /// After anything that may have moved the commits cursor — a key, a
+    /// search edit, a refresh that re-anchored the list: if the commit under
+    /// the keyboard is not the one the main view names, schedule its diff.
+    /// The no-op path is one read of the current row.
+    fn sync_main_diff(&mut self, cx: &mut Context<Self>) {
+        let Some(view) = self.column_commits() else {
+            return;
+        };
+        let Some(commit) = view.read(cx).current().cloned() else {
+            return;
+        };
+        let shown = self
+            .head
+            .borrow()
+            .as_ref()
+            .is_some_and(|h| h.sha == commit.sha);
+        if shown {
+            return;
+        }
+        self.schedule_main_diff(commit, false, cx);
+    }
+
+    /// The draft store's key for this window: the repository path, so
+    /// switching repositories restores each one's unsent words rather than
+    /// leaking them across. `None` over a fixture, which has no drafts.
+    fn draft_key(&self) -> Option<String> {
+        self.repo
+            .as_ref()
+            .map(|(path, _)| path.to_string_lossy().into_owned())
+    }
+
+    /// File the inspector fields' current words into the current
+    /// repository's draft. Called before every read that crosses a
+    /// boundary — opening the dialog, submitting, leaving the workspace,
+    /// refilling for another repository — so the store is current wherever
+    /// the fields themselves survive. The fields' own `Edited`
+    /// subscriptions keep it current between these points; this is the
+    /// backstop for transitions.
+    fn sync_fields_to_draft(&mut self, cx: &mut Context<Self>) {
+        let Some(key) = self.draft_key() else {
+            return;
+        };
+        let summary = self
+            .workspace
+            .summary
+            .as_ref()
+            .map(|field| field.read(cx).value().to_string());
+        let description = self
+            .workspace
+            .description
+            .as_ref()
+            .map(|field| field.read(cx).value().to_string());
+        if summary.is_none() && description.is_none() {
+            return;
+        }
+        let draft = self.drafts.entry(key).or_default();
+        if let Some(text) = summary {
+            draft.summary = text;
+        }
+        if let Some(text) = description {
+            draft.description = text;
+        }
+    }
+
+    /// The inspector's two fields, built once and refilled per repository:
+    /// Summary single-line, Description multiline, both mirrored into the
+    /// draft store on every edit. Called from the workspace composition, so
+    /// a repository switch refills rather than leaks — the leaving words
+    /// are filed first, then both fields take the new repository's draft.
+    fn ensure_inspector_fields(&mut self, cx: &mut Context<Self>) {
+        let key = self.draft_key();
+        if self.workspace.summary.is_some() && self.workspace.fields_key == key {
+            return;
+        }
+        self.sync_fields_to_draft(cx);
+        let draft = key
+            .as_ref()
+            .and_then(|key| self.drafts.get(key))
+            .cloned()
+            .unwrap_or_default();
+        if self.workspace.summary.is_none() {
+            let summary = cx.new(|cx| {
+                let mut field = input::Input::new("", "Commit summary", "", cx);
+                field.set_embedded();
+                field
+            });
+            let description = cx.new(|cx| {
+                let mut field = input::Input::new("", "Description (optional)", "", cx);
+                field.set_multiline(true);
+                field.set_embedded();
+                field
+            });
+            let mut subs = Vec::new();
+            subs.push(
+                cx.subscribe(&summary, |this: &mut Self, _, event: &input::Event, cx| {
+                    if let input::Event::Edited(text) = event {
+                        if let Some(key) = this.draft_key() {
+                            this.drafts.entry(key).or_default().summary = text.clone();
+                            cx.notify();
+                        }
+                    }
+                }),
+            );
+            subs.push(cx.subscribe(
+                &description,
+                |this: &mut Self, _, event: &input::Event, cx| {
+                    if let input::Event::Edited(text) = event {
+                        if let Some(key) = this.draft_key() {
+                            this.drafts.entry(key).or_default().description = text.clone();
+                            cx.notify();
+                        }
+                    }
+                },
+            ));
+            self.workspace.field_subs = subs;
+            self.workspace.summary = Some(summary);
+            self.workspace.description = Some(description);
+        }
+        // `set_text` emits nothing — the draft already holds these words —
+        // so refilling never writes back into the store it just read.
+        if let Some(field) = self.workspace.summary.clone() {
+            field.update(cx, |field, cx| field.set_text(draft.summary.clone(), cx));
+        }
+        if let Some(field) = self.workspace.description.clone() {
+            field.update(cx, |field, cx| {
+                field.set_text(draft.description.clone(), cx)
+            });
+        }
+        self.workspace.fields_key = key;
+    }
+
+    /// The status bar's fixed leading segments — sync recency, remote,
+    /// staging count — spelled from loaded state, never a git call. The
+    /// memo holds the inputs beside the spelling: stamps, staged total,
+    /// remote, branch label. Anything moves and the three re-spell;
+    /// otherwise the frame clones three refcounts.
+    fn status_leading(&self, cx: &mut Context<Self>) -> Vec<SharedString> {
+        let staged: u32 = match self.panes.get("files") {
+            Some(Screen::Files { view, .. }) => view
+                .read(cx)
+                .counts()
+                .values()
+                .map(|(staged, _)| staged)
+                .sum(),
+            _ => 0,
+        };
+        let head = self.panes.get("branches").and_then(|screen| {
+            let Screen::Branches { view, .. } = screen else {
+                return None;
+            };
+            view.read(cx).head_info()
+        });
+        // No upstream, no remote to name: the em-dash says unknowable,
+        // the way the Push button's does. A remotes read per frame is
+        // what a second git call would cost, and the bar is not worth one.
+        let remote = head
+            .as_ref()
+            .and_then(|info| info.remote.clone())
+            .unwrap_or_else(|| "\u{2014}".into());
+        let branch = head.as_ref().map(|info| info.label.clone());
+        let key = (
+            self.last_fetch,
+            self.last_push,
+            staged,
+            remote.clone(),
+            branch.clone(),
+        );
+        if let Some((ref memo_key, ref spelled)) = *self.status_memo.borrow() {
+            if *memo_key == key {
+                return spelled.clone();
+            }
+        }
+        let spelled = vec![
+            sync_text(self.last_fetch, self.last_push, Instant::now()),
+            remote,
+            staging_text(staged),
+        ];
+        *self.status_memo.borrow_mut() = Some((key, spelled.clone()));
+        spelled
+    }
+
+    /// The inspector's staged truth, straight off the files pane's refresh:
+    /// staged files with their `(staged, total)` hunk counts, plus the
+    /// staged-hunk total the Commit gate reads. No side is re-read here —
+    /// the composition calls this once per frame and the numbers arrive
+    /// spelled per refresh.
+    fn files_staged(&self, cx: &mut Context<Self>) -> (Vec<views::files::StagedFile>, u32) {
+        let Some(screen) = self.panes.get("files").cloned() else {
+            return (Vec::new(), 0);
+        };
+        let Screen::Files { view, .. } = screen else {
+            return (Vec::new(), 0);
+        };
+        let view = view.read(cx);
+        (view.staged_summary(), view.staged_hunks())
+    }
+
+    /// Who HEAD is, for the confirm dialog's branch line: the branches
+    /// pane's own spelling — a branch name or `detached · <sha>` — or an
+    /// honest absence when the pane never loaded, which the dialog says as
+    /// "no branch loaded" rather than inventing one.
+    fn head_label(&self, cx: &mut Context<Self>) -> Option<SharedString> {
+        let screen = self.panes.get("branches").cloned()?;
+        let Screen::Branches { view, .. } = screen else {
+            return None;
+        };
+        view.read(cx).head_info().map(|info| info.label)
+    }
+
+    /// Which inspector field holds the keyboard, if one does: `false` for
+    /// Summary, `true` for Description. The prompt path keeps its promise
+    /// about where the keyboard is by slot; the embedded fields keep it by
+    /// focus, compared here against the window's focused handle.
+    fn workspace_field_focused(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<bool> {
+        let focused = window.focused(cx)?;
+        for (entity, is_description) in [
+            (&self.workspace.summary, false),
+            (&self.workspace.description, true),
+        ] {
+            if let Some(field) = entity {
+                if field.read(cx).focus_handle() == focused {
+                    return Some(is_description);
+                }
+            }
+        }
+        None
+    }
+
+    fn enter_workspace(&mut self, cx: &mut Context<Self>) {
+        self.workspace.destination = views::workspace::Destination::Changes;
+        self.workspace_center(cx);
+        if self.panes.position("files").is_some() {
+            self.focus_named("files", cx);
+        }
+        self.sync_workspace_preview(cx);
+    }
+
+    /// `workspace.history`: the History destination — the branch timeline
+    /// beside the selected commit's diff, inside the same workspace. The
+    /// commits pane takes the keyboard and the one diff view is re-aimed at
+    /// the commit under its cursor, so the timeline and the detail cannot
+    /// disagree about which commit is selected.
+    fn enter_history(&mut self, cx: &mut Context<Self>) {
+        self.workspace.destination = views::workspace::Destination::History;
+        if self.panes.position("commits").is_some() {
+            self.focus_named("commits", cx);
+        }
+        self.sync_main_diff(cx);
+        cx.notify();
+    }
+
+    /// The workspace's center diff, built once on first entry and re-aimed
+    /// per selection — never rebuilt, which is what keeps its scroll state
+    /// and presentation across files, the same promise the main view keeps
+    /// across commits.
+    fn workspace_center(&mut self, cx: &mut Context<Self>) -> Entity<views::diff::Diff> {
+        if let Some(center) = self.workspace.center.clone() {
+            return center;
+        }
+        let host = config::host(cx);
+        let center = cx.new(|cx| views::diff::Diff::new(Vec::new(), host.clone(), cx));
+        let weak = cx.entity().downgrade();
+        center.update(cx, |v, _| {
+            v.set_focused(self.spot == Spot::Main);
+            v.hunk_action = Some(Rc::new(move |row, cx| {
+                _ = weak.update(cx, |this, cx| {
+                    let address = this
+                        .workspace
+                        .center
+                        .as_ref()
+                        .and_then(|center| center.read(cx).hunk_for_row(row));
+                    if let Some((path, hunk)) = address {
+                        this.workspace_stage_hunk(path, hunk, cx);
+                    }
+                });
+            }));
+        });
+        self.workspace.center = Some(center.clone());
+        center
+    }
+
+    /// `workspace.preview`: re-aim the center at the files cursor — the
+    /// workspace's answer to [`DevShell::sync_main_diff`], called from the
+    /// same two places: the tail of every command and the landing of every
+    /// refresh wave. The no-op path is one read of the current row plus a
+    /// key compare; a schedule is one side read plus one prepare on the
+    /// executor, landing through the request guard.
+    ///
+    /// The key names section, path *and* the files pane's refresh
+    /// generation: a staging write's wave re-lands the same selection with
+    /// a newer generation, which counts as new — the preview follows the
+    /// side that just moved without another keystroke.
+    fn sync_workspace_preview(&mut self, cx: &mut Context<Self>) {
+        // Only Changes has a preview to aim; History reads the commits pane
+        // and the one diff view instead, and re-aiming the hidden file
+        // center there would be a load nobody sees.
+        if self.workspace.destination != views::workspace::Destination::Changes {
+            return;
+        }
+        let Some(Screen::Files {
+            view: files_view,
+            generation,
+            ..
+        }) = self.panes.get("files")
+        else {
+            return;
+        };
+        let gen = generation.get().get();
+        let (cursor, current) = {
+            let v = files_view.read(cx);
+            (
+                v.cursor_visible(),
+                v.current_file()
+                    .map(|f| (f.section, f.path.clone(), f.path_text.clone())),
+            )
+        };
+        let Some((section, path, _)) = current.clone() else {
+            // An empty tree is not a selection: keep the last rows
+            // standing, but drop the key so the next file schedules.
+            self.workspace.last = None;
+            return;
+        };
+        let key = (section, path.clone(), gen);
+        if self.workspace.last.as_ref() == Some(&key) {
+            return;
+        }
+        // The sidebar follows the keyboard even when there is nothing new
+        // to load: grouped space pans on its own handle, minimally.
+        if let Some(row) = files_view.read(cx).grouped().cursor_row(cursor) {
+            self.workspace
+                .sidebar_scroll
+                .scroll_to_item(row, ScrollStrategy::Nearest);
+        }
+        // Conflicts render through their own markers presentation, not a
+        // diff — Phase 2 leaves the center on the last file.
+        let source = match section {
+            views::files::Section::Staged => {
+                gitten_core::source::DiffSource::Staged { path: path.clone() }
+            }
+            views::files::Section::Unstaged => {
+                gitten_core::source::DiffSource::Unstaged { path: path.clone() }
+            }
+            views::files::Section::Untracked => {
+                gitten_core::source::DiffSource::Untracked { path: path.clone() }
+            }
+            views::files::Section::Conflicts => return,
+        };
+        let Some((_, repo)) = self.repo.clone() else {
+            return;
+        };
+        self.workspace.last = Some(key);
+        let req = self.workspace.request + 1;
+        self.workspace.request = req;
+        let over = self.over.clone();
+        cx.spawn(async move |shell, cx| {
+            let mut job = None;
+            let live = shell
+                .update(cx, |shell, cx| {
+                    if shell.workspace.request != req {
+                        return false;
+                    }
+                    // An owned host crosses the thread boundary — the same
+                    // copy a pane refresh carries into its load half.
+                    let host = (*config::host(cx)).clone();
+                    let repo = repo.clone();
+                    job = Some(cx.background_spawn(async move {
+                        let loaded = gitten_app::acquire::diff_source(
+                            &source,
+                            &host.differ,
+                            &over,
+                            repo.as_ref(),
+                            false,
+                        )?;
+                        let Data::Diff(files) = loaded.data else {
+                            return Err("preview returned no diff".to_string());
+                        };
+                        let prepared = views::diff::prepare_files(&files, &host);
+                        Ok((files, prepared))
+                    }));
+                    true
+                })
+                .unwrap_or(false);
+            let Some(job) = job.filter(|_| live) else {
+                return;
+            };
+            let outcome = job.await;
+            // Apply half, guarded once more: a newer request wins, and a
+            // window that went away updates nothing.
+            _ = shell.update(cx, move |shell, cx| {
+                if shell.workspace.request != req {
+                    return;
+                }
+                match outcome {
+                    Ok((files, prepared)) => {
+                        if let Some(center) = shell.workspace.center.clone() {
+                            let host = config::host(cx);
+                            center
+                                .update(cx, |d, cx| d.replace_prepared(files, prepared, &host, cx));
+                        }
+                    }
+                    // A side that vanished under the selection — staged the
+                    // last hunk, deleted the file — is not a crash: one
+                    // sentence in the band, and the last rows keep standing.
+                    Err(e) => shell.set_notice(e),
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Aims the main view at `commit`.
+    ///
+    /// **Load at once, by request guard.** Every schedule bumps
+    /// [`DevShell::request`] and starts loading immediately; a starting
+    /// load proceeds only if its request is still the newest, so a fast
+    /// cursor run leaves one live load — the latest row's — and the dead
+    /// ones cost a compare each. The acquisition then runs on the
+    /// background executor behind a second copy of the same guard, so an
+    /// older load can never land over a newer one.
+    ///
+    /// The header is written *now*, not on arrival: the strip naming the
+    /// commit whose diff is coming is what makes the load visible in frame
+    /// one instead of an empty right half. An earlier failure stays on the
+    /// error band until the new rows replace them — a refusal to load does
+    /// not unname what is on screen.
+    fn schedule_main_diff(&mut self, commit: Commit, immediate: bool, cx: &mut Context<Self>) {
+        let shown = self
+            .head
+            .borrow()
+            .as_ref()
+            .is_some_and(|h| h.sha == commit.sha);
+        // Already on screen and resting: nothing to schedule. Shown and still
+        // loading: only a flush (enter) escalates the pending load to now.
+        if shown && !(immediate && self.loading.get()) {
+            return;
+        }
+        let Some((path, repo)) = self.repo.clone() else {
+            return;
+        };
+        let req = self.request.get() + 1;
+        self.request.set(req);
+        self.loading.set(true);
+        *self.head.borrow_mut() = Some(commit.clone());
+        let source = Source::Repo {
+            path,
+            arg: commit.sha.clone(),
+        };
+        if let Screen::Diff {
+            source: aim, label, ..
+        } = &self.main
+        {
+            *aim.borrow_mut() = Some(source.clone());
+            // The title names what is *coming*, the same promise the strip
+            // makes — and the same shape `open_diff` labelled its pane with.
+            label.replace(format!(
+                "{} {}",
+                &commit.sha[..commit.sha.len().min(8)],
+                commit.subject
+            ));
+        }
+        cx.spawn(async move |shell, cx| {
+            // Load half, on the executor: one acquisition plus one prepare.
+            // Built inside the guard so a superseded request never spawns it.
+            let mut job = None;
+            let live = shell
+                .update(cx, |shell, cx| {
+                    if shell.request.get() != req {
+                        return false;
+                    }
+                    // An owned host crosses the thread boundary — the same
+                    // copy a pane refresh carries into its load half.
+                    let host = (*config::host(cx)).clone();
+                    let repo = repo.clone();
+                    let source = source.clone();
+                    job = Some(cx.background_spawn(async move {
+                        let loaded = gitten_app::acquire::reacquire(
+                            View::Diff,
+                            &source,
+                            &host,
+                            Some(repo.as_ref()),
+                            &Overrides::default(),
+                        )?;
+                        let Data::Diff(files) = &loaded.data else {
+                            let e: String = "acquisition returned the wrong view".into();
+                            return Err(e);
+                        };
+                        let prepared = views::diff::prepare_files(files, &host);
+                        Ok((loaded.data, prepared, loaded.label))
+                    }));
+                    true
+                })
+                .unwrap_or(false);
+            let Some(job) = job.filter(|_| live) else {
+                return;
+            };
+            let outcome = job.await;
+            // Apply half, guarded twice more: a newer request wins, and a
+            // window that went away updates nothing.
+            _ = shell.update(cx, move |shell, cx| {
+                if shell.request.get() != req {
+                    return;
+                }
+                shell.loading.set(false);
+                match outcome {
+                    Ok((Data::Diff(files), prepared, label)) => {
+                        let Screen::Diff {
+                            view, generation, ..
+                        } = &shell.main
+                        else {
+                            return;
+                        };
+                        let host = config::host(cx);
+                        view.update(cx, |d, cx| d.replace_prepared(files, prepared, &host, cx));
+                        generation.set(shell.generation);
+                        // The rows were acquired with the file's own settings,
+                        // so the picks say so too — a stale override would be a
+                        // strip describing an algorithm that did not produce
+                        // this diff.
+                        shell.over = Overrides::default();
+                        // A success clears a previous *load's* failure — newer
+                        // rows replaced it. A write's refusal survives: it
+                        // names work git left behind, not rows that moved.
+                        if shell.error_is_load {
+                            shell.error = None;
+                            shell.error_is_load = false;
+                        }
+                        if let Screen::Diff { label: cell, .. } = &shell.main {
+                            cell.replace(label);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        shell.error = Some(GitError::new(e));
+                        shell.error_is_load = true;
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// `copy.selection`: the mouse's selection, or the keyboard's row. The
+    /// clipboard is the window system's here — [`Context::write_to_clipboard`]
+    /// — which is why this lives beside dispatch and not in a view.
+    fn copy_selection(&mut self, cx: &mut Context<Self>) {
+        if let Some(input) = self.input.as_ref() {
+            if let Some(text) = input.read(cx).selected_text() {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                self.set_notice("copied");
+            }
+            return;
+        }
+        let host = config::host(cx);
+        match self.active() {
+            Some(Screen::Diff { view, .. }) => {
+                let view = view.clone();
+                // The row the copy falls back to is the cursor's, so the drag
+                // has to be met where it left the list first.
+                view.update(cx, |d, _| d.reconcile(&host));
+                view.update(cx, |d, cx| d.copy(cx));
+            }
+            Some(Screen::Commits { view, .. }) => {
+                let view = view.clone();
+                view.update(cx, |v, _| v.reconcile(&host));
+                let text = view.read(cx).cursor_text();
+                if !text.is_empty() {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                    self.set_notice("copied");
+                }
+            }
+            Some(Screen::Files { view, .. }) => {
+                let view = view.clone();
+                view.update(cx, |f, _| f.reconcile(&host));
+                let text = view.read(cx).cursor_text();
+                if !text.is_empty() {
+                    // Letters first, then the path — the spelling git itself
+                    // prints, so it pastes into a shell usefully.
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                    self.set_notice("copied");
+                }
+            }
+            Some(Screen::Stashes { view, .. }) => {
+                let view = view.clone();
+                view.update(cx, |s, _| s.reconcile(&host));
+                let text = view.read(cx).cursor_text();
+                if !text.is_empty() {
+                    // The address first, then the message — same rule.
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                    self.set_notice("copied");
+                }
+            }
+            Some(Screen::Branches { view, .. }) => {
+                let view = view.clone();
+                view.update(cx, |b, _| b.reconcile(&host));
+                // The bare refname — the spelling every git command takes.
+                let text = view.read(cx).cursor_text();
+                if !text.is_empty() {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                    self.set_notice("copied");
+                }
+            }
+            Some(Screen::Custom(pane)) => {
+                let writes = self.writes();
+                pane.run("copy.selection", &host, writes.as_ref(), cx);
+            }
+            None => {}
+        }
+    }
+
+    /// One keypress, wherever it landed.
+    ///
+    /// Translation, resolution, dispatch — the whole of the input pipeline, and
+    /// deliberately short: what a key *means* is the live keymap's answer, not
+    /// this method's opinion. Anything consumed stops propagation, because the
+    /// alternative is a second, hardcoded meaning firing behind it — which is
+    /// precisely what this file used to have and must not again.
+    fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // The commit dialog stands over the workspace: Esc cancels it from
+        // anywhere and hands the keyboard back to the files pane — the same
+        // focus restoration the prompt path keeps when its field closes.
+        if self.commit_confirm
+            && ev.keystroke.key.as_str() == "escape"
+            && !ev.keystroke.modifiers.control
+            && !ev.keystroke.modifiers.alt
+            && !ev.keystroke.modifiers.platform
+            && !ev.keystroke.modifiers.function
+        {
+            cx.stop_propagation();
+            self.cancel_commit_confirm(cx);
+            return;
+        }
+        // An inspector field holds the keyboard: its own KEY_CONTEXT
+        // actions and the platform input own the press, so the pane keymap
+        // stays silent and typing never stages, discards or quits. Esc
+        // leaves the field for the files pane; plain Enter advances
+        // Summary to Description; Description breaks lines on Alt+Enter
+        // (the app's `input.newline` convention) and commits on Cmd+Enter
+        // (the global `workspace.commit` door) — plain Enter there is
+        // nothing, said by doing nothing rather than a bell. Anything else
+        // falls through to the field untouched.
+        if let Some(is_description) = self.workspace_field_focused(window, cx) {
+            let key = ev.keystroke.key.as_str();
+            let mods = &ev.keystroke.modifiers;
+            let clean = !mods.control && !mods.alt && !mods.platform && !mods.function;
+            if key == "escape" && clean {
+                cx.stop_propagation();
+                self.focus_named("files", cx);
+                cx.notify();
+                return;
+            }
+            if key == "enter" && clean && !mods.shift && !is_description {
+                if let Some(field) = self.workspace.description.clone() {
+                    window.focus(&field.read(cx).focus_handle(), cx);
+                }
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+            if key == "enter" && mods.alt && !mods.control && !mods.platform && is_description {
+                if let Some(field) = self.workspace.description.clone() {
+                    field.update(cx, |input, cx| {
+                        if input.is_multiline() {
+                            input.insert_newline(cx);
+                        }
+                    });
+                }
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+            return;
+        }
+        // Native keys, and only these. The desktop answers arrows, Tab,
+        // Enter and Esc directly — every other press belongs to a field
+        // (handled above), a platform binding (the menu adapters), or
+        // nothing at all. There is no keymap to consult and no chord state
+        // to keep: an unhandled key falls through untouched, never nagging
+        // about being unbound.
+        let key = ev.keystroke.key.as_str();
+        let mods = &ev.keystroke.modifiers;
+        let clean = !mods.control && !mods.alt && !mods.platform && !mods.function;
+        // The theme picker stands over the workspace on the palette's terms —
+        // arrows move, Enter applies and stays, Esc leaves — but a pick does
+        // not close it, so the arrows and Enter can be pressed again on the
+        // next candidate.
+        if self.theme_picker_open {
+            match key {
+                _ if key == "escape" && clean => {
+                    cx.stop_propagation();
+                    self.close_theme_picker(cx);
+                    return;
+                }
+                _ if key == "enter" && clean && !mods.shift => {
+                    cx.stop_propagation();
+                    self.run_theme_picker_selection(cx);
+                    return;
+                }
+                _ if key == "up" && clean && !mods.shift => {
+                    cx.stop_propagation();
+                    self.theme_picker_step(-1, cx);
+                    return;
+                }
+                _ if key == "down" && clean && !mods.shift => {
+                    cx.stop_propagation();
+                    self.theme_picker_step(1, cx);
+                    return;
+                }
+                _ => return,
+            }
+        }
+        // The palette stands over the workspace and owns the keyboard the
+        // way a field does: arrows move, Enter runs, Esc leaves — anything
+        // else types into its filter.
+        if self.palette_open {
+            match key {
+                _ if key == "escape" && clean => {
+                    cx.stop_propagation();
+                    self.close_palette(cx);
+                    return;
+                }
+                _ if key == "enter" && clean && !mods.shift => {
+                    cx.stop_propagation();
+                    self.run_palette_selection(cx);
+                    return;
+                }
+                _ if key == "up" && clean && !mods.shift => {
+                    cx.stop_propagation();
+                    self.palette_step(-1, cx);
+                    return;
+                }
+                _ if key == "down" && clean && !mods.shift => {
+                    cx.stop_propagation();
+                    self.palette_step(1, cx);
+                    return;
+                }
+                _ => return,
+            }
+        }
+        if key == "escape" && clean {
+            cx.stop_propagation();
+            self.back(cx);
+            cx.notify();
+            return;
+        }
+        if key == "enter" && clean && !mods.shift {
+            if self.commit_confirm {
+                cx.stop_propagation();
+                self.confirm_commit(cx);
+                return;
+            }
+            if self.input.is_some() {
+                cx.stop_propagation();
+                self.close_input(true, cx);
+                return;
+            }
+            return;
+        }
+        if key == "tab" && clean {
+            cx.stop_propagation();
+            self.cycle_focus(
+                match mods.shift {
+                    true => -1,
+                    false => 1,
+                },
+                window,
+                cx,
+            );
+            return;
+        }
+        // The arrows move whatever holds the keyboard through the same
+        // named verbs a click would run: the center when the diff region
+        // is up, the focused list otherwise. Every view answers the whole
+        // set — sideways in a list is a no-op, never a nag.
+        if clean && !mods.shift {
+            let verb = match key {
+                "up" => Some("view.up"),
+                "down" => Some("view.down"),
+                "pageup" => Some("view.page-up"),
+                "pagedown" => Some("view.page-down"),
+                "home" => Some("view.top"),
+                "end" => Some("view.bottom"),
+                "left" => Some("view.left"),
+                "right" => Some("view.right"),
+                _ => None,
+            };
+            if let Some(verb) = verb {
+                cx.stop_propagation();
+                self.run_command(verb, cx);
+                return;
+            }
+        }
+        // The file filter, the one single-key door the mock keeps: `/`
+        // filters the destination's own list — files in Changes, commits
+        // in History.
+        if key == "/" && clean && !mods.shift {
+            let search = match self.workspace.destination {
+                views::workspace::Destination::History => "commits.search",
+                _ => "files.search",
+            };
+            cx.stop_propagation();
+            self.run_command(search, cx);
+        }
+    }
+
+    /// The pixels the smooth path feeds the list for a fixed scroll name.
+    ///
+    /// The **command** signs them, not the finger: a finger-flick away from
+    /// you is positive, but `view.scroll-down` means that flick scrolls
+    /// *down* — so the name flips it. `[view] scroll` multiplies.
+    fn smooth_pixels(command: &str, dy: f32, rows: usize) -> Option<f32> {
+        let px = dy.abs() * rows as f32;
+        match command {
+            "view.scroll-up" => Some(px),
+            "view.scroll-down" => Some(-px),
+            _ => None,
+        }
+    }
+
+    /// One wheel event, wherever it rolled.
+    ///
+    /// Two rules, both inherited from the probe this replaced: the gesture has
+    /// **one axis for its life** ([`views::diff::locked`], `gpui`'s own lock),
+    /// and what is locked is decided *here*, in the capture phase, before the
+    /// list's own scroll handler can turn a sideways flick into vertical
+    /// movement.
+    ///
+    /// What changed with command dispatch is who owns the vertical half:
+    /// the wheel scrolls natively, always — no keymap is consulted, so no
+    /// binding can rebind, page, or stop it. What ships (`view.scroll-down`
+    /// semantics) moves the list by the event's own pixels, which is what
+    /// keeps a trackpad smooth.
+    fn on_wheel(&mut self, ev: &ScrollWheelEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // A wheel notch is an intervening event wherever it lands: a chord
+        // half-typed when the fingers touch the wheel is not half-typed any
+        // more. The same rule the focus and host checks apply, one line each.
+        // A project menu or dialog stands open: its occluding surface
+        // keeps the rows out of the hit path, while this capture
+        // interceptor stands aside so a handler on the visible panel can
+        // still see the event. Stopping propagation here would prevent that
+        // bubble handler.
+        if self.open.is_some() {
+            return;
+        }
+        // The workspace owns the whole middle, so the capture handler
+        // meets its three regions directly — center, sidebar rail, then
+        // the natively-scrolling chrome. The locked delta pans/scrolls
+        // the region directly; the gesture lock (`OngoingScroll`) lives
+        // for the whole gesture, never per-event, so a diagonal flick
+        // cannot drift the rows.
+        let mut ongoing = self.ongoing.get();
+        let delta = views::diff::locked(
+            ev.delta.pixel_delta(window.line_height()),
+            ev.modifiers.shift,
+            &mut ongoing,
+            ev.touch_phase,
+        );
+        self.ongoing.set(ongoing);
+        if let Some(center) = self.workspace.center.clone() {
+            if center.read(cx).list_bounds().contains(&ev.position) {
+                let mut moved = false;
+                if !delta.x.is_zero() {
+                    moved |= center.read(cx).pan_pixels(-f32::from(delta.x));
+                }
+                if !delta.y.is_zero() {
+                    let host = self.fresh_host(cx);
+                    // Native scroll, always: a flick away from you scrolls
+                    // down, toward you scrolls up — the shipped
+                    // `view.scroll-*` meaning, without consulting a keymap
+                    // no finger can rebind. Cursor verbs never rode the
+                    // wheel here; only pixels did.
+                    let name = match f32::from(delta.y) > 0.0 {
+                        true => "view.scroll-down",
+                        false => "view.scroll-up",
+                    };
+                    if let Some(px) = Self::smooth_pixels(name, f32::from(delta.y), host.view.rows)
+                    {
+                        moved |= center.update(cx, |v, _| v.scroll_pixels(px, &host));
+                    }
+                }
+                cx.stop_propagation();
+                if moved {
+                    cx.notify();
+                }
+                return;
+            }
+        }
+        // The sidebar rail: the wheel pans the grouped list on its own
+        // handle (`workspace.sidebar_scroll`) — the stack list's handle
+        // addresses hidden rows, so the glance must never fall through
+        // to it. Pixels accumulate to whole rail rows (uniform ROW_H
+        // items, so a trackpad's small deltas add up instead of dying
+        // to rounding); the keyboard stays where it was. Any resolved
+        // name that is not a smooth scroll is a cursor verb, ignored on
+        // a glance the way an unbound key is.
+        //
+        // The rect mirrors `workspace_body`'s geometry — title bar and
+        // destination header above, status bar below, the spec width
+        // rule on the left — the one place besides composition that
+        // names those numbers.
+        let vp = window.viewport_size();
+        let rail = views::workspace::sidebar_width(f32::from(vp.width));
+        let in_sidebar = f32::from(ev.position.x) >= 0.0
+            && f32::from(ev.position.x) < rail
+            && f32::from(ev.position.y) >= TITLE_H
+            && f32::from(ev.position.y) < f32::from(vp.height) - chrome::STATUS_H;
+        if in_sidebar {
+            let mut moved = false;
+            if !delta.y.is_zero() {
+                let grouped_len = match self.panes.get("files") {
+                    Some(Screen::Files { view, .. }) => view.read(cx).grouped().rows.len(),
+                    _ => 0,
+                };
+                let host = self.fresh_host(cx);
+                // Native scroll, always — the shipped `view.scroll-*`
+                // meaning, without consulting a keymap. A glance pans the
+                // rail; cursor verbs never rode it.
+                let name = match f32::from(delta.y) > 0.0 {
+                    true => "view.scroll-down",
+                    false => "view.scroll-up",
+                };
+                if let Some(px) = Self::smooth_pixels(name, f32::from(delta.y), host.view.rows) {
+                    // The mirror against the rail's actual position
+                    // first: the keyboard-follow scroll moves the list
+                    // without stepping it, and stepping from a stale
+                    // top jumps.
+                    let max = grouped_len.saturating_sub(1);
+                    let mirror = self.workspace.sidebar_top.get();
+                    let top = views::workspace::reconcile_top(
+                        &self.workspace.sidebar_scroll,
+                        mirror,
+                        crate::graph::ROW_H,
+                        max,
+                    );
+                    let acc = match top == mirror {
+                        // Another path moved the list: the banked
+                        // remainder belongs to the old position, so
+                        // this flick starts fresh.
+                        true => self.workspace.sidebar_px.get() + px,
+                        false => {
+                            self.workspace.sidebar_top.set(top);
+                            px
+                        }
+                    };
+                    match views::workspace::wheel_step(top, acc, crate::graph::ROW_H, max) {
+                        Some((next, rest)) => {
+                            // Strict: the step already spent its
+                            // pixels, so the row lands on top even
+                            // when it is already visible. Non-strict
+                            // would sit still while the mirror walks
+                            // away from the window it claims to name.
+                            self.workspace
+                                .sidebar_scroll
+                                .scroll_to_item_strict(next, ScrollStrategy::Top);
+                            self.workspace.sidebar_top.set(next);
+                            self.workspace.sidebar_px.set(rest);
+                            moved |= next != top;
+                        }
+                        None => self.workspace.sidebar_px.set(acc),
+                    }
+                }
+            }
+            cx.stop_propagation();
+            if moved {
+                cx.notify();
+            }
+        }
+        // The inspector, the destination header and the chrome scroll
+        // natively or not at all: falling through would scroll rows
+        // nobody sees. Returning unconsumed leaves text inputs their
+        // own pan.
+    }
+}
+
+impl DevShell {
+    /// The workspace middle region: 76px destination header over a
+    /// sidebar + center-diff + inspector row. Widths are fixed px per
+    /// the spec (255/266, 280/295 past 1550px), read from the viewport once
+    /// here at composition time — never from inside a view.
+    /// The 76px destination band: a 19px title over dim counts on the left,
+    /// the working-copy sentence on the right. One function because Changes
+    /// and History differ only in what they name, and two copies would drift.
+    fn destination_header(&self, host: &Host, title: &'static str, sub: SharedString) -> Div {
+        let c = host.theme.chrome;
+        div()
+            .flex_none()
+            .h(px(views::workspace::HEADER_H))
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .px(px(22.0))
+            .border_b_1()
+            .border_color(rgb(c.border))
+            .bg(rgb(c.title_bg))
+            .font_family(host.chrome_family.clone())
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .justify_center()
+                    .gap_y(px(4.0))
+                    .child(
+                        div()
+                            .text_size(px(19.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(c.fg))
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .text_size(px((host.font.size * chrome::TOPBAR_TEXT_SCALE).round()))
+                            .text_color(rgb(host.theme.dim_on(theme::Surface::Title)))
+                            .child(sub),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(chrome::gap_s(&host.font))
+                    .text_size(px((host.font.size * chrome::TOPBAR_TEXT_SCALE).round()))
+                    .text_color(rgb(host.theme.dim_on(theme::Surface::Title)))
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(5.0))
+                            .h(px(5.0))
+                            .rounded_full()
+                            .bg(rgb(c.accent)),
+                    )
+                    .child("Working copy"),
+            )
+    }
+
+    /// The History destination: the branch timeline beside the selected
+    /// commit's diff. The sidebar is already built by the caller with its
+    /// CURRENT BRANCH note; this owns the header and the two-pane centre.
+    fn history_body(
+        &mut self,
+        host: &Host,
+        sidebar: impl IntoElement,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let dim = host.theme.dim_on(theme::Surface::Context);
+        let Some(commits) = self.column_commits() else {
+            return div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(rgb(dim))
+                .child("no commit history in this view")
+                .into_any_element();
+        };
+        let Screen::Diff {
+            view: diff_view, ..
+        } = &self.main
+        else {
+            return div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(rgb(dim))
+                .child("no commit diff in this view")
+                .into_any_element();
+        };
+        let diff_view = diff_view.clone();
+        // The timeline follows the commits cursor: when it moves — a key, a
+        // click, a refresh re-anchor — park one scroll on the timeline's own
+        // handle. `usize::MAX` is "never scrolled", so the first render lands
+        // on the cursor rather than at row zero.
+        let cursor = commits.read(cx).cursor();
+        if self.workspace.history_cursor.get() != cursor {
+            self.workspace.history_cursor.set(cursor);
+            self.workspace
+                .history_scroll
+                .scroll_to_item(cursor, ScrollStrategy::Nearest);
+        }
+        let branch = self
+            .head_label(cx)
+            .unwrap_or_else(|| SharedString::from("detached HEAD"));
+
+        // A timeline click is two named steps, the same pair a keyboard move
+        // leaves through: move the commits cursor, then re-aim the one diff.
+        let me = cx.entity().downgrade();
+        let select: views::history::Select = Rc::new(move |row, cx| {
+            if let Some(shell) = me.upgrade() {
+                shell.update(cx, |this, cx| {
+                    if let Some(commits) = this.column_commits() {
+                        let host = config::host(cx);
+                        commits.update(cx, |v, cx| {
+                            v.select_row(row, &host);
+                            cx.notify();
+                        });
+                    }
+                    this.sync_main_diff(cx);
+                    cx.notify();
+                });
+            }
+        });
+        let me_changes = cx.entity().downgrade();
+        let changes: Rc<dyn Fn(&mut App)> = Rc::new(move |cx| {
+            if let Some(shell) = me_changes.upgrade() {
+                shell.update(cx, |this, cx| this.run_command("workspace.changes", cx));
+            }
+        });
+        let changed = self
+            .panes
+            .get("files")
+            .and_then(|screen| match screen {
+                Screen::Files { view, .. } => Some(view.read(cx).changed()),
+                _ => None,
+            })
+            .unwrap_or(0);
+        let deps = views::history::HistoryDeps {
+            commits: commits.clone(),
+            diff: diff_view,
+            scroll: self.workspace.history_scroll.clone(),
+            select,
+            changes,
+            changed,
+            branch: branch.clone(),
+        };
+        let history = views::history::render_history(&deps, cx);
+        let total = commits.read(cx).total();
+        let header = self.destination_header(
+            host,
+            "History",
+            SharedString::from(format!("{branch} \u{00b7} {total} recent commits")),
+        );
+
+        div()
+            .min_h_0()
+            .flex_grow(1.0)
+            .flex()
+            .flex_row()
+            .overflow_hidden()
+            .child(sidebar)
+            .child(
+                div()
+                    .min_w_0()
+                    .min_h_0()
+                    .flex_grow(1.0)
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden()
+                    .child(header)
+                    .child(
+                        div()
+                            .min_h_0()
+                            .flex_grow(1.0)
+                            .overflow_hidden()
+                            .child(history),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn workspace_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let host = config::host(cx);
+        let c = host.theme.chrome;
+        let viewport_w = f32::from(window.viewport_size().width);
+        let side_w = views::workspace::sidebar_width(viewport_w);
+        let insp_w = views::workspace::inspector_width(viewport_w);
+
+        let Some(files_screen) = self.panes.get("files").cloned() else {
+            // A fixture has no working tree and therefore no sidebar to
+            // group: the workspace is a repository layout, said plainly.
+            return div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(rgb(host.theme.dim_on(theme::Surface::Context)))
+                .child("the workspace needs a repository \u{2014} this view has none")
+                .into_any_element();
+        };
+        let Screen::Files {
+            view: files_view, ..
+        } = files_screen
+        else {
+            unreachable!("panes are named")
+        };
+
+        let (changed, filter_note, cursor_file) = {
+            let v = files_view.read(cx);
+            (
+                v.changed(),
+                v.filter_note(),
+                v.current_file().map(|f| {
+                    (
+                        f.section,
+                        f.path_text.clone(),
+                        f.dir.clone(),
+                        f.name.clone(),
+                    )
+                }),
+            )
+        };
+        let mut status_line = format!("{changed} files changed");
+        if let Some(note) = &filter_note {
+            status_line = format!("{status_line} \u{00b7} {note}");
+        }
+        let title: SharedString = match &self.repo {
+            Some((path, _)) => path
+                .file_name()
+                .map(|n| SharedString::from(n.to_string_lossy().into_owned()))
+                .unwrap_or_else(|| SharedString::from("repository")),
+            None => SharedString::from("no repository"),
+        };
+        // Every sidebar control resolves through the named dispatch — the
+        // same names the keyboard resolves to, so a button is an adapter
+        // and not a second path.
+        let me = cx.entity().downgrade();
+        let dispatch: views::sidebar::Dispatch = Rc::new(move |command, cx| {
+            if let Some(shell) = me.upgrade() {
+                shell.update(cx, |this, cx| this.run_command(command, cx));
+            }
+        });
+        let deps = views::sidebar::SidebarDeps {
+            files: files_view.clone(),
+            dispatch: dispatch.clone(),
+            title,
+            subtitle: SharedString::from(
+                self.repo
+                    .as_ref()
+                    .map(|(path, _)| {
+                        let (dir, name) = repo_title(path, home());
+                        format!("{dir}{name}")
+                    })
+                    .unwrap_or_default(),
+            ),
+            changed,
+            filter_note: filter_note.clone().map(SharedString::from),
+            destination: self.workspace.destination,
+            history_note: (self.workspace.destination == views::workspace::Destination::History)
+                .then(|| {
+                    self.head_label(cx)
+                        .unwrap_or_else(|| SharedString::from("detached HEAD"))
+                }),
+            scroll: self.workspace.sidebar_scroll.clone(),
+        };
+        let sidebar = div()
+            .id("workspace-sidebar")
+            .debug_selector(|| "workspace-sidebar".to_string())
+            .flex_none()
+            .w(px(side_w))
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .border_r_1()
+            .border_color(rgb(c.border))
+            // A click anywhere here is the keyboard coming back to the
+            // pane this destination reads: the files cursor in Changes,
+            // the commits cursor in History. Capture phase, so the row's
+            // own handler still stages the row the keyboard is already on.
+            .capture_any_mouse_down(cx.listener(|this, _, _, cx| {
+                let pane = match this.workspace.destination {
+                    views::workspace::Destination::Changes => "files",
+                    views::workspace::Destination::History => "commits",
+                };
+                this.focus_named(pane, cx);
+            }))
+            .child(views::sidebar::render_sidebar(&deps, cx));
+
+        // The History destination is a different centre — a timeline beside
+        // the commit's diff — so it leaves through its own assembly before
+        // any of the working-tree pieces are built.
+        if self.workspace.destination == views::workspace::Destination::History {
+            return self.history_body(&host, sidebar, cx);
+        }
+
+        // The center: breadcrumb, Unified/Split toggle, status and totals
+        // over the shared diff view, fed one file's rows per selection.
+        let center = self.workspace_center(cx);
+        let summary = center.read(cx).file_summary();
+        let (layout_names, layout_index) = {
+            let v = center.read(cx);
+            (v.layout_names(), v.layout_index())
+        };
+        let status_word = match cursor_file.as_ref().map(|(s, _, _, _)| s) {
+            Some(views::files::Section::Staged) => "Staged",
+            Some(views::files::Section::Untracked) => "New file",
+            Some(views::files::Section::Conflicts) => "Conflict",
+            _ => "Modified",
+        };
+        let breadcrumb: AnyElement = match &cursor_file {
+            Some((_, _, dir, name)) => div()
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .min_w_0()
+                .child(chrome::icon(
+                    "gitten/file.svg",
+                    14.0,
+                    host.theme.dim_on(theme::Surface::Title),
+                ))
+                .child(chrome::path_spans(
+                    &host,
+                    dir.clone(),
+                    name.clone(),
+                    c.fg,
+                    theme::Surface::Title,
+                    false,
+                ))
+                .into_any_element(),
+            None => div()
+                .text_color(rgb(host.theme.dim_on(theme::Surface::Title)))
+                .child("No file selected")
+                .into_any_element(),
+        };
+        // Totals name the diff on screen, not the selection: a load still
+        // in flight must not print the new file's name over the old file's
+        // numbers.
+        let totals: Option<AnyElement> = match (&summary, &cursor_file) {
+            (Some(s), Some((_, path_text, _, _))) if s.path.as_str() == path_text.as_ref() => Some(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(chrome::gap_m(&host.font))
+                    .child(
+                        div()
+                            .text_color(rgb(host.theme.diff.adds_fg))
+                            .child(SharedString::from(format!("+{}", s.adds))),
+                    )
+                    .child(
+                        div()
+                            .text_color(rgb(host.theme.diff.dels_fg))
+                            .child(SharedString::from(format!("\u{2212}{}", s.dels))),
+                    )
+                    .into_any_element(),
+            ),
+            _ => None,
+        };
+        let toggle = div()
+            .flex_none()
+            .flex()
+            .flex_row()
+            .p(px(2.0))
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(rgb(c.border))
+            .bg(rgb(c.bg))
+            .children(
+                layout_names
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, name)| {
+                        let center = center.clone();
+                        let chosen = i == layout_index;
+                        div()
+                            .id(("ws-layout", i))
+                            .px(px(8.0))
+                            .py(px(4.0))
+                            .rounded(px(4.0))
+                            .cursor_pointer()
+                            .bg(rgb(match chosen {
+                                true => host.theme.chrome.title_bg,
+                                false => c.bg,
+                            }))
+                            .text_color(rgb(match chosen {
+                                true => c.fg,
+                                false => host.theme.dim_on(theme::Surface::Title),
+                            }))
+                            .child(title_case(name))
+                            // Presentation state, not app dispatch: the toggle
+                            // names one of the registry entries this very view
+                            // published. The rebuild keeps the reading position
+                            // and carries the selection by content (see
+                            // `snapshot_selection`); an unresolvable end drops it.
+                            .on_click(move |_, _, cx| {
+                                let host = config::host(cx);
+                                center.update(cx, |v, cx| v.set_layout(i, &host, cx));
+                            })
+                            .into_any_element()
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        // The center header: breadcrumb left, status + totals + the
+        // Unified/Split segmented control right — the reference's 48px
+        // diff-toolbar, chosen segment on the surface over the rail tint.
+        let center_header = div()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .bg(rgb(host.theme.chrome.title_bg))
+            .font_family(host.chrome_family.clone())
+            .text_size(px(11.0))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px(px(18.0))
+                    .h(px(48.0))
+                    .border_b_1()
+                    .border_color(rgb(c.border))
+                    .child(div().min_w_0().flex_shrink(1.0).child(breadcrumb))
+                    .child(toggle),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px(px(18.0))
+                    .h(px(38.0))
+                    .border_b_1()
+                    .border_color(rgb(c.border))
+                    .child(
+                        div().flex().gap(px(8.0)).child(status_word).child(
+                            div()
+                                .text_color(rgb(host.theme.dim_on(theme::Surface::Title)))
+                                .child("in working tree"),
+                        ),
+                    )
+                    .children(totals),
+            );
+        let staged_side = matches!(
+            self.workspace.last,
+            Some((views::files::Section::Staged, _, _))
+        );
+        center.update(cx, |view, _| {
+            view.hunk_action_label = if staged_side {
+                "− Unstage hunk"
+            } else {
+                "+ Stage hunk"
+            }
+        });
+        let center_pane = div()
+            .id("workspace-center")
+            .debug_selector(|| "workspace-center".to_string())
+            .flex_grow(1.0)
+            .min_w_0()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .capture_any_mouse_down(cx.listener(|this, _, _, cx| this.set_spot(Spot::Main, cx)))
+            .child(center_header)
+            .child(
+                div()
+                    .min_h_0()
+                    .flex_grow(1.0)
+                    .overflow_hidden()
+                    .child(center.clone()),
+            );
+
+        // The inspector's rail: staged summary, drafts and commit, drawn
+        // from the files pane's refresh and the shell's draft store — never
+        // a second read of the repository. The fields exist from
+        // `ensure_inspector_fields` above; the gate reads the draft they
+        // mirror on every edit.
+        self.ensure_inspector_fields(cx);
+        let me_inspector = cx.entity().downgrade();
+        let inspect_dispatch: views::inspector::Dispatch = Rc::new(move |command, cx| {
+            if let Some(shell) = me_inspector.upgrade() {
+                shell.update(cx, |this, cx| this.run_command(command, cx));
+            }
+        });
+        let (staged_files, staged_total) = self.files_staged(cx);
+        let draft_has_message = self
+            .draft_key()
+            .as_ref()
+            .and_then(|key| self.drafts.get(key))
+            .is_some_and(CommitDraft::has_message);
+        let (can_commit, commit_note) = match (staged_total > 0, draft_has_message) {
+            (false, _) => (false, SharedString::from("No staged changes")),
+            (true, false) => (
+                false,
+                SharedString::from("Write a summary to enable commit"),
+            ),
+            (true, true) => (true, SharedString::from("")),
+        };
+        let inspector_deps = views::inspector::InspectorDeps {
+            summary: self.workspace.summary.clone(),
+            description: self.workspace.description.clone(),
+            staged: staged_files,
+            staged_hunks: staged_total,
+            can_commit,
+            commit_note,
+            dispatch: inspect_dispatch,
+        };
+        let inspector = div()
+            .id("workspace-inspector")
+            .debug_selector(|| "workspace-inspector".to_string())
+            .flex_none()
+            .w(px(insp_w))
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .border_l_1()
+            .border_color(rgb(c.border))
+            .child(views::inspector::render_inspector(&inspector_deps, cx));
+
+        // The destination header: the reference's 76px band, shared with the
+        // History destination so the two cannot drift.
+        let header = self.destination_header(
+            &host,
+            match self.workspace.destination {
+                views::workspace::Destination::Changes => "Changes",
+                views::workspace::Destination::History => "History",
+            },
+            SharedString::from(status_line.clone()),
+        );
+
+        // The confirmation standing over the workspace: branch, message and
+        // staged counts as they stand now — the submit re-gates, so a dialog
+        // left standing across a staging change cannot commit what it
+        // previewed. Rendered through the shared centered panel; Esc and
+        // Cancel dismiss with the draft untouched (see `on_key`).
+        let staged_len = inspector_deps.staged.len();
+        let dialog = self.commit_confirm.then(|| {
+            let key = self.draft_key();
+            let draft = key
+                .as_ref()
+                .and_then(|key| self.drafts.get(key))
+                .cloned()
+                .unwrap_or_default();
+            let branch = self
+                .head_label(cx)
+                .unwrap_or_else(|| SharedString::from("no branch loaded"));
+            let dim = rgb(host.theme.dim_on(theme::Surface::Context));
+            let weak = cx.entity().downgrade();
+            let cancel = weak.clone();
+            let close = weak.clone();
+            let button = |id: &'static str, label: &'static str, lit: bool| {
+                div()
+                    .id(id)
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .h(px(28.0))
+                    .px(chrome::gap_l(&host.font))
+                    .rounded(px(chrome::RADIUS))
+                    .cursor_pointer()
+                    .bg(rgb(match lit {
+                        true => c.accent,
+                        false => c.raised,
+                    }))
+                    .text_color(rgb(match lit {
+                        true => c.status_bg,
+                        false => c.fg,
+                    }))
+                    .child(label)
+            };
+            let mut message: Vec<AnyElement> = vec![div()
+                .text_size(px(13.0))
+                .text_color(rgb(c.fg))
+                .child(SharedString::from(draft.summary.clone()))
+                .into_any_element()];
+            if !draft.description.trim().is_empty() {
+                message.push(
+                    div()
+                        .text_color(dim)
+                        .child(SharedString::from(draft.description.clone()))
+                        .into_any_element(),
+                );
+            }
+            message.push(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(dim)
+                    .child(SharedString::from(format!(
+                        "{staged_len} {} \u{00b7} {staged_total} {} staged",
+                        match staged_len {
+                            1 => "file",
+                            _ => "files",
+                        },
+                        match staged_total {
+                            1 => "hunk",
+                            _ => "hunks",
+                        },
+                    )))
+                    .into_any_element(),
+            );
+            let close = modal::close_button(&host, "ws-commit-close")
+                .on_click(move |_, _, cx| {
+                    _ = close.update(cx, |this, cx| this.cancel_commit_confirm(cx));
+                })
+                .into_any_element();
+            modal::centered(
+                &host,
+                modal::Width::Max(560.0),
+                vec![
+                    modal::heading(&host, "Commit staged changes", Some(close)).into_any_element(),
+                    div()
+                        .flex()
+                        .gap(chrome::gap_s(&host.font))
+                        .mb(px(16.0))
+                        .text_color(dim)
+                        .child("Branch:")
+                        .child(div().text_color(rgb(c.fg)).child(branch))
+                        .into_any_element(),
+                    modal::preview(&host, message),
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap(chrome::gap_m(&host.font))
+                        .mt(px(20.0))
+                        .child(button("ws-commit-cancel", "Cancel", false).on_click(
+                            move |_, _, cx| {
+                                _ = cancel.update(cx, |this, cx| this.cancel_commit_confirm(cx));
+                            },
+                        ))
+                        .child(button("ws-commit-confirm", "Commit", true).on_click(
+                            move |_, _, cx| {
+                                _ = weak.update(cx, |this, cx| this.confirm_commit(cx));
+                            },
+                        ))
+                        .into_any_element(),
+                ],
+            )
+        });
+        let body = div()
+            .min_h_0()
+            .flex_grow(1.0)
+            .flex()
+            .flex_row()
+            .overflow_hidden()
+            .child(sidebar)
+            .child(
+                div()
+                    .min_w_0()
+                    .min_h_0()
+                    .flex_grow(1.0)
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden()
+                    .child(header)
+                    .child(
+                        div()
+                            .min_h_0()
+                            .flex_grow(1.0)
+                            .flex()
+                            .overflow_hidden()
+                            .child(center_pane)
+                            .child(inspector),
+                    ),
+            );
+        match dialog {
+            Some(dialog) => div()
+                .size_full()
+                .child(body)
+                .child(dialog)
+                .into_any_element(),
+            None => body.into_any_element(),
+        }
+    }
+}
+
+// The `Screen` adapter above takes plain arguments so it reads as one thing;
+// what follows is the shell itself.
+impl Render for DevShell {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // One-shot: the first render of the shell is the first frame being
+        // assembled, which is the end of what a startup measurement covers.
+        if !self.first_render.replace(true) {
+            start::mark("first render");
+        }
+        let overlay = self.stats.as_mut().map(|s| {
+            s.tick();
+            (s.frames(), s.rows(), s.heap(), s.load.clone())
+        });
+        if overlay.is_some() {
+            window.request_animation_frame();
+        }
+
+        // The live host, read per frame, not the one captured when this was
+        // built. It was the captured one, which meant the window chrome and the
+        // font for the whole window silently did not hot-reload while every view
+        // inside it did — the exact trap `docs/extending.md` warns about, in the
+        // one place nobody looked.
+        let host = config::host(cx);
+        let c = host.theme.chrome;
+        let f = &host.font;
+        // The reference's narrow tier: under 1150px the branch chip drops
+        // its `from <base>` suffix (the 850px composer move stays a browser
+        // reference — the desktop keeps its inspector and scrolls instead
+        // of shearing the grid). Read here at composition, never in a view.
+        let narrow = f32::from(window.viewport_size().width) < 1150.0;
+
+        let ch = host.font.char_width();
+
+        let me = cx.entity().downgrade();
+        // The branch chip. One small struct per frame, no second git call
+        // anywhere. Filled with `raised`, the quiet chip surface — the status
+        // badge keeps the accent fill to itself, so the two never compete.
+        // Detached HEAD names its abbreviated commit; a fixture with no
+        // branch pane draws nothing.
+        let head_chip = self.panes.get("branches").and_then(|screen| {
+            let Screen::Branches { view, .. } = screen else {
+                return None;
+            };
+            view.read(cx).head_info()
+        });
+
+        // Themes: the picker's mouse door, the reference's `.theme-toggle` — a
+        // square palette glyph to the left of Commands. One name —
+        // `theme.picker` — for this button, the command list and whatever key
+        // a config binds, so the doors cannot drift.
+        let theme_button = {
+            let me = me.clone();
+            let ink = host.theme.dim_on(theme::Surface::Title);
+            div()
+                .id("theme-button")
+                .debug_selector(|| "theme-button".to_string())
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(28.0))
+                .rounded(px(chrome::RADIUS))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(c.raised)))
+                .on_click(move |_, _, cx| {
+                    _ = me.update(cx, |this, cx| this.run_command("theme.picker", cx));
+                })
+                .child(chrome::icon("gitten/palette.svg", 15.0, ink))
+                .into_any_element()
+        };
+
+        // Commands: the palette's mouse door. One name —
+        // `commands.palette` — for this button, the menu adapter and
+        // `cmd-k`, so the three cannot drift into three behaviors. The
+        // reference draws it as plain muted text with a magnifier, not a
+        // bordered control: the only button in the strip is Push.
+        let commands_button = {
+            let me = me.clone();
+            let ink = host.theme.dim_on(theme::Surface::Title);
+            div()
+                .id("commands-button")
+                .debug_selector(|| "commands-button".to_string())
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px((ch * 0.7).round()))
+                .text_size(px((f.size * chrome::TOPBAR_TEXT_SCALE).round()))
+                .font_family(host.chrome_family.clone())
+                .text_color(rgb(ink))
+                .cursor_pointer()
+                .hover(|s| s.text_color(rgb(c.fg)))
+                .on_click(move |_, _, cx| {
+                    _ = me.update(cx, |this, cx| this.run_command("commands.palette", cx));
+                })
+                .child(chrome::icon("gitten/search.svg", 15.0, ink))
+                .child("Commands")
+                .child(div().flex_none().child("\u{2318}K"))
+                .into_any_element()
+        };
+
+        // Push: `repo.push`'s mouse door, labeled from the loaded upstream
+        // distance — never a fresh read. `None` is unknowable and keeps
+        // its em-dash; `Some(0)` is published and goes inert, because a
+        // button that sent nothing would be the lie. Anything else sends
+        // through the keyboard verb, whose refusals land verbatim in the
+        // band — detached HEAD included, which is why it stays live.
+        let push_button = self
+            .panes
+            .get("branches")
+            .and_then(|screen| {
+                let Screen::Branches { view, .. } = screen else {
+                    return None;
+                };
+                view.read(cx).head_info()
+            })
+            .map(|info| {
+                let live = !(info.branch && info.ahead == Some(0));
+                let mut button = div()
+                    .id("push-button")
+                    .debug_selector(|| "push-button".to_string())
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .h(px(CHIP_H))
+                    .px(chrome::gap_l(&host.font))
+                    .bg(rgb(c.raised))
+                    .border_1()
+                    .border_color(rgb(c.border))
+                    .rounded(px(chrome::RADIUS))
+                    .text_size(px((f.size * chrome::TOPBAR_TEXT_SCALE).round()))
+                    .font_family(host.chrome_family.clone());
+                button = match live {
+                    true => {
+                        let me = me.clone();
+                        button
+                            .text_color(rgb(c.fg))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(c.keycap)).border_color(rgb(c.faint)))
+                            .on_click(move |_, _, cx| {
+                                _ = me.update(cx, |this, cx| this.run_command("repo.push", cx));
+                            })
+                    }
+                    false => button.text_color(rgb(host.theme.dim_on(theme::Surface::Title))),
+                };
+                button.child(push_label(info.ahead)).into_any_element()
+            });
+
+        let error = self.error.as_ref().map(|e| e.summary.clone());
+        let notice = self.notice.clone();
+        let running = self.running.as_ref().map(|(label, at)| {
+            // Whole seconds, and only once there is one to say: a job that
+            // answers inside its first second reads as if it never ran.
+            match at.elapsed().as_secs() {
+                0 => SharedString::from(label.as_str()),
+                s => SharedString::from(format!("{label} · {s}s")),
+            }
+        });
+        let running = running
+            .or_else(|| (self.refresh_pending > 0).then(|| "refreshing repository".into()))
+            // The main view's own load, which does not ride the job queue:
+            // said here rather than invented for it, because the band is the
+            // one place a background something is spoken of.
+            .or_else(|| self.loading.get().then(|| "loading diff".into()));
+        let input = self.input.clone();
+
+        // The one focusable element in the window, and where key dispatch enters
+        // it: a capture-phase listener on the root, so a keystroke is translated
+        // and resolved *before* anything nested can give it a private meaning.
+        // Taking focus on the first frame is what puts this element on the
+        // dispatch path at all.
+        let desired_focus = input
+            .as_ref()
+            .map(|input| input.read(cx).focus_handle())
+            .unwrap_or_else(|| self.focus.clone());
+        if self.focused.as_ref() != Some(&desired_focus) {
+            window.focus(&desired_focus, cx);
+            self.focused = Some(desired_focus);
+        }
+        let mut root = div()
+            .id("shell")
+            .size_full()
+            .v_flex()
+            .bg(rgb(c.bg))
+            .text_color(rgb(c.fg))
+            // From the host, not a constant: `text_sm` was `rems(0.875)` — 14px —
+            // and the family was hardcoded here while three other things
+            // depended on which font it was.
+            .text_size(px(f.size))
+            .font_family(f.family.clone())
+            .track_focus(&self.focus)
+            .capture_key_down(cx.listener(Self::on_key))
+            // The menu's four adapters. Each calls the same named dispatch a
+            // key resolves to — see the note on the `actions!` above.
+            .on_action(cx.listener(|this, _: &Quit, _, cx| this.native("quit", cx)))
+            .on_action(
+                cx.listener(|this, _: &CopySelection, _, cx| this.native("copy.selection", cx)),
+            )
+            .on_action(cx.listener(|this, _: &SelectAll, _, cx| this.native("select.all", cx)))
+            .on_action(cx.listener(|this, _: &OpenSettings, _, cx| this.native("settings", cx)))
+            .on_action(
+                cx.listener(|this, _: &ShowCommands, _, cx| this.native("commands.palette", cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &CommitStaged, _, cx| this.native("workspace.commit", cx)),
+            );
+
+        // The wheel, heard first: capture phase on a paint-time probe, the same
+        // trick the diff view's old one used, moved up to where the mode stack
+        // and the keymap live.
+        {
+            let me = cx.entity().downgrade();
+            root = root.child(
+                canvas(
+                    |_, _, _| {},
+                    move |_, _, window, _cx| {
+                        let me = me.clone();
+                        window.on_mouse_event(move |ev: &ScrollWheelEvent, phase, window, cx| {
+                            if phase == DispatchPhase::Capture {
+                                _ = me.update(cx, |this, cx| this.on_wheel(ev, window, cx));
+                            }
+                        });
+                    },
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .h(px(0.)),
+            );
+        }
+
+        root = root
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(chrome::gap_l(&host.font))
+                    .h(px(TITLE_H))
+                    // The window has no titlebar of its own any more, so the
+                    // traffic lights are drawn *into* this strip and the title
+                    // has to start after them.
+                    .pl(px(views::workspace::sidebar_width(f32::from(
+                        window.viewport_size().width,
+                    ))))
+                    .pr(px((ch * 1.7).round()))
+                    .bg(rgb(c.title_bg))
+                    .border_b_1()
+                    .border_color(rgb(c.border))
+                    .text_size(px((f.size * chrome::TITLE_TEXT_SCALE).round()))
+                    // The strip names the repository and is read; raw dim is
+                    // under the text floor here (3.37), so it resolves against
+                    // the strip it is drawn on.
+                    .text_color(rgb(host.theme.dim_on(theme::Surface::Title)))
+                    // The one thing in the strip that is allowed to shrink, and
+                    // everything else is `flex_none`. A repository is the part of
+                    // a title a reader can reconstruct; a button pushed off the
+                    // right edge — which is what a strip of `flex_none`
+                    // children and no `min_w_0` did — is a control that no
+                    // longer exists.
+                    .child(
+                        div()
+                            .id("project-title")
+                            .flex_shrink(1.0)
+                            .min_w_0()
+                            .mr(chrome::gap_m(&host.font))
+                            .overflow_hidden()
+                            // Start-ellipsis — the truncation call the
+                            // no-repo fallback uses too: the *name*, the
+                            // last segment, is the part being scanned; the
+                            // parent is the part to sacrifice.
+                            .whitespace_nowrap()
+                            .text_ellipsis_start(),
+                    )
+                    // The branch control: HEAD's branch glyph, then the name
+                    // the head read above the strip spelled. The reference
+                    // draws this as plain text in the strip — no chip, no
+                    // border — so the name is the only thing with weight and
+                    // the `from <base>` beside it is the strip's dim.
+                    .children(head_chip.map(|info| {
+                        let me = me.clone();
+                        // The base half's ink, spelled once here for the
+                        // control and the `from` below it.
+                        let dim = rgb(host.theme.dim_on(theme::Surface::Title));
+                        div()
+                            .id("branch-control")
+                            .debug_selector(|| "branch-control".to_string())
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .gap(px((ch * 0.7).round()))
+                            .text_size(px((f.size * chrome::TOPBAR_TEXT_SCALE).round()))
+                            .font_family(host.chrome_family.clone())
+                            .whitespace_nowrap()
+                            // The control focuses the branches pane through
+                            // the same name the `3` key resolves to.
+                            .cursor_pointer()
+                            .hover(|s| s.text_color(rgb(c.fg)))
+                            .on_click(move |_, _, cx| {
+                                _ = me
+                                    .update(cx, |this, cx| this.run_command("branches.focus", cx));
+                            })
+                            // The branch glyph, tinted like the strip's
+                            // secondary text. A real SVG in the asset source,
+                            // never a codepoint the configured face may not
+                            // carry.
+                            .child(chrome::icon(
+                                "gitten/branch.svg",
+                                15.0,
+                                host.theme.dim_on(theme::Surface::Title),
+                            ))
+                            .child(div().flex_none().text_color(rgb(c.fg)).child(info.chip))
+                            // The base the branch reads as `from`: spelled
+                            // halves, no per-frame format — the name above
+                            // and these two ride the same dim the strip
+                            // resolves its secondary text in. Hidden on
+                            // narrow windows per the reference's 1150px tier.
+                            .children(info.base.filter(|_| !narrow).map(|base| {
+                                div()
+                                    .flex_none()
+                                    .text_color(dim)
+                                    .child(" from ")
+                                    .child(base)
+                            }))
+                            .children(info.drift.map(|drift| {
+                                // Each arrow in its own ink — ↑ outgoing in the
+                                // staged green, ↓ incoming in the unstaged red —
+                                // so the direction reads before the number
+                                // does. Both clear the text floor raw on the
+                                // strip. The ` · ` opener and the spaces ride
+                                // in dim, where the ink is invisible either
+                                // way, so the spelled width is exactly what
+                                // the budget above costed.
+                                let dim = rgb(host.theme.dim_on(theme::Surface::Title));
+                                div()
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .child(div().flex_none().text_color(dim).child(" · "))
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .text_color(rgb(host.theme.diff.adds_fg))
+                                            .child(drift.up),
+                                    )
+                                    .child(div().flex_none().text_color(dim).child(" "))
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .text_color(rgb(host.theme.diff.dels_fg))
+                                            .child(drift.down),
+                                    )
+                            }))
+                    }))
+                    // Pushes the right-edge controls off the title and takes the
+                    // clicks that land between them, so a stray click on the
+                    // title bar does not fall through to whatever is under it.
+                    .child(div().flex_grow(1.0))
+                    .child(theme_button)
+                    .child(commands_button)
+                    .children(push_button),
+            )
+            // The middle is the workspace — header, grouped sidebar,
+            // file diff, inspector slot — composed once here at the viewport
+            // the window handed over.
+            .child(self.workspace_body(window, cx))
+            .children(input)
+            // The menu itself is deferred at priority 1. Its transparent
+            // priority-0 backdrop blocks the rest of the window without
+            // covering the menu, so capture can leave overlay wheel ownership
+            // alone without exposing the native list scroller underneath.
+            .children(self.open.is_some().then(menu::backdrop))
+            // The project menu, off the title that opened it: the recent
+            // repositories and the `Open other…` row.
+            .children(
+                (self.open == Some(Open::Project)).then(|| self.project_menu(&host, window, cx)),
+            )
+            // The status bar: where the keyboard is, and what the nearest
+            // keys do. A sentence owed to the user — an error, a job's own
+            // finish, an armed question — takes the hints' place rather than
+            // a band of its own: it is the one strip already being read, and
+            // an armed question competing with key hints for a row is two
+            // things saying "look at me" where one will do. An error wins
+            // over a notice: it describes what failed, the notice describes
+            // what was tried since. A prompt empties the hints honestly —
+            // its field owns the keyboard and speaks for itself.
+            .child({
+                // The question's answers, when the sentence on screen is a
+                // question and not an error: one button per answer plus
+                // Cancel. Clicking runs the same names the palette would —
+                // the arm/execute logic, disarm, and errors are the
+                // command's own — and Cancel runs back, the Esc path.
+                // Read before `message` below moves `error`.
+                let answers: &[Answer] = match (&error, &notice) {
+                    (None, Some(Notice::Question { answers, .. })) => answers,
+                    _ => &[],
+                };
+                let questioning =
+                    error.is_none() && matches!(notice, Some(Notice::Question { .. }));
+                let message = error
+                    .map(|e| (e, c.error))
+                    // A question takes the error's ink and not this: quiet is
+                    // what hid the arm, and the one sentence a second press
+                    // spends is the one being read.
+                    .or_else(|| {
+                        notice.as_ref().map(|n| match n {
+                            Notice::Info(text) => (
+                                text.as_str().into(),
+                                host.theme.dim_on(theme::Surface::Status),
+                            ),
+                            Notice::Question { text, .. } => (text.as_str().into(), c.error),
+                        })
+                    })
+                    .or_else(|| running.map(|n| (n, host.theme.dim_on(theme::Surface::Status))));
+                // The bar's fixed left-half segments, spelled from loaded
+                // state and memoized on their inputs: the hints shrink by
+                // exactly what they spend, and the bar reads the same
+                // spelling. Computed for both branches — the memo makes an
+                // unneeded spelling a key comparison and three refcounts.
+                let leading = self.status_leading(cx);
+                // An error says how to leave, where it stands: `esc` dismisses,
+                // the message key opens the full text.
+                let exits = self
+                    .error
+                    .as_ref()
+                    .map(|_| SharedString::from("· esc dismiss · ` full text"));
+                match message {
+                    Some((text, ink)) => div()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap(chrome::gap_l(&host.font))
+                        .h(px(chrome::STATUS_H))
+                        .px(chrome::gap_l(&host.font))
+                        .bg(rgb(c.status_bg))
+                        .border_t_1()
+                        .border_color(rgb(c.border))
+                        .text_color(rgb(host.theme.dim_on(theme::Surface::Status)))
+                        .text_size(px((host.font.size * chrome::STATUS_TEXT_SCALE).round()))
+                        .child(div().min_w_0().truncate().text_color(rgb(ink)).child(text))
+                        // The answers, when the sentence is a question: action
+                        // ink for the doing, furniture ink for the leaving.
+                        // Each id names its row so a second answer never
+                        // steals the first one's clicks.
+                        .children(answers.iter().enumerate().map(|(i, answer)| {
+                            let command = answer.command;
+                            div()
+                                .id(SharedString::from(format!("band-answer-{i}")))
+                                .flex_none()
+                                .cursor_pointer()
+                                .text_color(rgb(c.accent))
+                                .child(answer.label)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.run_command(command, cx);
+                                }))
+                        }))
+                        .children(questioning.then(|| {
+                            div()
+                                .id("band-cancel")
+                                .flex_none()
+                                .cursor_pointer()
+                                .text_color(rgb(host.theme.quiet_on(c.status_bg)))
+                                .child("Cancel")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.run_command("back", cx);
+                                }))
+                        }))
+                        // An error says how to leave, in the faint ink of
+                        // furniture: the summary is the sentence, this is the
+                        // small print. No live key, no piece — the help
+                        // overlay's rule.
+                        .children(exits.map(|e| {
+                            div()
+                                .flex_none()
+                                .text_color(rgb(host.theme.quiet_on(c.status_bg)))
+                                .child(e)
+                        }))
+                        .into_any_element(),
+                    None => div()
+                        .id("statusbar")
+                        .debug_selector(|| "statusbar".to_string())
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .h(px(chrome::STATUS_H))
+                        .px(px(14.0))
+                        .border_t_1()
+                        .border_color(rgb(c.border))
+                        .bg(rgb(c.title_bg))
+                        .font_family(host.chrome_family.clone())
+                        .text_size(px(10.0))
+                        .text_color(rgb(host.theme.dim_on(theme::Surface::Title)))
+                        .child(
+                            div()
+                                .flex()
+                                .gap(px(10.0))
+                                .children(leading.iter().cloned().map(|text| div().child(text))),
+                        )
+                        .child(
+                            div()
+                                .id("workspace-commands")
+                                .cursor_pointer()
+                                .child("Commands  ⌘K")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.run_command("commands.palette", cx)
+                                })),
+                        )
+                        .into_any_element(),
+                }
+            })
+            .children(overlay.map(|(frames, rows, heap, load)| {
+                div()
+                    .flex_none()
+                    .v_flex()
+                    .px(chrome::gap_xl(&host.font))
+                    .py(chrome::gap_m(&host.font))
+                    .gap(chrome::gap_s(&host.font))
+                    .bg(rgb(c.status_bg))
+                    .border_t_1()
+                    .border_color(rgb(c.border))
+                    .text_color(rgb(host.theme.dim_on(theme::Surface::Status)))
+                    .child(
+                        div()
+                            .flex()
+                            .gap(chrome::gap_xxl(&host.font))
+                            .child(div().text_color(rgb(c.accent)).child(frames))
+                            .child(rows)
+                            .child(heap),
+                    )
+                    // Read — it is the load number — so through `quiet_on`.
+                    .child(
+                        div()
+                            .text_color(rgb(host.theme.quiet_on(c.status_bg)))
+                            .child(load),
+                    )
+            }))
+            // The Commands palette over everything but the message: the
+            // same deferred, occluding centered-panel shape as the commit
+            // dialog. It lists runnable named commands, not keys.
+            .children(
+                self.theme_picker_open
+                    .then(|| self.render_theme_picker(window, cx)),
+            )
+            .children(self.palette_open.then(|| self.render_palette(window, cx)))
+            // The message overlay, over even the palette: it exists because the
+            // band's one truncated line was not the whole of git's answer, so
+            // the whole of the answer is the one thing it must show.
+            .children(
+                self.show_message
+                    .then_some(self.error.as_ref())
+                    .flatten()
+                    .map(|error| {
+                        let me = cx.entity().downgrade();
+                        let close = modal::close_button(&host, "message-close")
+                            .on_click(move |_, _, cx| {
+                                _ = me.update(cx, |this, cx| {
+                                    this.show_message = false;
+                                    cx.notify();
+                                });
+                            })
+                            .into_any_element();
+                        message_overlay(error, &host, Some(close))
+                    }),
+            );
+        root
+    }
+}
+
+/// The error's whole answer, word-wrapped, over everything. The heading names
+/// the panel; the glance is git's own first line in the error's ink, and the
+/// body is everything git said, argv prefix included — the band's one truncated
+/// line is the glance, this is the reading. No `whitespace_nowrap`: a long
+/// answer wraps, because a panel that clips its tail is the band with more
+/// room.
+fn message_overlay(error: &GitError, host: &Host, close: Option<AnyElement>) -> AnyElement {
+    // The box around the answer — scrim, border, paint order — is the shared
+    // centered panel's, the way the help panel's is. What is here is only the
+    // glance and the record.
+    modal::centered(
+        host,
+        modal::Width::Max(720.0),
+        vec![
+            modal::heading(host, "Message", close).into_any_element(),
+            div()
+                .flex_none()
+                .text_size(px(13.0))
+                .text_color(rgb(host.theme.chrome.error))
+                .child(error.summary.clone())
+                .into_any_element(),
+            div()
+                .min_h_0()
+                .overflow_hidden()
+                .child(error.full.clone())
+                .into_any_element(),
+            modal::hint(host, "esc dismiss"),
+        ],
+    )
+}
+
+fn main() {
+    start::begin(std::time::Instant::now());
+    start::mark("main enter");
+    // Arguments, `gitten.toml`, `--help`, `gitten config` — all of it shared
+    // with every other client — see `gitten_app`. The acquisition is the one
+    // stage a window does not wait for: it is scheduled after the window is
+    // up, through the same wave a repository switch rides, and the road to
+    // frame zero is configuration only. What is left in this file is a window.
+    let mut startup = Startup::new("gitten", View::Commits)
+        .blurb("a git client")
+        .extra(EXTRA);
+    let bare = bare_launch_view(startup.take());
+    // Which door this launch takes, decided before anything runs: a
+    // repository launch defers its acquisition past the window, and a
+    // fixture or patch — acquired in-process, no spawn floor, no window to
+    // buy time against — keeps the synchronous road and its stderr failures
+    // exactly as they were.
+    let repo_launch = matches!(
+        gitten_app::cli::parse(startup.take(), View::Commits),
+        Request::Open {
+            source: Source::Repo { .. },
+            ..
+        }
+    );
+    // A bare launch from Finder or `open` arrives with no arguments and a
+    // working directory of `/`: the shared parse opens the default view of
+    // `.`, which is usually not a repository, and there is no terminal for
+    // the failure to be printed to. Deciding costs one cheap `git status` on
+    // the one path that needs it — a window-opened-anyway cannot learn it
+    // before drawing. With no repository here, the latest recent one opens —
+    // or, with no history at all, one is offered to pick. Anything explicit
+    // keeps the window-first path and its in-window answer to a repository
+    // that will not open.
+    if let Some(view) = bare {
+        if gitten_git::open(std::path::Path::new("."))
+            .status()
+            .is_err()
+        {
+            let recents = gitten_app::projects::load();
+            if let Some(started) = open_recent(view, &recents) {
+                let app = gpui_platform::application().with_assets(assets::Assets);
+                start::mark("gpui application up; entering run");
+                app.run(move |cx| open_main_window(Launch::Ready(started), cx));
+                return;
+            }
+            eprintln!("gitten: no repository here; choose one to open");
+            let app = gpui_platform::application().with_assets(assets::Assets);
+            app.run(move |cx| offer_repo_then_open(view, cx));
+            return;
+        }
+    }
+    let launch = if repo_launch {
+        startup.configure().map(Launch::Skeleton)
+    } else {
+        startup.go().map(Launch::Ready)
+    };
+    match launch {
+        Ok(launch) => {
+            let app = gpui_platform::application().with_assets(assets::Assets);
+            start::mark("gpui application up; entering run");
+            app.run(move |cx| open_main_window(launch, cx));
+        }
+        Err(exit) => exit.finish(),
+    }
+}
+
+/// What `main` opens once startup produced it: globals, the config watcher, the
+/// menus and the window itself. One function so every entry — a repository
+/// from the command line, the latest recent after a bare launch found none,
+/// or one picked after that found none either — builds the same window
+/// through the same path.
+/// What `main` hands [`open_main_window`]: a launch that already holds its
+/// rows, and one that will hold them shortly.
+enum Launch {
+    /// Startup acquired before the window opened — `loaded` is here, and the
+    /// views build from it. Two launches keep the synchronous road: a
+    /// fixture or a patch, whose acquisition is an in-process read with no
+    /// spawn floor to defer, and a bare launch, whose acquisition is what
+    /// *chose* the repository.
+    Ready(Started),
+    /// The window first. Screens register empty at the wave's source
+    /// generation, the restore waits for the wave, and the acquisition runs
+    /// through the same background wave a repository switch rides — nothing
+    /// about it is new code; what is new is that startup rides it too.
+    Skeleton(Configured),
+}
+
+/// A sidebar pane's header while the wave that fills it is still running —
+/// the skeleton frame's one honest word. Never a count: nothing has been
+/// counted yet. The wave's apply halves replace it with the real label.
+const STARTUP_LOADING: &str = "loading";
+
+fn open_main_window(launch: Launch, cx: &mut App) {
+    start::mark(match &launch {
+        Launch::Ready(_) => "startup done (args + gitten.toml + acquire)",
+        Launch::Skeleton(_) => {
+            "startup done (args + gitten.toml; acquisition deferred to the wave)"
+        }
+    });
+    let (which, source, host, data, label, config_path, repo_open) = match launch {
+        Launch::Ready(started) => {
+            let Started {
+                view: which,
+                source,
+                host,
+                loaded,
+                config: config_path,
+                repo,
+            } = started;
+            let label = loaded.label.clone();
+            (
+                which,
+                source,
+                Rc::new(host),
+                Some(loaded.data),
+                label,
+                config_path,
+                repo,
+            )
+        }
+        Launch::Skeleton(configured) => {
+            let Configured {
+                view: which,
+                source,
+                host,
+                config: config_path,
+                repo,
+            } = configured;
+            (
+                which,
+                source,
+                Rc::new(host),
+                None,
+                STARTUP_LOADING.to_string(),
+                config_path,
+                repo,
+            )
+        }
+    };
+    // The generation the skeleton's wave targets: every screen registers one
+    // below it, so the first wave — like every later one — fills exactly what
+    // is stale. A Ready launch needs no wave; its screens register at the
+    // generation they were acquired at.
+    let wave_target = Generation::default().advance();
+    let skeleton = data.is_none();
+
+    // Names this exact view, so a saved scroll position is only ever restored
+    // into the diff it was taken in — see `session.rs`.
+    let session_key = source.key(which);
+    let session_path = session::path();
+
+    // How to fetch the diff again with a different algorithm, and where a
+    // commit's diff would come from. Built here, where the source is known, so
+    // nothing downstream has to learn what a repository is. `None` for a `.diff`
+    // fixture. The handle is the one Startup opened, so every re-acquisition
+    // keeps any backend state alive rather than opening the path again.
+    let (rediff, repo) = match (&source, repo_open) {
+        (Source::Repo { path, .. }, Some(repo)) => {
+            let for_diff = repo.clone();
+            let rediff: Rediff = Rc::new(move |host: &Host, over: &Overrides, revision: &str| {
+                gitten_git::diff(for_diff.as_ref(), revision, &host.differ, over)
+            });
+            // Canonicalised once, here: `.` is what every launch is handed by
+            // default and has no name to put in a title, and a syscall on the
+            // render path is not the place to find one.
+            let path = path.canonicalize().unwrap_or_else(|_| path.clone());
+            // Every launch is a visit: the project menu reads this file, and
+            // a repository opened any way at all belongs in it. Recorded from
+            // the executor rather than inline — a read-plus-write of the
+            // recents file is nothing the first frame waits for, and the
+            // menu reads it only when it opens.
+            let visit = path.clone();
+            cx.spawn(async move |_| gitten_app::projects::record(&visit))
+                .detach();
+            (Some(rediff), Some((path, repo)))
+        }
+        _ => (None, None),
+    };
+
+    let which_name = which.name();
+
+    // One for the action handler, one for the strip: both reload from the file,
+    // and the async task below takes the original.
+    let shell_config_path = config_path.clone();
+
+    start::mark("app.run enter");
+    gpui_component::init(cx);
+    input::bind_keys(cx);
+    cx.set_global(config::Active(host.clone()));
+    // Nothing picked yet: the file's theme is the one on screen.
+    cx.set_global(config::Chosen(None));
+    // No settings window until one is asked for: the opener reads this to
+    // activate instead of duplicating.
+    cx.set_global(settings_window::Open::default());
+    // After `gpui_component::init`, which sets its own theme to Light — see
+    // `config::sync_widgets`, which is the only thing standing between that
+    // and a pair of light scrollbars over a near-black diff.
+    config::sync_widgets(&host, cx);
+    start::mark("run setup through widget theme sync");
+
+    // Re-read the file whenever it is written, and hand the result to every
+    // window. The watcher's callback runs on its own thread, so it only sets
+    // a flag; the task below is what touches the app.
+    //
+    // Polling a flag rather than plumbing an async channel through: a save is
+    // a human action, 120 ms of latency is imperceptible, and this is five
+    // lines with nothing to get wrong about wakeups.
+    let dirty = Arc::new(AtomicBool::new(false));
+    let watcher = {
+        let dirty = dirty.clone();
+        config::watch(&config_path, move || dirty.store(true, Ordering::Relaxed)).ok()
+    };
+    if watcher.is_none() {
+        eprintln!(
+            "gitten: could not watch {}; config reload is off",
+            config_path.display()
+        );
+    }
+    cx.spawn(async move |cx: &mut AsyncApp| {
+        // Held for as long as the task lives: dropping a `notify` watcher
+        // stops it watching, silently.
+        let _watcher = watcher;
+        loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(120))
+                .await;
+            if !dirty.swap(false, Ordering::Relaxed) {
+                continue;
+            }
+            // The same call a theme pick makes — see `config::reload`.
+            let warnings = cx.update(|cx| config::reload(&config_path, cx));
+            for w in warnings {
+                eprintln!("gitten: {w}");
+            }
+        }
+    })
+    .detach();
+
+    // The platform's keys, not this app's: these exist for the menu and for
+    // the two chords the keymap cannot spell — the platform modifier never
+    // reaches `command::Key` — and their handlers are the element-level
+    // adapters in `render`, which call the same named dispatch every
+    // keypress uses. Nothing else is a `KeyBinding` anywhere in this crate:
+    // `s`, `w`, `T`, `escape` and the rest resolve through the live keymap,
+    // where `[keys]` can move them.
+    cx.bind_keys([
+        KeyBinding::new("cmd-q", Quit, None),
+        KeyBinding::new("cmd-c", CopySelection, None),
+        KeyBinding::new("cmd-a", SelectAll, None),
+        KeyBinding::new("cmd-,", OpenSettings, None),
+        // The palette and the commit key: cmd-k opens the command list from
+        // anywhere, cmd-enter commits staged work from anywhere. Both are
+        // adapters onto named commands — `commands.palette` and the
+        // workspace's commit door — so a config file still owns every
+        // binding this map could have spelled.
+        KeyBinding::new("cmd-k", ShowCommands, None),
+        KeyBinding::new("cmd-enter", CommitStaged, None),
+    ]);
+
+    // Open the window here and now, not from a spawned task: the task only
+    // ran at the executor's next pump, which put a scheduling hop between
+    // this body and the first frame for no benefit — and every registration
+    // above is in place before any event can be delivered, because none are
+    // delivered until this closure yields.
+    start::mark("opening window");
+    cx.open_window(
+        window_options(started_title(which, &label).into()),
+        move |window, cx| {
+            start::mark("window callback enter");
+            // Where the last run of this exact command left off. Restored
+            // before the first frame so you never see row 0 flash past.
+            let resume = session::restore(&session_key, &session_path);
+            start::mark("session restored");
+            #[allow(clippy::type_complexity)]
+            // The saved row is applied to the views above, and the periodic
+            // task below reads the live row off the shell — so the
+            // tuple's own handle is spare by construction.
+            let (screen, rendered, _top, total, note, load): (
+                Screen,
+                Rc<Cell<usize>>,
+                Rc<Cell<usize>>,
+                Rc<Cell<usize>>,
+                Rc<std::cell::RefCell<SharedString>>,
+                String,
+            ) = match data {
+                Some(Data::Commits(commits)) => {
+                    let e = cx.new(|_| views::commits::Commits::new(commits, host.clone()));
+                    let v = e.read(cx);
+                    if let Some(r) = &resume {
+                        // The viewport model is filled in before either
+                        // call, so a saved row clamps against a list that
+                        // exists and a margin from the live file — see
+                        // `Commits::scroll_to`.
+                        v.scroll_to(r.top, &host);
+                        v.go_to(r.top, &host);
+                    }
+                    (
+                        Screen::commits(e, source.clone(), Generation::default(), label.clone()),
+                        v.rendered.clone(),
+                        // The commit graph has a fixed row count: one per
+                        // commit, and nothing reflows it.
+                        v.top.clone(),
+                        Rc::new(Cell::new(v.total())),
+                        Rc::new(std::cell::RefCell::new(SharedString::default())),
+                        v.load.clone(),
+                    )
+                }
+                Some(Data::Diff(files)) => {
+                    let e = cx.new(|cx| views::diff::Diff::new(files, host.clone(), cx));
+                    let v = e.read(cx);
+                    if let Some(r) = &resume {
+                        v.scroll_to(r.top, &host);
+                        v.go_to(r.top, &host);
+                    }
+                    (
+                        Screen::diff(
+                            e.clone(),
+                            Some(source.clone()),
+                            Generation::default(),
+                            label.clone(),
+                        ),
+                        v.rendered.clone(),
+                        v.top.clone(),
+                        v.total.clone(),
+                        v.note.clone(),
+                        v.load.clone(),
+                    )
+                }
+                // A launch never opens on a conflict: the files pane does
+                // not exist at startup, so no eye could be on one. The arm
+                // names itself rather than hiding in a wildcard, so a
+                // future launch that can open on a conflict must say what
+                // screen it means.
+                Some(Data::Conflict(..)) => {
+                    unreachable!("no launch opens on a conflict")
+                }
+                // The skeleton: the same screens at their loading shapes,
+                // one generation below the wave that fills them. The saved
+                // row waits — restoring into an empty list would clamp it
+                // away — and rides `pending_restore`, which the wave's
+                // `finish_refresh` applies before it schedules the preview.
+                None => match which {
+                    View::Commits => {
+                        let e = cx.new(|_| views::commits::Commits::new(Vec::new(), host.clone()));
+                        let v = e.read(cx);
+                        (
+                            Screen::commits(
+                                e,
+                                source.clone(),
+                                Generation::default(),
+                                STARTUP_LOADING,
+                            ),
+                            v.rendered.clone(),
+                            // The commit graph has a fixed row count: one
+                            // per commit, and nothing reflows it.
+                            v.top.clone(),
+                            Rc::new(Cell::new(0)),
+                            Rc::new(std::cell::RefCell::new(SharedString::default())),
+                            // The view's own load — the empty list measured
+                            // honestly, "0 commits · 0 lanes" — and not a
+                            // bare empty string: the overlay's second row
+                            // renders whatever lands here, and an empty
+                            // string is a row of nothing.
+                            v.load.clone(),
+                        )
+                    }
+                    View::Diff => {
+                        let e = cx.new(|cx| views::diff::Diff::new(Vec::new(), host.clone(), cx));
+                        let v = e.read(cx);
+                        (
+                            Screen::diff(
+                                e.clone(),
+                                Some(source.clone()),
+                                Generation::default(),
+                                STARTUP_LOADING,
+                            ),
+                            v.rendered.clone(),
+                            v.top.clone(),
+                            v.total.clone(),
+                            v.note.clone(),
+                            v.load.clone(),
+                        )
+                    }
+                },
+            };
+            let has_column = matches!(screen, Screen::Commits { .. });
+            // The diff main view. A launch that opened on a *list* starts
+            // it empty — its rows arrive with the first selection's
+            // scheduled load, and the header names the commit from frame
+            // one. A launch that opened on a diff (`gitten diff …`, a
+            // fixture, a patch) *is* this screen: same rows, no commit
+            // list.
+            let main_screen = match &screen {
+                Screen::Commits { .. } => {
+                    let e = cx.new(|cx| views::diff::Diff::new(Vec::new(), host.clone(), cx));
+                    Screen::diff(e, None, Generation::default(), "")
+                }
+                other => other.clone(),
+            };
+            let mut initial_panes = panes::Panes::new(which_name, screen);
+
+            // The working tree gets its compact pane, above wherever a
+            // diff later opens. One blocking `git status` here, beside the
+            // rest of startup acquisition; from the next write on, the
+            // generation-guarded refresh path keeps it current. A fixture
+            // has no repository and so no pane at all.
+            if repo.is_some() {
+                if skeleton {
+                    // The skeleton's sidebars: registered at their loading
+                    // shape, one generation below the wave — the wave's own
+                    // `refresh` halves are what fill them, so no read here
+                    // is a read the refresh path does not already run. The
+                    // pane exists from frame one, which is the whole point:
+                    // the number keys, the cycle and the walk derive from
+                    // registration, not from data. An empty working tree
+                    // would be a *claim*; the loading label on the header is
+                    // the only sentence these rows are allowed to make.
+                    initial_panes.register(
+                        "files",
+                        Screen::files(
+                            cx.new(|_| {
+                                views::files::Files::from_prepared(views::files::prepare(
+                                    Default::default(),
+                                    "",
+                                    // No side reads before the first refresh:
+                                    // file-level boxes until the wave lands.
+                                    std::collections::HashMap::new(),
+                                ))
+                            }),
+                            Generation::default(),
+                            STARTUP_LOADING,
+                        ),
+                    );
+                    initial_panes.focus(0);
+                    let branches = cx.new(|_| {
+                        views::branches::Branches::from_prepared(views::branches::prepare(
+                            Vec::new(),
+                            Vec::new(),
+                            None,
+                            Vec::new(),
+                            &host.theme,
+                            "",
+                        ))
+                    });
+                    initial_panes.register(
+                        "branches",
+                        Screen::branches(branches, Generation::default(), STARTUP_LOADING),
+                    );
+                    initial_panes.focus(0);
+                    initial_panes.register(
+                        "stashes",
+                        Screen::stashes(
+                            cx.new(|_| {
+                                views::stashes::Stashes::from_prepared(views::stashes::prepare(
+                                    &[],
+                                    "",
+                                ))
+                            }),
+                            Generation::default(),
+                            STARTUP_LOADING,
+                        ),
+                    );
+                    initial_panes.focus(0);
+                    start::mark("skeleton panes built");
+                } else if let Some((_, handle)) = &repo {
+                    start::mark("files status begin");
+                    let described = std::thread::scope(|s| {
+                        // Beside, not behind — describe, status and the stash
+                        // stack spawn together and are joined only once all
+                        // three are back. Joining each in sequence would put
+                        // three git processes on the launch path one after
+                        // another.
+                        let title = s.spawn(|| handle.describe());
+                        let status = s.spawn(|| handle.status());
+                        let parked = s.spawn(|| handle.stashes());
+                        let title = title.join().unwrap_or_default();
+                        let files_prepared = match status
+                            .join()
+                            .unwrap_or_else(|p| std::panic::resume_unwind(p))
+                        {
+                            Ok(status) => views::files::prepare(
+                                status,
+                                &title,
+                                std::collections::HashMap::new(),
+                            ),
+                            // Shown as a clean tree rather than failing the
+                            // window: one bad status must not take the launch.
+                            Err(e) => {
+                                eprintln!("gitten: status failed, showing an empty pane: {e}");
+                                views::files::prepare(
+                                    Default::default(),
+                                    &title,
+                                    std::collections::HashMap::new(),
+                                )
+                            }
+                        };
+                        // The same trade for the stack: a failed read is an
+                        // empty pane and a line on stderr, not a lost launch.
+                        let stashes_prepared = match parked
+                            .join()
+                            .unwrap_or_else(|p| std::panic::resume_unwind(p))
+                        {
+                            Ok(stashes) => views::stashes::prepare(&stashes, &title),
+                            Err(e) => {
+                                eprintln!("gitten: stashes failed, showing an empty pane: {e}");
+                                views::stashes::prepare(&[], &title)
+                            }
+                        };
+                        (files_prepared, stashes_prepared)
+                    });
+                    start::mark("files status done");
+                    let (files_prepared, stashes_prepared) = described;
+                    // Registration order is the *startup* order — commits is
+                    // the root tenant, then the three sidebar panes join it.
+                    // The number keys and ctrl-j walk the design's order
+                    // (files → branches → stashes → commits), derived in
+                    // [`DevShell::list_order`], so this list's order is only
+                    // about who was here first. Registration focuses what it
+                    // adds; the `focus(0)` calls put the keyboard back where
+                    // it launched.
+                    let files_label = files_prepared.label.clone();
+                    initial_panes.register(
+                        "files",
+                        Screen::files(
+                            cx.new(|_| views::files::Files::from_prepared(files_prepared)),
+                            Generation::default(),
+                            files_label,
+                        ),
+                    );
+                    initial_panes.focus(0);
+                    start::mark("files pane built");
+
+                    // The branches panel beside it — three reads run side by
+                    // side, behind the same spawn floor the files pane pays.
+                    // A failed read shows an empty panel rather than failing
+                    // the launch, for the same reason a bad status does.
+                    start::mark("branches read begin");
+                    let described = handle.describe();
+                    let prepared = std::thread::scope(|s| {
+                        let local = s.spawn(|| handle.branches());
+                        let remote = s.spawn(|| handle.remote_branches());
+                        let head = s.spawn(|| handle.head());
+                        let taken = s.spawn(|| handle.worktree_branches());
+                        let local = local
+                            .join()
+                            .unwrap_or_else(|p| std::panic::resume_unwind(p));
+                        let remote = remote
+                            .join()
+                            .unwrap_or_else(|p| std::panic::resume_unwind(p));
+                        let head = head.join().unwrap_or_else(|p| std::panic::resume_unwind(p));
+                        let taken = taken.join().unwrap_or_default();
+                        match (local, remote) {
+                            (Ok(local), Ok(remote)) => {
+                                let head = match head {
+                                    Ok(head) => Some(head),
+                                    Err(e) => {
+                                        eprintln!(
+                                            "gitten: head read failed, showing attached: {e}"
+                                        );
+                                        None
+                                    }
+                                };
+                                views::branches::prepare(
+                                    local,
+                                    remote,
+                                    head,
+                                    taken,
+                                    &host.theme,
+                                    &described,
+                                )
+                            }
+                            (Err(e), _) | (_, Err(e)) => {
+                                eprintln!("gitten: branch reads failed, empty panel: {e}");
+                                views::branches::prepare(
+                                    Vec::new(),
+                                    Vec::new(),
+                                    None,
+                                    Vec::new(),
+                                    &host.theme,
+                                    &described,
+                                )
+                            }
+                        }
+                    });
+                    start::mark("branches read done");
+                    let label = prepared.label.clone();
+                    let branches = cx.new(|_| views::branches::Branches::from_prepared(prepared));
+                    initial_panes.register(
+                        "branches",
+                        Screen::branches(branches, Generation::default(), label),
+                    );
+                    initial_panes.focus(0);
+                    start::mark("branches pane built");
+
+                    // The stack, last in the cycle like its key is last on the
+                    // number row.
+                    let stashes_label = stashes_prepared.label.clone();
+                    initial_panes.register(
+                        "stashes",
+                        Screen::stashes(
+                            cx.new(|_| views::stashes::Stashes::from_prepared(stashes_prepared)),
+                            Generation::default(),
+                            stashes_label,
+                        ),
+                    );
+                    initial_panes.focus(0);
+                    start::mark("stashes pane built");
+                }
+            }
+            start::mark("view built");
+
+            // First-paint evidence, and only when logging: the views count
+            // rows as the list builds them (see `rendered`), so the counter
+            // going non-zero is the first frame actually carrying content.
+            // Polled at 5 ms rather than hooked into a render — a paint has
+            // no callback, and this task dies as soon as it fires. The same
+            // moment is where a `GITTEN_START_QUIT` run ends: the task quits
+            // the process instead of only marking, so a wall clock around the
+            // binary *is* the time to interactive. A window still appears —
+            // GPUI draws nothing without one — for however long the road
+            // takes.
+            if start::on() || gitten_app::env::start_quit() {
+                let drawn = rendered.clone();
+                cx.spawn(async move |cx| loop {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(5))
+                        .await;
+                    let n = drawn.get();
+                    if n > 0 {
+                        if start::on() {
+                            start::mark(&format!("first rows drawn ({n})"));
+                        }
+                        if gitten_app::env::start_quit() {
+                            // An error here means the window is already
+                            // gone — the measurement is over either way.
+                            cx.update(|cx| cx.quit());
+                        }
+                        break;
+                    }
+                })
+                .detach();
+            }
+
+            let stats = stats::enabled().then(|| Stats::new(rendered, total, note, load));
+            let focus = cx.focus_handle();
+            let jobs = Runner::new();
+            let submitter = jobs.submitter();
+            let shell = cx.new(|_| DevShell {
+                which: which_name,
+                panes: initial_panes,
+                main: main_screen,
+                has_column,
+                spot: match has_column {
+                    true => Spot::List,
+                    false => Spot::Main,
+                },
+                head: RefCell::new(None),
+                request: Cell::new(0),
+                loading: Cell::new(false),
+                stats,
+                rediff,
+                repo,
+                jobs,
+                submitter,
+                // The skeleton's screens register one generation below this,
+                // so the startup wave — the same `refresh_stale` a repository
+                // switch runs — targets exactly them. A Ready launch acquired
+                // its screens at the default generation and has no wave.
+                generation: match skeleton {
+                    true => wave_target,
+                    false => Generation::default(),
+                },
+                refresh_id: 0,
+                refresh_pending: 0,
+                refresh_error: None,
+                running: None,
+                show_message: false,
+                input: None,
+                prompt: None,
+                search_live: None,
+                over: Overrides::default(),
+                open: None,
+                error: None,
+                error_is_load: false,
+                notice: None,
+                config: shell_config_path,
+                first_render: Cell::new(false),
+                title_memo: RefCell::new(None),
+                workspace: views::workspace::Workspace::default(),
+                drafts: std::collections::HashMap::new(),
+                commit_confirm: false,
+                pending_commit_key: None,
+                last_fetch: None,
+                last_push: None,
+                status_memo: RefCell::new(None),
+                palette_open: false,
+                palette_sel: 0,
+                palette_field: None,
+                palette_sub: None,
+                palette_query: String::new(),
+                theme_picker_open: false,
+                theme_picker_sel: 0,
+                theme_picker_field: None,
+                theme_picker_sub: None,
+                theme_picker_query: String::new(),
+                focus,
+                focused: None,
+                ongoing: Cell::default(),
+                projects: Vec::new(),
+                session_key: session_key.clone(),
+                session_path: session_path.clone(),
+                // A Ready launch restored above, straight into views that
+                // hold rows. The skeleton restores with the wave — into an
+                // empty list would clamp the row away — through the same
+                // `pending_restore` a repository switch hands its wave.
+                pending_restore: match (&resume, skeleton) {
+                    (Some(session), true) => Some(session.top),
+                    _ => None,
+                },
+            });
+            {
+                let shell = shell.clone();
+                shell.update(cx, |shell, cx| {
+                    shell.sync_focus(cx);
+                    // The workspace is the launch destination per the
+                    // interaction contract: build the center, focus the
+                    // files pane and schedule the preview on frame one.
+                    // A fixture has no files pane — `enter_workspace`
+                    // focuses nothing and the preview early-outs — and a
+                    // skeleton's rows arrive with its wave, which re-aims
+                    // the preview on landing.
+                    shell.enter_workspace(cx);
+                    // Frame one already names its commit: schedule the
+                    // newest one's diff through the same guarded rails
+                    // every later selection rides. The header and the
+                    // band are up before the first paint; the rows land
+                    // on the next executor pump. The skeleton has no rows
+                    // yet — its preview is scheduled by `finish_refresh`
+                    // when the wave lands, the way a switch's is.
+                    if skeleton {
+                        shell.refresh_stale(cx);
+                    } else {
+                        shell.sync_main_diff(cx);
+                    }
+                });
+            }
+            {
+                let shell = shell.downgrade();
+                cx.spawn(async move |cx: &mut AsyncApp| loop {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(50))
+                        .await;
+                    if shell.update(cx, |shell, cx| shell.drain_jobs(cx)).is_err() {
+                        break;
+                    }
+                })
+                .detach();
+            }
+            // Persist as you scroll, so any kind of death keeps the position:
+            // `dev.sh` kills the process, and nothing runs on the way out.
+            // Only on change, so an idle window writes nothing at all. The
+            // key and the row are read off the shell per tick rather than
+            // held from startup, so one task serves every repository a
+            // switch puts under the window — and dies with it.
+            {
+                let path = session_path.clone();
+                let weak = shell.downgrade();
+                cx.spawn(async move |cx: &mut AsyncApp| {
+                    let mut last = weak
+                        .update(cx, |shell, cx| {
+                            (shell.session_key.clone(), shell.session_top(cx))
+                        })
+                        .unwrap_or_default();
+                    loop {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(400))
+                            .await;
+                        let now = weak.update(cx, |shell, cx| {
+                            (shell.session_key.clone(), shell.session_top(cx))
+                        });
+                        let Ok(now) = now else {
+                            break;
+                        };
+                        if now != last {
+                            last = now.clone();
+                            if let (key, Some(top)) = now {
+                                session::save(&session::Session { key, top }, &path);
+                            }
+                        }
+                    }
+                })
+                .detach();
+            }
+            cx.new(|cx| Root::new(shell, window, cx))
+        },
+    )
+    .expect("failed to open window");
+    start::mark("open_window returned");
+    cx.activate(true);
+
+    // Closing the last window must end the process — macOS keeps an
+    // appless process alive otherwise.
+    cx.on_window_closed(|cx, _| {
+        if cx.windows().is_empty() {
+            cx.quit();
+        }
+    })
+    .detach();
+
+    // Last, not first: these two are the platform round trips of this
+    // closure — ~20 ms measured between them, the single largest thing
+    // here — and nothing on screen needs either. The cost is a first
+    // touch, not a property of one call: whichever platform API runs
+    // first after setup absorbs it (it moved with `set_menus`, then with
+    // `on_window_closed`, as they were reordered), so both go *after* the
+    // window rather than paying it on the way to frame zero. No event is
+    // delivered to keys, menus or actions until this closure returns and
+    // the event loop starts, so registering after the window exists races
+    // nothing; the bar just fills in while frame zero paints.
+    //
+    // Four items, each an adapter onto a named command — see the note on
+    // the `actions!`.
+    cx.set_menus(vec![
+        Menu {
+            name: "gitten".into(),
+            items: vec![
+                MenuItem::action("Settings…", OpenSettings),
+                MenuItem::action("Quit", Quit),
+            ],
+            disabled: false,
+        },
+        // Not decoration: without an Edit menu macOS gives the window no
+        // Copy item, and the OS is entitled to be asked. The keys work
+        // either way — this is what makes them *discoverable*.
+        Menu {
+            name: "Edit".into(),
+            items: vec![
+                MenuItem::action("Copy", CopySelection),
+                MenuItem::action("Select All", SelectAll),
+            ],
+            disabled: false,
+        },
+    ]);
+    start::mark("menus + close handler registered");
+}
+
+/// The view a launch that named no source asked for, if it named none.
+///
+/// `open /Applications/gitten.app` arrives with no arguments and a working
+/// directory of `/`: the shared parse reads that as the default view of `.`,
+/// which is usually not a repository. The shell answers that one case with
+/// the latest recent repository (see [`open_recent`]), or with a picker when
+/// there is no history yet (see [`offer_repo_then_open`]) instead of a
+/// message nobody can see. Anything explicit — a path, `--fixtures`, a patch —
+/// is not this: a repository launch defers its acquisition past the window
+/// and answers a repository that will not open in the window's error band,
+/// and a fixture or patch fails on stderr as it always has.
+fn bare_launch_view(args: &[String]) -> Option<View> {
+    match gitten_app::cli::parse(args, View::Commits) {
+        Request::Open { view, source } => match source {
+            Source::Repo { path, arg } if path.as_os_str() == "." && arg.is_empty() => Some(view),
+            _ => None,
+        },
+        Request::Help | Request::Config => None,
+    }
+}
+
+/// A bare launch with nowhere to go: ask which repository to open.
+///
+/// First the latest recent repository that still opens — a Finder launch with
+/// history lands where it was, with no click. Only with no history at all, or
+/// nothing in it still a repository, does the system picker run: the first-ever
+/// launch has nowhere to return to. Takes the list rather than loading it so a
+/// test can hand in scratch paths without touching the real recent file.
+fn open_recent(view: View, recents: &[std::path::PathBuf]) -> Option<Started> {
+    for path in recents {
+        let retry = Startup::new("gitten", View::Commits)
+            .blurb("a git client")
+            .extra(EXTRA)
+            .args(vec![
+                view.name().to_string(),
+                path.to_string_lossy().into_owned(),
+            ])
+            .go();
+        if let Ok(started) = retry {
+            return Some(started);
+        }
+        // A clean checkout is still a repository: a working-tree `diff`
+        // startup rejects an empty answer ("no changes"), while the window
+        // itself accepts one (a write can clean the tree at runtime). Fall
+        // back to the graph rather than skipping a repository that opens.
+        if view != View::Commits {
+            let fallback = Startup::new("gitten", View::Commits)
+                .blurb("a git client")
+                .extra(EXTRA)
+                .args(vec![
+                    View::Commits.name().to_string(),
+                    path.to_string_lossy().into_owned(),
+                ])
+                .go();
+            if let Ok(started) = fallback {
+                return Some(started);
+            }
+        }
+    }
+    None
+}
+
+/// A bare launch with nowhere to go and no recent to return to: ask which
+/// repository to open.
+///
+/// Inside the event loop because the platform picker lives there. A choice
+/// retries the shared startup with that directory and builds the same window —
+/// including the project-menu recording the open performs; anything else quits
+/// quietly, and a directory that is still not a repository fails exactly as
+/// the command line would have.
+fn offer_repo_then_open(view: View, cx: &mut App) {
+    cx.spawn(async move |cx: &mut AsyncApp| {
+        let picked = cx
+            .update(|cx| {
+                cx.prompt_for_paths(PathPromptOptions {
+                    files: false,
+                    directories: true,
+                    multiple: false,
+                    prompt: Some("Open a git repository".into()),
+                })
+            })
+            .await
+            .ok()
+            .and_then(|result| result.ok())
+            .flatten()
+            .and_then(|mut paths| paths.pop());
+        match picked {
+            Some(dir) => {
+                let retry = Startup::new("gitten", View::Commits)
+                    .blurb("a git client")
+                    .extra(EXTRA)
+                    .args(vec![
+                        view.name().to_string(),
+                        dir.to_string_lossy().into_owned(),
+                    ])
+                    .go();
+                // Same clean-checkout rule as `open_recent`: a picked
+                // repository opens even when its working tree is clean.
+                let retry = match (retry, view) {
+                    (Ok(started), _) => Ok(started),
+                    (Err(_), v) if v != View::Commits => Startup::new("gitten", View::Commits)
+                        .blurb("a git client")
+                        .extra(EXTRA)
+                        .args(vec![
+                            View::Commits.name().to_string(),
+                            dir.to_string_lossy().into_owned(),
+                        ])
+                        .go(),
+                    (Err(exit), _) => Err(exit),
+                };
+                cx.update(|cx| match retry {
+                    Ok(started) => open_main_window(Launch::Ready(started), cx),
+                    Err(exit) => exit.finish(),
+                });
+            }
+            None => cx.update(|cx| cx.quit()),
+        }
+    })
+    .detach();
+}
+
+impl DevShell {
+    /// What the title's dimmest third says: the repository and revision, or the
+    /// commit whose diff is on top.
+    /// Spelled for tests only (see [`Screen::label`]).
+    #[cfg(test)]
+    fn active_label(&self, cx: &App) -> SharedString {
+        SharedString::from(
+            self.active()
+                .map(|screen| screen.label(cx))
+                .unwrap_or_else(|| self.which.to_string()),
+        )
+    }
+}
+
+/// The window's own title — what macOS shows in Mission Control, the Window menu
+/// and the tab bar. Not what is drawn in the strip: that is three separate
+/// colours in [`DevShell::render`], because "gitten", the view and the repository
+/// are three different kinds of thing and one grey run of text says so about
+/// none of them.
+///
+/// `Started::title` is the shared one; this exists because the window is opened
+/// after the `Started` has been taken apart, and reassembling it to ask would be
+/// sillier than the two lines.
+fn started_title(view: View, label: &str) -> String {
+    format!("gitten · {} · {label}", view.name())
+}
+
+/// The window, and the one decision in it worth writing down: **there is no
+/// system titlebar.**
+///
+/// `WindowOptions::default()` leaves `appears_transparent: false`, which is an
+/// opaque macOS titlebar — in system grey, titled with the executable's name
+/// because `title` was never set — stacked directly on top of this app's own
+/// 44-pixel strip. Two title bars, one of them nobody wrote.
+///
+/// So the strip *is* the titlebar. `traffic_light_position` is the inset of the
+/// close button, and macOS uses that inset to size the band. The buttons are
+/// centred from [`TITLE_H`], so they stay aligned when the strip grows. Dragging
+/// still belongs to the platform: `app_owns_titlebar_drag` stays false.
+///
+/// A minimum size, because there is no useful window narrower than its own
+/// gutters — the diff view's wrap budget bottoms out at eight characters and
+/// says so — and the height is [`WINDOW_MIN_H`], because four stacked sections'
+/// floors plus the two strips are more than any smaller number admits.
+fn window_options(title: SharedString) -> WindowOptions {
+    WindowOptions {
+        titlebar: Some(TitlebarOptions {
+            title: Some(title),
+            appears_transparent: true,
+            traffic_light_position: Some(point(px(LIGHTS_X), px((TITLE_H - 12.0) / 2.0))),
+        }),
+        window_min_size: Some(size(px(560.), px(WINDOW_MIN_H))),
+        ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        bare_launch_view, config, input, open_recent, panes, settings_window, DevShell, GitError,
+        Notice, Open, Pane, Refresh, Screen, Writes,
+    };
+    use crate::views::commits::Commits;
+    use gitten_app::cli::{Source, View};
+    use gitten_app::jobs::{Event as JobEvent, Generation, Job, Runner, Submitter};
+    use gitten_core::host::Host;
+    use gitten_core::status::Status;
+    use gitten_core::Commit;
+    use gitten_git::{Pair, Repo};
+    use gpui::{AppContext as _, TestAppContext};
+    use std::cell::{Cell, RefCell};
+    use std::path::PathBuf;
+    use std::rc::Rc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    fn args(line: &str) -> Vec<String> {
+        line.split_whitespace().map(String::from).collect()
+    }
+
+    #[test]
+    fn status_recency_spells_the_guide_copy() {
+        // The bar's single sync sentence, with the clock held still:
+        // guide copy on both sides, newest stamp wins, absence is said.
+        use super::{ago_text, sync_text};
+        assert_eq!(ago_text(0), "just now");
+        assert_eq!(ago_text(59), "just now");
+        assert_eq!(ago_text(60), "1m ago");
+        assert_eq!(ago_text(3599), "59m ago");
+        assert_eq!(ago_text(3600), "1h ago");
+        let now = Instant::now();
+        assert_eq!(sync_text(None, None, now).to_string(), "Never fetched");
+        let old = now - Duration::from_secs(3700);
+        assert_eq!(
+            sync_text(Some(old), None, now).to_string(),
+            "Last fetched 1h ago"
+        );
+        assert_eq!(
+            sync_text(Some(now - Duration::from_secs(150)), None, now).to_string(),
+            "Last fetched 2m ago"
+        );
+        let fresh = now - Duration::from_secs(30);
+        assert_eq!(
+            sync_text(Some(old), Some(fresh), now).to_string(),
+            "Last push just now"
+        );
+        // Fetch-only history never borrows the push sentence, and a push
+        // with no fetch behind it still says push.
+        assert_eq!(
+            sync_text(Some(old), Some(old - Duration::from_secs(60)), now).to_string(),
+            "Last fetched 1h ago"
+        );
+        assert_eq!(
+            sync_text(None, Some(fresh), now).to_string(),
+            "Last push just now"
+        );
+    }
+
+    #[test]
+    fn push_label_never_invents_zero() {
+        // Unknowable is an em-dash, in-sync is a state, anything else a
+        // count — `0` would invite a push that sends nothing.
+        use super::push_label;
+        assert_eq!(push_label(None).to_string(), "Push \u{2014}");
+        assert_eq!(push_label(Some(0)).to_string(), "Published");
+        assert_eq!(push_label(Some(2)).to_string(), "Push 2");
+    }
+
+    #[test]
+    fn staging_count_spells_its_singular() {
+        use super::staging_text;
+        assert_eq!(staging_text(0).to_string(), "0 staged hunks");
+        assert_eq!(staging_text(1).to_string(), "1 staged hunk");
+        assert_eq!(staging_text(5).to_string(), "5 staged hunks");
+    }
+
+    #[test]
+    fn the_commit_gate_ignores_a_whitespace_summary() {
+        // The inspector's Commit button and the confirm door share this
+        // gate with the prompt path's refusal: blank is blank, whatever
+        // the draft's description holds.
+        use super::CommitDraft;
+        assert!(!CommitDraft::default().has_message());
+        assert!(!CommitDraft {
+            summary: "   \n  ".into(),
+            description: "real words".into(),
+        }
+        .has_message());
+        assert!(CommitDraft {
+            summary: "name the change".into(),
+            ..Default::default()
+        }
+        .has_message());
+    }
+
+    #[test]
+    fn the_commit_message_shapes_git_two_paragraphs() {
+        // What `git commit` receives: the subject alone when no
+        // description was written — an empty second paragraph would be
+        // content, not absence — and git's own blank line between them
+        // when one was.
+        use super::CommitDraft;
+        assert_eq!(
+            CommitDraft {
+                summary: "name the change".into(),
+                ..Default::default()
+            }
+            .message(),
+            "name the change"
+        );
+        assert_eq!(
+            CommitDraft {
+                summary: "name the change".into(),
+                description: "  why it reads this way  ".into(),
+            }
+            .message(),
+            "name the change\n\n  why it reads this way  "
+        );
+    }
+
+    #[test]
+    fn a_bare_launch_names_its_view_and_nothing_else() {
+        // What `open /Applications/gitten.app` arrives as: no arguments, and no
+        // source beyond the default. Only this shape gets the recent-then-picker
+        // treatment; everything a user actually typed fails as it always has.
+        assert_eq!(bare_launch_view(&args("")), Some(View::Commits));
+        assert_eq!(bare_launch_view(&args("commits")), Some(View::Commits));
+        assert_eq!(bare_launch_view(&args("diff")), Some(View::Diff));
+        assert_eq!(bare_launch_view(&args("diff . HEAD~2..HEAD")), None);
+        assert_eq!(bare_launch_view(&args("commits /tmp")), None);
+        assert_eq!(bare_launch_view(&args("diff --fixtures")), None);
+        assert_eq!(bare_launch_view(&args("diff --patch foo.diff")), None);
+        assert_eq!(bare_launch_view(&args("--help")), None);
+        assert_eq!(bare_launch_view(&args("config")), None);
+        assert_eq!(bare_launch_view(&args("bogus")), None);
+    }
+
+    #[test]
+    fn no_history_means_no_recent_to_open() {
+        assert!(open_recent(View::Commits, &[]).is_none());
+    }
+
+    #[test]
+    fn stale_recents_open_nothing() {
+        assert!(open_recent(View::Commits, &[PathBuf::from("/nonexistent-gitten-repo")]).is_none());
+    }
+
+    #[test]
+    fn a_bare_launch_returns_the_latest_recent_that_still_opens() {
+        // The workspace root is a repository with history — the same assumption
+        // `gitten-app`'s own startup test makes — so it stands in for a recent
+        // entry that survived, behind one that did not.
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("the shell lives one level below the workspace root")
+            .to_path_buf();
+        let stale = PathBuf::from("/nonexistent-gitten-repo");
+        let started = open_recent(View::Commits, &[stale, root.clone()])
+            .expect("the workspace root is a repository");
+        assert_eq!(started.view, View::Commits);
+        match started.source {
+            Source::Repo { path, .. } => assert_eq!(path, root),
+            other => panic!("a repo source opens a repo, got {other:?}"),
+        }
+        // The requested view rides along — but only a dirty checkout can prove
+        // it, because a working-tree `diff` startup rejects a clean tree ("no
+        // changes") while `commits` opens anywhere with history. The workspace
+        // root is clean on CI and dirty on a developer's machine, so a scratch
+        // repository with a real edit is the hermetic stand-in.
+        let dirty = scratch_repo("bare-diff", true);
+        let started = open_recent(View::Diff, std::slice::from_ref(&dirty))
+            .expect("a dirty repository has a diff");
+        assert_eq!(started.view, View::Diff);
+        match started.source {
+            Source::Repo { path, .. } => assert_eq!(path, dirty),
+            other => panic!("a repo source opens a repo, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dirty);
+    }
+
+    #[test]
+    fn a_bare_diff_launch_on_a_clean_checkout_falls_back_to_the_graph() {
+        // A clean checkout is still a repository: skipping it would land a
+        // bare `diff` relaunch on the picker despite valid history.
+        let clean = scratch_repo("bare-diff-clean", false);
+        let started = open_recent(View::Diff, std::slice::from_ref(&clean))
+            .expect("a clean repository still opens");
+        assert_eq!(
+            started.view,
+            View::Commits,
+            "the graph is the honest fallback for an empty working tree"
+        );
+        let _ = std::fs::remove_dir_all(&clean);
+        assert!(open_recent(View::Diff, &[PathBuf::from("/nonexistent-gitten-repo")]).is_none());
+    }
+
+    /// A throwaway repository with one commit — dirty when asked — so a
+    /// working-tree `diff` has something deterministic to open regardless of
+    /// whether the enclosing checkout is clean (CI) or dirty (a laptop).
+    fn scratch_repo(name: &str, dirty: bool) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("gitten-gui-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a temp dir");
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+                .args(args)
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q", "."]);
+        git(&["config", "core.autocrlf", "false"]);
+        std::fs::write(dir.join("f.txt"), "one\n").expect("wrote the file");
+        git(&["add", "f.txt"]);
+        git(&["commit", "-qm", "x"]);
+        if dirty {
+            std::fs::write(dir.join("f.txt"), "one\ntwo\n").expect("dirtied the worktree");
+        }
+        dir
+    }
+
+    struct ExtensionPane {
+        ran: Rc<Cell<bool>>,
+        generation: Rc<Cell<Generation>>,
+    }
+
+    impl ExtensionPane {
+        /// What a verb looks like from a pane that did not ship with the app:
+        /// aim a [`gitten_app::verbs::Write`] at the handed repository and
+        /// hand it to the handed queue. No field of the shell is reached, no
+        /// built-in is special-cased — these are the same two rails
+        /// `files.stage` rides.
+        fn stage_like_a_builtin(&self, writes: &Writes) -> bool {
+            let job = gitten_app::verbs::Write::stage(&writes.repo, b"notes.md".to_vec());
+            let queued = writes.send(Box::new(job));
+            self.ran.set(queued);
+            queued
+        }
+    }
+
+    impl Pane for ExtensionPane {
+        fn mode(&self) -> &'static str {
+            "extension"
+        }
+
+        fn label(&self, _: &gpui::App) -> String {
+            "extension pane".into()
+        }
+
+        fn refresh(
+            &self,
+            target: Generation,
+            _: &Host,
+            _: &gitten_core::differ::Overrides,
+            repo: gitten_git::Handle,
+        ) -> Option<Refresh> {
+            if self.generation.get() >= target {
+                return None;
+            }
+            let generation = self.generation.clone();
+            Some(Refresh::new(
+                target,
+                move || {
+                    repo.status()?;
+                    Ok("extension-owned data".to_string())
+                },
+                move |value: String, _, _| {
+                    assert_eq!(value, "extension-owned data");
+                    generation.set(target);
+                    Ok(())
+                },
+            ))
+        }
+
+        fn run(&self, command: &str, _: &Host, writes: Option<&Writes>, _: &mut gpui::App) -> bool {
+            match (command, writes) {
+                ("extension.toggle", _) => {
+                    self.ran.set(true);
+                    true
+                }
+                // A fixture has no repository to write through; `None` here is
+                // the same honest nothing a built-in verb answers.
+                ("extension.stage", Some(writes)) => self.stage_like_a_builtin(writes),
+                _ => false,
+            }
+        }
+    }
+
+    struct Succeed;
+
+    impl Job for Succeed {
+        fn name(&self) -> &str {
+            "succeed"
+        }
+
+        fn run(self: Box<Self>) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn successful_generation() -> Generation {
+        let runner = Runner::new();
+        runner
+            .submitter()
+            .submit(Box::new(Succeed))
+            .unwrap_or_else(|_| panic!("runner rejected a job"));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            while let Some(event) = runner.try_next() {
+                if let JobEvent::Finished {
+                    generation,
+                    outcome: Ok(()),
+                    ..
+                } = event
+                {
+                    return generation;
+                }
+            }
+            assert!(Instant::now() < deadline, "job did not finish");
+            std::thread::yield_now();
+        }
+    }
+
+    struct RefreshRepo {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Repo for RefreshRepo {
+        fn log(&self, _: usize) -> gitten_git::Result<Vec<Commit>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(vec![Commit {
+                sha: "1".into(),
+                short: "1".into(),
+                parents: Box::from(&[][..]),
+                author: "test".into(),
+                timestamp: 0,
+                subject: "refreshed".into(),
+            }])
+        }
+
+        fn pairs(&self, _: &str) -> gitten_git::Result<Vec<Pair>> {
+            Ok(Vec::new())
+        }
+
+        fn status(&self) -> gitten_git::Result<Status> {
+            Ok(Status::default())
+        }
+
+        fn describe(&self) -> String {
+            "refreshed".into()
+        }
+    }
+
+    /// A shell on one commits screen, with whatever picker is named open and
+    /// one key of a chord half-typed — the state `esc` meets most often.
+    fn shell(which: Option<Open>, cx: &mut TestAppContext) -> gpui::Entity<DevShell> {
+        cx.new(|cx| {
+            // The live host, so anything a test dispatches through
+            // `config::host` finds one — tests that care replace it.
+            cx.set_global(config::Active(Rc::new(Host::new())));
+            let host = config::host(cx);
+            let commits = cx.new(|_| Commits::new(Vec::new(), host.clone()));
+            let diff = cx.new(|cx| crate::views::diff::Diff::new(Vec::new(), host.clone(), cx));
+            let jobs = Runner::new();
+            DevShell {
+                which: "commits",
+                panes: panes::Panes::new(
+                    "commits",
+                    Screen::commits(commits, Source::Fixtures, Generation::default(), "repo"),
+                ),
+                main: Screen::diff(diff, None, Generation::default(), ""),
+                has_column: true,
+                spot: super::Spot::List,
+                head: RefCell::new(None),
+                request: Cell::new(0),
+                loading: Cell::new(false),
+                stats: None,
+                rediff: None,
+                repo: None,
+                submitter: jobs.submitter(),
+                jobs,
+                generation: Generation::default(),
+                refresh_id: 0,
+                refresh_pending: 0,
+                refresh_error: None,
+                running: None,
+                show_message: false,
+                input: None,
+                prompt: None,
+                search_live: None,
+                over: Default::default(),
+                open: which,
+                error: None,
+                error_is_load: false,
+                notice: None,
+                config: std::path::PathBuf::new(),
+                first_render: Cell::new(false),
+                title_memo: RefCell::new(None),
+                workspace: crate::views::workspace::Workspace::default(),
+                drafts: std::collections::HashMap::new(),
+                commit_confirm: false,
+                last_fetch: None,
+                last_push: None,
+                status_memo: RefCell::new(None),
+                pending_commit_key: None,
+                palette_open: false,
+                palette_sel: 0,
+                palette_field: None,
+                palette_sub: None,
+                palette_query: String::new(),
+                theme_picker_open: false,
+                theme_picker_sel: 0,
+                theme_picker_field: None,
+                theme_picker_sub: None,
+                theme_picker_query: String::new(),
+                focus: cx.focus_handle(),
+                focused: None,
+                ongoing: Cell::default(),
+                projects: Vec::new(),
+                session_key: String::new(),
+                session_path: std::path::PathBuf::new(),
+                pending_restore: None,
+            }
+        })
+    }
+
+    #[gpui::test]
+    fn esc_closes_any_open_menu_and_touches_nothing_else(cx: &mut TestAppContext) {
+        // The project menu, standing over the title: one `esc` closes it
+        // and reaches no further.
+        let shell = shell(Some(Open::Project), cx);
+        shell.update(cx, |s, cx| s.back(cx));
+        shell.read_with(cx, |s, _| {
+            assert!(s.open.is_none(), "the menu stayed open");
+            assert_eq!(s.panes.len(), 1, "esc closed the pane too");
+        });
+    }
+
+    #[gpui::test]
+    fn the_settings_command_opens_one_window(cx: &mut TestAppContext) {
+        let shell = shell(None, cx);
+        let observed = shell.clone();
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.set_global(config::Active(Rc::new(Host::new())));
+            cx.set_global(settings_window::Open::default());
+            assert_eq!(cx.windows().len(), 0, "a window stood before it was asked");
+        });
+        // `,` is the keymap's name for it — the same dispatch a press runs.
+        observed.update(&mut *cx, |s, cx| s.run_command("settings", cx));
+        cx.update(|cx| {
+            assert_eq!(
+                cx.windows().len(),
+                1,
+                "settings opened anywhere but a new window"
+            );
+        });
+        // A second open activates instead of duplicating.
+        observed.update(&mut *cx, |s, cx| s.run_command("settings", cx));
+        cx.update(|cx| {
+            assert_eq!(
+                cx.windows().len(),
+                1,
+                "the second open duplicated the window"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn picking_a_theme_keeps_the_picker_open(cx: &mut TestAppContext) {
+        // The reference dismisses its picker on a choice; this window does not,
+        // because trying several palettes against the diff behind the scrim is
+        // the whole reason the picker exists.
+        let shell = shell(None, cx);
+        let observed = shell.clone();
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.set_global(config::Active(Rc::new(Host::new())));
+            cx.set_global(config::Chosen(None));
+        });
+        observed.update(&mut *cx, |s, cx| s.run_command("theme.picker", cx));
+        let index = observed.read_with(cx, |s, cx| {
+            assert!(s.theme_picker_open, "the picker did not open");
+            s.theme_picker_cards(cx)
+                .iter()
+                .position(|card| card.name == "github-dark")
+                .expect("github-dark is registered")
+        });
+        observed.update(&mut *cx, |s, cx| s.choose_theme_at(index, cx));
+        observed.read_with(cx, |s, cx| {
+            assert!(s.theme_picker_open, "choosing closed the picker");
+            assert_eq!(config::host(cx).theme.name, "github-dark");
+        });
+        // And esc is still the way out.
+        observed.update(&mut *cx, |s, cx| s.back(cx));
+        observed.read_with(cx, |s, _| {
+            assert!(!s.theme_picker_open, "esc left the picker standing");
+        });
+    }
+
+    #[gpui::test]
+    fn esc_with_nothing_open_returns_from_diff_to_list(cx: &mut TestAppContext) {
+        let shell = shell(None, cx);
+        // With nothing stacked above, `esc` hands the keyboard back from
+        // the diff to the stack.
+        shell.update(cx, |s, cx| {
+            s.set_spot(super::Spot::Main, cx);
+            s.back(cx);
+        });
+        shell.read_with(cx, |s, _| {
+            assert_eq!(s.spot, super::Spot::List, "esc did not return to the list");
+        });
+    }
+
+    #[gpui::test]
+    fn the_lists_learn_focus_when_it_moves_and_not_in_render(cx: &mut TestAppContext) {
+        // A row's bar is accent only in the pane holding the keyboard; the
+        // flag that says so is written where focus moves, so a test can read
+        // it without a frame ever being drawn.
+        let shell = shell(None, cx);
+        let second = cx.update(|cx| cx.new(|_| Commits::new(Vec::new(), Rc::new(Host::new()))));
+        shell.update(cx, |s, cx| {
+            s.panes.register(
+                "second",
+                Screen::commits(
+                    second.clone(),
+                    Source::Fixtures,
+                    Generation::default(),
+                    "second",
+                ),
+            );
+            s.sync_focus(cx);
+        });
+        let first = shell.read_with(cx, |s, _| match s.panes.get("commits") {
+            Some(Screen::Commits { view, .. }) => view.clone(),
+            _ => panic!("no commits list"),
+        });
+        // Registration focuses the newcomer.
+        assert!(!first.read_with(cx, |v, _| v.focused()));
+        assert!(second.read_with(cx, |v, _| v.focused()));
+
+        shell.update(cx, |s, cx| s.focus_named("commits", cx));
+        assert!(first.read_with(cx, |v, _| v.focused()));
+        assert!(!second.read_with(cx, |v, _| v.focused()));
+        shell.update(cx, |s, cx| s.focus_named("second", cx));
+        assert!(!first.read_with(cx, |v, _| v.focused()));
+        assert!(second.read_with(cx, |v, _| v.focused()));
+
+        // The diff holds the keyboard: no list is focused, and the memory of
+        // which one was comes back with `esc`.
+        shell.update(cx, |s, cx| s.set_spot(super::Spot::Main, cx));
+        assert!(!second.read_with(cx, |v, _| v.focused()));
+        shell.update(cx, |s, cx| s.back(cx));
+        assert!(second.read_with(cx, |v, _| v.focused()));
+    }
+
+    #[gpui::test]
+    fn esc_hands_the_keyboard_back_from_the_diff_and_never_closes_a_list(cx: &mut TestAppContext) {
+        let shell = shell(None, cx);
+        // From the column, esc with nothing standing does nothing at all —
+        // and closes nothing, because the lists are the column's residents.
+        shell.update(cx, |s, cx| s.back(cx));
+        shell.read_with(cx, |s, _| {
+            assert_eq!(s.panes.len(), 1);
+            assert_eq!(s.spot, super::Spot::List);
+        });
+
+        // Enter hands the keyboard to the diff region; `esc` brings it back.
+        shell.update(cx, |s, cx| s.run_command("commits.open-diff", cx));
+        shell.read_with(cx, |s, _| {
+            assert_eq!(s.spot, super::Spot::Main);
+        });
+        shell.update(cx, |s, cx| s.back(cx));
+        shell.read_with(cx, |s, _| assert_eq!(s.spot, super::Spot::List));
+
+        // A second registered list survives every esc.
+        shell.update(cx, |s, cx| {
+            let commits = cx.new(|_| Commits::new(Vec::new(), Rc::new(Host::new())));
+            s.panes.register(
+                "second",
+                Screen::commits(commits, Source::Fixtures, Generation::default(), "second"),
+            );
+        });
+        for _ in 0..2 {
+            shell.update(cx, |s, cx| s.back(cx));
+        }
+        shell.read_with(cx, |s, _| {
+            assert_eq!(s.panes.len(), 2, "esc closed a list");
+            assert_eq!(s.open, None);
+        });
+    }
+
+    #[gpui::test]
+    fn pane_commands_move_focus(cx: &mut TestAppContext) {
+        let shell = shell(None, cx);
+        shell.update(cx, |shell, cx| {
+            let commits = cx.new(|_| Commits::new(Vec::new(), Rc::new(Host::new())));
+            shell.panes.register(
+                "second",
+                Screen::commits(commits, Source::Fixtures, Generation::default(), "second"),
+            );
+        });
+        shell.read_with(cx, |shell, app| {
+            assert_eq!(shell.active_label(app).as_ref(), "second");
+        });
+
+        shell.update(cx, |shell, cx| shell.run_command("pane.prev", cx));
+        shell.read_with(cx, |shell, app| {
+            assert_eq!(shell.active_label(app).as_ref(), "repo");
+        });
+
+        shell.update(cx, |shell, cx| shell.run_command("pane.next", cx));
+        shell.read_with(cx, |shell, app| {
+            assert_eq!(shell.active_label(app).as_ref(), "second");
+            assert_eq!(shell.panes.focused_index(), 1);
+        });
+    }
+
+    #[gpui::test]
+    fn the_pane_moves_walk_every_pane_in_reading_order(cx: &mut TestAppContext) {
+        let shell = shell(None, cx);
+        // The whole visible stack, so the walk has five stops: four lists and
+        // the diff.
+        shell.update(cx, |shell, cx| {
+            let host = config::host(cx);
+            let branches = cx.new(|_| {
+                crate::views::branches::Branches::from_prepared(crate::views::branches::prepare(
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                    Vec::new(),
+                    &host.theme,
+                    "t",
+                ))
+            });
+            shell.panes.register(
+                "files",
+                Screen::files(
+                    cx.new(|_| {
+                        crate::views::files::Files::from_prepared(crate::views::files::prepare(
+                            Default::default(),
+                            "t",
+                            std::collections::HashMap::new(),
+                        ))
+                    }),
+                    Generation::default(),
+                    "files",
+                ),
+            );
+            shell.panes.register(
+                "branches",
+                Screen::branches(branches, Generation::default(), "branches"),
+            );
+            shell.panes.register(
+                "stashes",
+                Screen::stashes(
+                    cx.new(|_| {
+                        crate::views::stashes::Stashes::from_prepared(
+                            crate::views::stashes::prepare(&[], "t"),
+                        )
+                    }),
+                    Generation::default(),
+                    "stashes",
+                ),
+            );
+            shell.run_command("files.focus", cx);
+        });
+
+        // Right from the top walks down the stack and lands on the diff:
+        // files → branches → commits → stashes → diff.
+        for expected in ["branches", "commits", "stashes"] {
+            shell.update(cx, |shell, cx| shell.run_command("pane.right", cx));
+            shell.read_with(cx, |shell, _| {
+                assert_eq!(
+                    shell.panes.focused_name(),
+                    expected,
+                    "walking right from the top"
+                );
+                assert_eq!(shell.spot, super::Spot::List);
+            });
+        }
+        shell.update(cx, |shell, cx| shell.run_command("pane.right", cx));
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(
+                shell.spot,
+                super::Spot::Main,
+                "right of the foot is the diff"
+            );
+        });
+        // And the edge is an edge: right on the diff answers, moves nothing.
+        shell.update(cx, |shell, cx| shell.run_command("pane.right", cx));
+        shell.read_with(cx, |shell, _| assert_eq!(shell.spot, super::Spot::Main));
+
+        // Left from the diff walks back up the stack, and the top is the
+        // other edge.
+        for expected in ["stashes", "commits", "branches", "files"] {
+            shell.update(cx, |shell, cx| shell.run_command("pane.left", cx));
+            shell.read_with(cx, |shell, _| {
+                assert_eq!(
+                    shell.panes.focused_name(),
+                    expected,
+                    "walking left from the diff"
+                );
+                assert_eq!(shell.spot, super::Spot::List);
+            });
+        }
+        shell.update(cx, |shell, cx| shell.run_command("pane.left", cx));
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(
+                shell.panes.focused_name(),
+                "files",
+                "the top is the left edge"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn a_compiled_in_extension_registers_a_pane_without_a_screen_variant(cx: &mut TestAppContext) {
+        let shell = shell(None, cx);
+        let ran = Rc::new(Cell::new(false));
+        let refreshed = Rc::new(Cell::new(Generation::default()));
+        let target = successful_generation();
+        shell.update(cx, |shell, cx| {
+            cx.set_global(config::Active(Rc::new(Host::new())));
+            shell.register_pane(
+                "extension",
+                ExtensionPane {
+                    ran: ran.clone(),
+                    generation: refreshed.clone(),
+                },
+                cx,
+            );
+            shell.run_command("extension.toggle", cx);
+            shell.repo = Some((
+                PathBuf::from("/fake"),
+                Arc::new(RefreshRepo {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                }),
+            ));
+            shell.generation = target;
+            shell.refresh_stale(cx);
+        });
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, app| {
+            assert_eq!(shell.active_label(app).as_ref(), "extension pane");
+            assert_eq!(shell.active_view_name(), "extension");
+            assert_eq!(shell.panes.len(), 2);
+        });
+        assert!(ran.get(), "the extension's command did not reach its pane");
+        assert_eq!(refreshed.get(), target);
+    }
+
+    #[gpui::test]
+    fn one_generation_refreshes_every_visible_repository_pane(cx: &mut TestAppContext) {
+        let shell = shell(None, cx);
+        let generation = successful_generation();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let path = PathBuf::from("/fake");
+        let source = Source::Repo {
+            path: path.clone(),
+            arg: "1".into(),
+        };
+        shell.update(cx, |shell, cx| {
+            let root = cx.new(|_| Commits::new(Vec::new(), Rc::new(Host::new())));
+            shell.panes = panes::Panes::new(
+                "commits",
+                Screen::commits(root, source.clone(), Generation::default(), "stale root"),
+            );
+            let second = cx.new(|_| Commits::new(Vec::new(), Rc::new(Host::new())));
+            shell.panes.register(
+                "second",
+                Screen::commits(second, source.clone(), Generation::default(), "stale"),
+            );
+            shell.repo = Some((
+                path,
+                Arc::new(RefreshRepo {
+                    calls: calls.clone(),
+                }),
+            ));
+            shell.generation = generation;
+            shell.running = Some(("running next write".into(), Instant::now()));
+            cx.set_global(config::Active(Rc::new(Host::new())));
+            shell.refresh_stale(cx);
+        });
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "repository refresh blocked the GPUI update"
+        );
+        cx.run_until_parked();
+
+        shell.read_with(cx, |shell, cx| {
+            for pane in shell.panes.iter() {
+                let Screen::Commits {
+                    view,
+                    generation: pane_generation,
+                    ..
+                } = pane
+                else {
+                    panic!("test registered only commit panes");
+                };
+                assert_eq!(view.read(cx).total(), 1);
+                assert_eq!(pane_generation.get(), generation);
+            }
+            assert!(shell.error.is_none());
+            assert_eq!(shell.refresh_pending, 0);
+            assert_eq!(
+                shell.running.as_ref().map(|(label, _)| label.as_str()),
+                Some("running next write")
+            );
+        });
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    /// The History destination draws the branch timeline and the selected
+    /// commit's diff inside the workspace — the reference's layout, not the
+    /// numbered stack.
+    #[gpui::test]
+    fn the_history_destination_draws_a_timeline_beside_the_commit_diff(cx: &mut TestAppContext) {
+        let shell = commits_shell(cx);
+        shell.update(cx, |shell, cx| {
+            let files = cx.new(|_| {
+                crate::views::files::Files::from_prepared(crate::views::files::prepare(
+                    gitten_core::status::Status::default(),
+                    "gitten",
+                    Default::default(),
+                ))
+            });
+            shell.panes.register(
+                "files",
+                Screen::files(files, gitten_app::jobs::Generation::default(), "files"),
+            );
+            shell.run_command("workspace.history", cx);
+        });
+        let observed = shell.clone();
+        let handle = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.set_global(config::Active(Rc::new(Host::new())));
+            cx.open_window(
+                gpui::WindowOptions {
+                    window_bounds: Some(gpui::WindowBounds::Windowed(gpui::Bounds {
+                        origin: Default::default(),
+                        size: gpui::size(gpui::px(1200.0), gpui::px(800.0)),
+                    })),
+                    ..Default::default()
+                },
+                move |_, _| observed,
+            )
+            .unwrap()
+        });
+        let mut cx = gpui::VisualTestContext::from_window(handle.into(), cx);
+        cx.run_until_parked();
+        let history = cx
+            .debug_bounds("workspace-history")
+            .expect("the history destination was not drawn");
+        assert!(history.size.width > gpui::px(0.0));
+        assert!(history.size.height > gpui::px(0.0));
+        assert_eq!(
+            shell.read_with(&cx, |shell, _| shell.workspace.destination),
+            crate::views::workspace::Destination::History
+        );
+    }
+
+    /// The design's whole arrangement: stack, diff — two regions side by
+    #[gpui::test]
+    fn browsing_from_a_fixture_says_so_and_opens_no_panel(cx: &mut TestAppContext) {
+        // No repository behind the view: the file picker is never reached —
+        // the refusal below runs before any platform call — so this needs
+        // no panel stub and asserts the honest `None`, not the dialog.
+        let bare = shell(None, cx);
+        bare.update(cx, |shell, cx| shell.run_command("project.browse", cx));
+        bare.read_with(cx, |shell, _| {
+            assert!(shell.notice.is_some(), "a fixture went unsaid");
+            assert!(shell.open.is_none(), "refusing to browse left a menu open");
+        });
+    }
+
+    #[gpui::test]
+    fn files_focus_reaches_the_registered_pane_and_says_so_when_there_is_none(
+        cx: &mut TestAppContext,
+    ) {
+        // Bound before the name `shell` is taken by a list-carrying one.
+        let bare = shell(None, cx);
+        let shell = shell(None, cx);
+        shell.update(cx, |shell, cx| {
+            let files = cx.new(|_| {
+                crate::views::files::Files::from_prepared(crate::views::files::prepare(
+                    Status::default(),
+                    "gitten (main)",
+                    Default::default(),
+                ))
+            });
+            shell.panes.register(
+                "files",
+                Screen::files(files, Generation::default(), "gitten (main) · 0 changed"),
+            );
+            // Registration focuses what it adds; a launch starts on the root.
+            shell.panes.focus(0);
+        });
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(shell.active_view_name(), "commits")
+        });
+
+        // Named dispatch — the same path Commands and menus run. It
+        // swaps the list into the column and takes the keyboard with it.
+        shell.update(cx, |shell, cx| shell.run_command("files.focus", cx));
+        shell.read_with(cx, |shell, app| {
+            assert_eq!(shell.panes.focused_name(), "files");
+            assert_eq!(
+                shell.active_label(app).as_ref(),
+                "gitten (main) · 0 changed"
+            );
+        });
+
+        // And with no such resident — a fixture has no working tree — the
+        // command is answered with a sentence, not silence.
+        bare.update(cx, |shell, cx| shell.run_command("files.focus", cx));
+        bare.read_with(cx, |shell, _| {
+            assert!(shell.notice.is_some(), "a missing pane went unsaid");
+        });
+    }
+
+    #[gpui::test]
+    fn native_input_owns_the_keyboard_until_it_closes(cx: &mut TestAppContext) {
+        let shell = shell(None, cx);
+        let input = cx.new(|cx| input::Input::new("message", "type", "draft", cx));
+        shell.update(cx, |shell, cx| shell.open_input(input.clone(), cx));
+        shell.update(cx, |shell, cx| shell.run_command("select.all", cx));
+        assert_eq!(
+            input.read_with(cx, |input, _| input.selected_text()),
+            Some("draft".into())
+        );
+
+        shell.update(cx, |shell, cx| shell.run_command("input.cancel", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.input.is_none());
+        });
+    }
+
+    // ---------------------------------------------------------- the search
+
+    /// A history to filter: alternating authors and subjects, so any query
+    /// keeps a known half and discards the rest.
+    fn search_commit(n: usize) -> Commit {
+        let even = n.is_multiple_of(2);
+        Commit {
+            sha: format!("{n:040x}"),
+            short: format!("abc00{n}"),
+            parents: Box::from(&[][..]),
+            author: Arc::from(if even { "ada" } else { "grace" }),
+            timestamp: 1_700_000_000 + n as i64,
+            subject: if even {
+                format!("engine note {n}")
+            } else {
+                format!("compiler pass {n}")
+            },
+        }
+    }
+
+    fn search_history() -> Vec<Commit> {
+        (0..30).map(search_commit).collect()
+    }
+
+    /// A commits pane with rows *and* a repository behind it — what the
+    /// history verbs need that the fixture-backed [commits] shell lacks.
+    /// The keyboard starts on row 0, whose sha is forty zeros and whose
+    /// short form is `abc000`.
+    fn history_shell(cx: &mut TestAppContext) -> (gpui::Entity<DevShell>, Arc<RecordingRepo>) {
+        let calls = Arc::default();
+        let repo = Arc::new(RecordingRepo::new(Arc::clone(&calls)));
+        let handle: gitten_git::Handle = repo.clone();
+        let shell = shell(None, cx);
+        shell.update(cx, |shell, cx| {
+            let view = cx.new(|_| Commits::new(search_history(), Rc::new(Host::new())));
+            cx.set_global(config::Active(Rc::new(Host::new())));
+            shell.panes.register(
+                "commits",
+                Screen::commits(view, Source::Fixtures, Generation::default(), "~/src"),
+            );
+            shell.repo = Some((PathBuf::from("/recorded"), handle));
+        });
+        (shell, repo)
+    }
+
+    /// [`shell`] is built with an empty pane; this one carries rows, which is
+    /// what every search test needs to see move. Replacing by name keeps the
+    /// root slot — and focus — exactly where they were.
+    fn commits_shell(cx: &mut TestAppContext) -> gpui::Entity<DevShell> {
+        let shell = shell(None, cx);
+        shell.update(cx, |shell, cx| {
+            let view = cx.new(|_| Commits::new(search_history(), Rc::new(Host::new())));
+            // A live edit reconciles against the file's settings, like every
+            // other reader of the host.
+            cx.set_global(config::Active(Rc::new(Host::new())));
+            shell.panes.register(
+                "commits",
+                Screen::commits(view, Source::Fixtures, Generation::default(), "~/src"),
+            );
+        });
+        shell
+    }
+
+    /// The focused commits pane, for reading what a search did to it.
+    fn commits_view(shell: &gpui::Entity<DevShell>, cx: &TestAppContext) -> gpui::Entity<Commits> {
+        match shell.read_with(cx, |shell, _| shell.active().cloned()) {
+            Some(Screen::Commits { view, .. }) => view.clone(),
+            _ => panic!("no commits pane under the keyboard"),
+        }
+    }
+
+    /// Opens the prompt and types `query` into it the way the platform would:
+    /// through the field's own edit path, whose event the live filter rides.
+    #[track_caller]
+    fn type_query(shell: &gpui::Entity<DevShell>, cx: &mut TestAppContext, query: &str) {
+        shell.update(cx, |shell, cx| shell.run_command("commits.search", cx));
+        let typed = shell.read_with(cx, |shell, _| shell.input.clone());
+        let Some(field) = typed else {
+            panic!("no field opened");
+        };
+        field.update(cx, |field, cx| field.replace(None, query, cx));
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn slash_opens_a_live_search_and_enter_leaves_what_it_found(cx: &mut TestAppContext) {
+        let shell = commits_shell(cx);
+        type_query(&shell, cx, "engine");
+
+        shell.read_with(cx, |shell, _| {
+            assert!(
+                matches!(shell.prompt, Some(super::Prompt::Search { .. })),
+                "{:?}",
+                shell.prompt
+            );
+        });
+        let view = commits_view(&shell, cx);
+        view.read_with(cx, |v, _| {
+            assert_eq!(v.rows(), 15, "the list filtered while typing");
+            assert_eq!(v.filter_note().as_deref(), Some("15/30"));
+        });
+
+        // Enter closes with the query standing; the count stays in the title.
+        shell.update(cx, |shell, cx| shell.run_command("input.accept", cx));
+        shell.read_with(cx, |shell, app| {
+            assert!(shell.input.is_none());
+            assert_eq!(shell.active_label(app).as_ref(), "~/src · 15/30");
+        });
+        view.read_with(cx, |v, _| {
+            assert_eq!(v.rows(), 15, "accept kept the filter")
+        });
+    }
+
+    #[gpui::test]
+    fn esc_clears_the_filter_along_with_the_prompt(cx: &mut TestAppContext) {
+        let shell = commits_shell(cx);
+        type_query(&shell, cx, "engine");
+        let view = commits_view(&shell, cx);
+        view.read_with(cx, |v, _| assert_eq!(v.rows(), 15));
+
+        // The real exit key: `back` finds the input and cancels it.
+        shell.update(cx, |shell, cx| shell.back(cx));
+        shell.read_with(cx, |shell, app| {
+            assert!(shell.input.is_none());
+            assert_eq!(shell.active_label(app).as_ref(), "~/src", "restored");
+        });
+        view.read_with(cx, |v, _| assert_eq!(v.rows(), 30, "nothing left standing"));
+    }
+
+    #[gpui::test]
+    fn a_second_slash_edits_the_standing_query(cx: &mut TestAppContext) {
+        let shell = commits_shell(cx);
+        type_query(&shell, cx, "engine");
+        shell.update(cx, |shell, cx| shell.run_command("input.accept", cx));
+
+        // Reopen: the pane still holds the query, so the field starts from
+        // it rather than from nothing.
+        type_query(&shell, cx, "");
+        let value = shell.read_with(cx, |shell, app| {
+            shell
+                .input
+                .as_ref()
+                .map(|field| field.read(app).value().to_string())
+        });
+        assert_eq!(value.as_deref(), Some("engine"));
+
+        // Narrowing from there filters live from the longer query.
+        let typed = shell.read_with(cx, |shell, _| shell.input.clone().unwrap());
+        typed.update(cx, |field, cx| field.replace(None, " note 3", cx));
+        cx.run_until_parked();
+        let view = commits_view(&shell, cx);
+        view.read_with(cx, |v, _| {
+            assert!(matches!(v.query(), Some(q) if q.contains("note 3")));
+            assert!(v.rows() < 15, "the edited query applied live");
+        });
+    }
+
+    #[gpui::test]
+    fn an_empty_accept_takes_the_filter_back_off(cx: &mut TestAppContext) {
+        let shell = commits_shell(cx);
+
+        // Accepting an untouched prompt clears nothing because there is
+        // nothing to clear — and says so by leaving the label alone.
+        type_query(&shell, cx, "");
+        shell.update(cx, |shell, cx| shell.run_command("input.accept", cx));
+        shell.read_with(cx, |shell, app| {
+            assert_eq!(shell.active_label(app).as_ref(), "~/src");
+        });
+
+        // A standing filter comes off live the moment the field is emptied:
+        // cmd-a and delete are enough, before enter even lands.
+        type_query(&shell, cx, "engine");
+        let typed = shell.read_with(cx, |shell, _| shell.input.clone().unwrap());
+        typed.update(cx, |field, cx| {
+            field.select_all_text(true, cx);
+            field.replace(None, "", cx);
+        });
+        cx.run_until_parked();
+        let view = commits_view(&shell, cx);
+        view.read_with(cx, |v, _| {
+            assert_eq!(v.rows(), 30, "cleared while still open")
+        });
+        shell.update(cx, |shell, cx| shell.run_command("input.accept", cx));
+        shell.read_with(cx, |shell, app| {
+            assert_eq!(shell.active_label(app).as_ref(), "~/src");
+        });
+    }
+
+    #[gpui::test]
+    fn search_says_so_where_nothing_answers_it(cx: &mut TestAppContext) {
+        // No repository data at all is still a commits screen — it answers.
+        let shell = shell(None, cx);
+        shell.update(cx, |shell, cx| shell.run_command("commits.search", cx));
+        shell.read_with(cx, |shell, _| assert!(shell.input.is_some()));
+
+        // And the verb is one keypress away in every list pane now: over
+        // the working tree, the same command filters the focused list.
+        let (shell, _repo, _handle) = files_shell(cx);
+        shell.update(cx, |shell, cx| shell.run_command("files.search", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.input.is_some(), "the files pane answers, too");
+        });
+    }
+
+    /// Install the fixture diff into the workspace center instead of the
+    /// hidden main view: what the keyboard scrolls through the workspace
+    /// door is the center's rows, not the load buffer's.
+    fn install_center(shell: &gpui::Entity<DevShell>, raw: &str, cx: &mut TestAppContext) {
+        shell.update(cx, |shell, cx| {
+            let host = Rc::new(Host::new());
+            let center = cx.new(|cx| {
+                crate::views::diff::Diff::new(
+                    gitten_core::parse_unified_diff(raw),
+                    host.clone(),
+                    cx,
+                )
+            });
+            shell.workspace.center = Some(center);
+        });
+    }
+
+    const ONE_HUNK: &str = "\
+diff --git a/one.txt b/one.txt
+--- a/one.txt
++++ b/one.txt
+@@ -1,3 +1,3 @@
+ alpha
+-beta
++BETA
+ gamma
+";
+
+    /// The commits list under the keyboard, however far down the registry it
+    /// sits after other lists registered beside it.
+    fn column_commits(shell: &gpui::Entity<DevShell>, cx: &TestAppContext) -> String {
+        let view = shell.read_with(cx, |shell, _| {
+            let at = shell.panes.position("commits").expect("no commits list");
+            match shell.panes.iter().nth(at) {
+                Some(Screen::Commits { view, .. }) => view.clone(),
+                _ => panic!("the column's resident is not a commits list"),
+            }
+        });
+        view.read_with(cx, |v, _| {
+            v.current().map(|c| c.sha.clone()).unwrap_or_default()
+        })
+    }
+
+    #[gpui::test]
+    fn swapping_lists_preserves_each_list_cursor(cx: &mut TestAppContext) {
+        let shell = commits_shell(cx);
+        // The commit cursor moves two rows down...
+        for _ in 0..2 {
+            shell.update(cx, |shell, cx| shell.run_command("view.down", cx));
+        }
+        assert_eq!(column_commits(&shell, cx), search_commit(2).sha);
+
+        // ...a files list swaps in and its own cursor moves to its bottom...
+        let mut tree = Status::default();
+        tree.staged.push(gitten_core::status::StagedEntry {
+            path: "gone.txt".into(),
+            change: gitten_core::status::Change::Deleted,
+            old_path: None,
+            kind: gitten_core::status::Kind::File,
+            submodule: Default::default(),
+        });
+        tree.unstaged.push(gitten_core::status::UnstagedEntry {
+            path: "notes.md".into(),
+            change: gitten_core::status::Change::Modified,
+            kind: gitten_core::status::Kind::File,
+            submodule: Default::default(),
+        });
+        shell.update(cx, |shell, cx| {
+            let files = cx.new(|_| {
+                crate::views::files::Files::from_prepared(crate::views::files::prepare(
+                    tree,
+                    "r",
+                    Default::default(),
+                ))
+            });
+            shell.panes.register(
+                "files",
+                Screen::files(files, Generation::default(), "files"),
+            );
+        });
+        shell.update(cx, |shell, cx| shell.run_command("view.bottom", cx));
+
+        // ...and both survive every swap back. The views are never rebuilt —
+        // swapping is focusing.
+        shell.update(cx, |shell, cx| shell.run_command("commits.focus", cx));
+        assert_eq!(column_commits(&shell, cx), search_commit(2).sha);
+        shell.update(cx, |shell, cx| shell.run_command("files.focus", cx));
+        shell.read_with(cx, |shell, cx| match shell.active() {
+            Some(Screen::Files { view, .. }) => {
+                assert_eq!(
+                    view.read(cx).current_file().map(|f| f.path_text.as_ref()),
+                    Some("notes.md"),
+                    "the files cursor did not survive the swaps"
+                );
+            }
+            _ => panic!("the files list is not showing"),
+        });
+    }
+
+    /// The workspace composition state — Changes on launch per the
+    /// interaction contract, one center entity built on first entry;
+    /// `workspace.history` switches to the History destination in the same
+    /// workspace, `workspace.changes` switches back. The preview schedule
+    /// itself runs on the executor, so this asserts the composition
+    /// state — destination, one center entity — not the loaded rows.
+    #[gpui::test]
+    fn workspace_destinations_switch_inside_the_workspace(cx: &mut TestAppContext) {
+        let (shell, _, _) = files_shell(cx);
+        shell.update(cx, |shell, cx| {
+            assert_eq!(
+                shell.workspace.destination,
+                crate::views::workspace::Destination::Changes
+            );
+            shell.run_command("workspace.changes", cx);
+            assert!(
+                shell.workspace.center.is_some(),
+                "entering builds the center"
+            );
+            let first = shell.workspace.center.clone();
+            shell.run_command("workspace.changes", cx);
+            assert_eq!(
+                shell.workspace.center.clone().map(|c| c.entity_id()),
+                first.map(|c| c.entity_id()),
+                "re-entering rebuilds nothing"
+            );
+            shell.run_command("workspace.history", cx);
+            assert_eq!(
+                shell.workspace.destination,
+                crate::views::workspace::Destination::History,
+                "History is a destination in the workspace, not a lowering"
+            );
+            shell.run_command("workspace.changes", cx);
+            assert_eq!(
+                shell.workspace.destination,
+                crate::views::workspace::Destination::Changes
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn commands_follow_the_region_the_list_moves_lists_then_the_diff(cx: &mut TestAppContext) {
+        let shell = commits_shell(cx);
+        // The workspace owns key routing: entering builds the center, and
+        // History hands the keyboard to the commits timeline. `view.down`
+        // then moves the list through the ordinary pane path, and from the
+        // diff region through the workspace door onto the center — never
+        // the hidden main view, which keeps no keyboard names.
+        shell.update(cx, |shell, cx| shell.run_command("workspace.changes", cx));
+        install_center(&shell, ONE_HUNK, cx);
+        shell.update(cx, |shell, cx| shell.run_command("workspace.history", cx));
+        // From the timeline, `j` moves the commit list and touches nothing else.
+        shell.update(cx, |shell, cx| shell.run_command("view.down", cx));
+        assert_eq!(column_commits(&shell, cx), search_commit(1).sha);
+        shell.read_with(cx, |shell, cx| {
+            let center = shell
+                .workspace
+                .center
+                .clone()
+                .expect("center built on entry");
+            assert_eq!(center.read(cx).cursor(), 0);
+        });
+
+        // Enter hands the keyboard to the diff region...
+        shell.update(cx, |shell, cx| shell.run_command("commits.open-diff", cx));
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(shell.spot, super::Spot::Main);
+        });
+
+        // ...and now `j` scrolls the center, leaving the list where it was.
+        shell.update(cx, |shell, cx| shell.run_command("view.down", cx));
+        shell.read_with(cx, |shell, cx| {
+            let center = shell
+                .workspace
+                .center
+                .clone()
+                .expect("center built on entry");
+            assert_eq!(center.read(cx).cursor(), 1);
+        });
+        assert_eq!(column_commits(&shell, cx), search_commit(1).sha);
+    }
+
+    #[gpui::test]
+    fn a_fast_cursor_run_loads_only_the_commit_it_settles_on(cx: &mut TestAppContext) {
+        let (shell, repo) = history_shell(cx);
+        // Five rows of cursor movement before any timer fires: every row
+        // re-aims the request, and only the last aim survives its guard.
+        for _ in 0..5 {
+            shell.update(cx, |shell, cx| shell.run_command("view.down", cx));
+        }
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(shell.request.get(), 5, "each row re-aimed the request");
+            assert!(shell.loading.get(), "the settled load is in flight");
+        });
+        assert!(
+            repo.diffs_wrote().is_empty(),
+            "a load ran before the cursor settled"
+        );
+
+        // Settled: one acquisition runs, for the final row.
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, _| assert!(!shell.loading.get()));
+        assert_eq!(repo.diffs_wrote(), vec![search_commit(5).sha]);
+    }
+
+    #[gpui::test]
+    fn startup_names_and_loads_the_newest_commit(cx: &mut TestAppContext) {
+        let (shell, repo) = history_shell(cx);
+        // What main() runs before frame one: schedule through the same rails
+        // every later selection rides.
+        shell.update(cx, |shell, cx| shell.sync_main_diff(cx));
+        // Named before anything loaded — the header strip is true in frame one.
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(
+                shell.head.borrow().as_ref().map(|c| c.sha.clone()),
+                Some(search_commit(0).sha)
+            );
+            assert!(shell.loading.get());
+        });
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, _| {
+            assert!(!shell.loading.get(), "the startup load never came home");
+            assert_eq!(
+                shell.head.borrow().as_ref().map(|c| c.sha.clone()),
+                Some(search_commit(0).sha)
+            );
+        });
+        assert_eq!(repo.diffs_wrote(), vec![search_commit(0).sha]);
+    }
+
+    #[test]
+    fn the_wheel_follows_the_resolved_command_not_the_finger() {
+        // A flick away from the user is positive; what it *does* is whatever
+        // `[keys]` resolved to. The shipped binding signs it one way…
+        assert_eq!(
+            DevShell::smooth_pixels("view.scroll-up", 40.0, 1),
+            Some(40.0)
+        );
+        assert_eq!(
+            DevShell::smooth_pixels("view.scroll-down", 40.0, 1),
+            Some(-40.0)
+        );
+        // …and a rebound `wheelup = "view.scroll-down"` sends the very same
+        // flick the other way — the finger's own sign never leaks through.
+        assert_eq!(
+            DevShell::smooth_pixels("view.scroll-down", -40.0, 1),
+            Some(-40.0)
+        );
+    }
+
+    #[test]
+    fn the_scroll_setting_multiplies_and_other_commands_dispatch_by_name() {
+        // `[view] scroll` scales the finger's pixels…
+        assert_eq!(
+            DevShell::smooth_pixels("view.scroll-up", -12.5, 4),
+            Some(50.0)
+        );
+        // …and everything else — a page, an extension's command — keeps the
+        // event's pixels out of it and goes through named dispatch instead.
+        assert_eq!(DevShell::smooth_pixels("view.page-down", 30.0, 1), None);
+        assert_eq!(DevShell::smooth_pixels("blame.toggle", 30.0, 1), None);
+    }
+
+    // ---------------------------------------------------------- the file verbs
+
+    struct RecordingRepo {
+        calls: Arc<std::sync::Mutex<Vec<String>>>,
+        head: std::sync::Mutex<gitten_core::refs::HeadState>,
+        /// Where main sits against origin/main, moved by the sync verbs the
+        /// way a real remote moves it — fetch reveals behind, pull closes
+        /// the distance, push spends ahead. Interior-mutable so a test can
+        /// set the starting gap.
+        distance: std::sync::Mutex<(u32, u32)>,
+        /// Set when a verb has left the index conflicted — the state a
+        /// refused revert leaves behind, which only the next status read
+        /// reveals. Interior-mutable so a test arms it before the verb runs.
+        conflict: AtomicBool,
+        /// Paths status reports as known to no part of git. Interior-mutable
+        /// so a test arms exactly the files its diff fixture talks about —
+        /// the fact hunk verbs classify creations by.
+        untracked: std::sync::Mutex<Vec<String>>,
+        /// What `log` answers — the window of history a rewrite composes
+        /// over. Empty until a test serves it.
+        log_answer: std::sync::Mutex<Vec<Commit>>,
+        /// Which revspecs `pairs` was asked to diff, in order — the record a
+        /// main-view load test reads. Separate from [`Self::calls`] so
+        /// write assertions never see a read.
+        diffs: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingRepo {
+        fn new(calls: Arc<std::sync::Mutex<Vec<String>>>) -> Self {
+            Self {
+                calls,
+                head: std::sync::Mutex::new(gitten_core::refs::HeadState::Branch {
+                    name: gitten_core::refs::RefName::from("main"),
+                    commit: None,
+                }),
+                distance: std::sync::Mutex::new((0, 0)),
+                conflict: AtomicBool::new(false),
+                untracked: std::sync::Mutex::new(Vec::new()),
+                log_answer: std::sync::Mutex::new(Vec::new()),
+                diffs: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn wrote(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        /// The revspecs `pairs` was asked for — one entry per diff acquisition.
+        fn diffs_wrote(&self) -> Vec<String> {
+            self.diffs.lock().unwrap().clone()
+        }
+
+        /// Serves `log`'s answer — the same commits the pane shows, which is
+        /// what makes a composed plan checkable against what was asked for.
+        fn serve_log(&self, commits: Vec<Commit>) {
+            *self.log_answer.lock().unwrap() = commits;
+        }
+
+        /// Makes the next `revert` refuse the way git does on a conflict:
+        /// nonzero, its own words, and unmerged paths left for the status
+        /// read that follows to find.
+        fn arm_conflict(&self) {
+            self.conflict.store(true, Ordering::SeqCst);
+        }
+
+        /// Resolves it — the state `git add` leaves behind on a real
+        /// machine, which is what a continue needs to find.
+        fn clear_conflict(&self) {
+            self.conflict.store(false, Ordering::SeqCst);
+        }
+
+        /// Detaches HEAD, for the refusal half of the sync tests.
+        fn detach(&self) {
+            *self.head.lock().unwrap() = gitten_core::refs::HeadState::Detached {
+                commit: "0123456789abcdef".into(),
+            };
+        }
+
+        /// Names paths the next `status` read reports as untracked — the
+        /// fact a hunk verb classifies a creation by.
+        fn arm_untracked(&self, paths: &[&str]) {
+            *self.untracked.lock().unwrap() = paths.iter().map(|p| p.to_string()).collect();
+        }
+
+        /// The tracking pair the branches read reports for main.
+        fn counts(&self) -> (u32, u32) {
+            *self.distance.lock().unwrap()
+        }
+    }
+
+    /// One modelled local branch, for the fakes' ref pictures.
+    fn branch_ref(name: &str, head: bool) -> gitten_core::refs::Branch {
+        gitten_core::refs::Branch {
+            name: gitten_core::refs::RefName::from(name),
+            commit: "0123456789abcdef0123456789abcdef01234567".into(),
+            upstream: None,
+            head,
+        }
+    }
+
+    /// Serves every verb by writing down what was asked of it — the fake a
+    /// dispatch test needs, standing where the binary implementation stands in
+    /// a live window.
+    impl Repo for RecordingRepo {
+        fn log(&self, _: usize) -> gitten_git::Result<Vec<Commit>> {
+            Ok(self.log_answer.lock().unwrap().clone())
+        }
+
+        fn pairs(&self, revspec: &str) -> gitten_git::Result<Vec<Pair>> {
+            self.diffs.lock().unwrap().push(revspec.to_string());
+            Ok(Vec::new())
+        }
+
+        fn status(&self) -> gitten_git::Result<Status> {
+            // A standing tree rather than an empty answer: a real repository
+            // still has changes after a write, and the re-acquire a successful
+            // job schedules must find rows to put the keyboard back on.
+            let mut tree = Status::default();
+            // The refused revert's leftover: unmerged paths in the index,
+            // found by the re-read the failure schedules.
+            if self.conflict.load(Ordering::SeqCst) {
+                tree.conflicts.push(gitten_core::status::ConflictEntry {
+                    path: "poem.txt".into(),
+                    state: gitten_core::status::ConflictKind::BothModified,
+                    kind: gitten_core::status::Kind::File,
+                    submodule: Default::default(),
+                });
+            }
+            tree.staged.push(gitten_core::status::StagedEntry {
+                path: "gone.txt".into(),
+                change: gitten_core::status::Change::Deleted,
+                old_path: None,
+                kind: gitten_core::status::Kind::File,
+                submodule: Default::default(),
+            });
+            tree.unstaged.push(gitten_core::status::UnstagedEntry {
+                path: "notes.md".into(),
+                change: gitten_core::status::Change::Modified,
+                kind: gitten_core::status::Kind::File,
+                submodule: Default::default(),
+            });
+            for path in self.untracked.lock().unwrap().iter() {
+                tree.untracked.push(gitten_core::status::UntrackedEntry {
+                    path: path.as_str().into(),
+                });
+            }
+            Ok(tree)
+        }
+
+        fn describe(&self) -> String {
+            "recorded".into()
+        }
+
+        fn stage(&self, path: &[u8]) -> gitten_git::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("stage {}", String::from_utf8_lossy(path)));
+            Ok(())
+        }
+
+        fn unstage(&self, path: &[u8]) -> gitten_git::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("unstage {}", String::from_utf8_lossy(path)));
+            Ok(())
+        }
+
+        fn commit(&self, message: &str) -> gitten_git::Result<String> {
+            self.calls.lock().unwrap().push(format!("commit {message}"));
+            Ok("f00d".into())
+        }
+
+        fn reset(
+            &self,
+            mode: gitten_core::refs::ResetMode,
+            target: &[u8],
+        ) -> gitten_git::Result<()> {
+            self.calls.lock().unwrap().push(format!(
+                "reset {} {}",
+                mode.flag(),
+                String::from_utf8_lossy(target)
+            ));
+            Ok(())
+        }
+
+        fn revert(&self, commit: &[u8]) -> gitten_git::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("revert {}", String::from_utf8_lossy(commit)));
+            if self.conflict.load(Ordering::SeqCst) {
+                // git's own sentence for the case, close enough to be
+                // recognised: refused, and the question left in the tree.
+                return Err("error: could not revert 0000000...".into());
+            }
+            Ok(())
+        }
+
+        fn rebase_todo(
+            &self,
+            upstream: &[u8],
+            script: &gitten_git::TodoScript,
+        ) -> gitten_git::Result<()> {
+            // The plan travels in the record lossily — these shas are hex
+            // and the assertions read them; the real bytes are covered by
+            // the git crate's own tests.
+            self.calls.lock().unwrap().push(format!(
+                "rebase onto {} with plan {}",
+                String::from_utf8_lossy(upstream),
+                String::from_utf8_lossy(&script.emit())
+            ));
+            Ok(())
+        }
+
+        fn rebase_onto(&self, upstream: &[u8]) -> gitten_git::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("rebase onto {}", String::from_utf8_lossy(upstream)));
+            Ok(())
+        }
+
+        fn rebase_abort(&self) -> gitten_git::Result<()> {
+            self.calls.lock().unwrap().push("rebase abort".into());
+            Ok(())
+        }
+
+        fn rebase_continue(&self) -> gitten_git::Result<()> {
+            self.calls.lock().unwrap().push("rebase continue".into());
+            Ok(())
+        }
+
+        fn amend(&self, message: &str) -> gitten_git::Result<String> {
+            self.calls.lock().unwrap().push(format!("amend {message}"));
+            Ok("f00d".into())
+        }
+
+        fn discard(&self, path: &[u8]) -> gitten_git::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("discard {}", String::from_utf8_lossy(path)));
+            Ok(())
+        }
+
+        // The patch verbs: the bytes are the payload and no test reads them
+        // back here — recording the size says "it arrived whole" without a
+        // wall of patch text in the assertion.
+        fn stage_patch(&self, patch: &[u8]) -> gitten_git::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("stage-patch {} bytes", patch.len()));
+            Ok(())
+        }
+
+        fn unstage_patch(&self, patch: &[u8]) -> gitten_git::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("unstage-patch {} bytes", patch.len()));
+            Ok(())
+        }
+
+        fn discard_patch(&self, patch: &[u8]) -> gitten_git::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("discard-patch {} bytes", patch.len()));
+            Ok(())
+        }
+
+        fn remove_untracked(&self, path: &[u8]) -> gitten_git::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("delete {}", String::from_utf8_lossy(path)));
+            Ok(())
+        }
+
+        fn ignore(&self, path: &[u8]) -> gitten_git::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("ignore {}", String::from_utf8_lossy(path)));
+            Ok(())
+        }
+
+        fn stage_many(&self, paths: &[&[u8]]) -> gitten_git::Result<()> {
+            let shown = paths
+                .iter()
+                .map(|p| String::from_utf8_lossy(p).into_owned())
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("stage-many {shown}"));
+            Ok(())
+        }
+
+        fn unstage_many(&self, paths: &[&[u8]]) -> gitten_git::Result<()> {
+            let shown = paths
+                .iter()
+                .map(|p| String::from_utf8_lossy(p).into_owned())
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("unstage-many {shown}"));
+            Ok(())
+        }
+
+        fn stash_push(&self, message: Option<&str>) -> gitten_git::Result<usize> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("stash push {message:?}"));
+            Ok(0)
+        }
+
+        fn stash_apply(&self, index: usize) -> gitten_git::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("stash apply stash@{index}"));
+            Ok(())
+        }
+
+        fn stash_pop(&self, index: usize) -> gitten_git::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("stash pop stash@{index}"));
+            Ok(())
+        }
+
+        fn stash_drop(&self, index: usize) -> gitten_git::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("stash drop stash@{index}"));
+            Ok(())
+        }
+        fn checkout(&self, name: &[u8]) -> gitten_git::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("checkout {}", String::from_utf8_lossy(name)));
+            Ok(())
+        }
+
+        fn create_branch(&self, name: &[u8], _start: Option<&[u8]>) -> gitten_git::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("create {}", String::from_utf8_lossy(name)));
+            Ok(())
+        }
+
+        fn delete_branch(&self, name: &[u8], force: bool) -> gitten_git::Result<()> {
+            self.calls.lock().unwrap().push(format!(
+                "delete {}{}",
+                String::from_utf8_lossy(name),
+                if force { " -D" } else { "" }
+            ));
+            Ok(())
+        }
+
+        fn rename_branch(&self, from: &[u8], to: &[u8]) -> gitten_git::Result<()> {
+            self.calls.lock().unwrap().push(format!(
+                "rename {} {}",
+                String::from_utf8_lossy(from),
+                String::from_utf8_lossy(to)
+            ));
+            Ok(())
+        }
+
+        fn cherry_pick(&self, sha: &[u8]) -> gitten_git::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("cherry-pick {}", String::from_utf8_lossy(sha)));
+            if self.conflict.load(Ordering::SeqCst) {
+                // git's own sentence for a pick that cannot apply its
+                // change: refused, and the question left in the tree.
+                return Err("error: could not apply 0000000...".into());
+            }
+            Ok(())
+        }
+
+        fn cherry_pick_abort(&self) -> gitten_git::Result<()> {
+            self.calls.lock().unwrap().push("cherry-pick abort".into());
+            Ok(())
+        }
+
+        fn cherry_pick_continue(&self) -> gitten_git::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push("cherry-pick continue".into());
+            Ok(())
+        }
+
+        fn create_tag(
+            &self,
+            name: &[u8],
+            target: &[u8],
+            _message: Option<&str>,
+        ) -> gitten_git::Result<()> {
+            // Lossy on purpose, like every record here: these names are hex
+            // and text and the assertions read them; the byte discipline is
+            // the git crate's own tests to hold.
+            self.calls.lock().unwrap().push(format!(
+                "tag {} at {}",
+                String::from_utf8_lossy(name),
+                String::from_utf8_lossy(target)
+            ));
+            Ok(())
+        }
+
+        fn branches(&self) -> gitten_git::Result<Vec<gitten_core::refs::Branch>> {
+            let (ahead, behind) = *self.distance.lock().unwrap();
+            let mut main = branch_ref("main", true);
+            main.upstream = Some(gitten_core::refs::Upstream {
+                remote: gitten_core::refs::RefName::from("origin"),
+                branch: gitten_core::refs::RefName::from("main"),
+                ahead: Some(ahead),
+                behind: Some(behind),
+            });
+            Ok(vec![branch_ref("feature", false), main])
+        }
+
+        fn remote_branches(&self) -> gitten_git::Result<Vec<gitten_core::refs::RemoteBranch>> {
+            Ok(vec![gitten_core::refs::RemoteBranch {
+                remote: gitten_core::refs::RefName::from("origin"),
+                branch: gitten_core::refs::RefName::from("main"),
+                commit: "0123456789abcdef0123456789abcdef01234567".into(),
+            }])
+        }
+
+        fn head(&self) -> gitten_git::Result<gitten_core::refs::HeadState> {
+            Ok(self.head.lock().unwrap().clone())
+        }
+
+        fn remotes(&self) -> gitten_git::Result<Vec<gitten_core::refs::Remote>> {
+            Ok(vec![gitten_core::refs::Remote {
+                name: gitten_core::refs::RefName::from("origin"),
+                urls: vec!["https://example.invalid/x".into()],
+            }])
+        }
+
+        fn push(&self, remote: &[u8], branch: &[u8]) -> gitten_git::Result<()> {
+            self.calls.lock().unwrap().push(format!(
+                "push {} {}",
+                String::from_utf8_lossy(remote),
+                String::from_utf8_lossy(branch)
+            ));
+            *self.distance.lock().unwrap() = (0, 0);
+            Ok(())
+        }
+
+        fn pull(&self) -> gitten_git::Result<()> {
+            self.calls.lock().unwrap().push("pull".into());
+            *self.distance.lock().unwrap() = (0, 0);
+            Ok(())
+        }
+
+        fn fetch(&self, remote: Option<&[u8]>) -> gitten_git::Result<()> {
+            let named = match remote {
+                Some(remote) => String::from_utf8_lossy(remote).into_owned(),
+                None => "--all".into(),
+            };
+            self.calls.lock().unwrap().push(format!("fetch {named}"));
+            // A fetched stranger commit: the only honest first reading.
+            *self.distance.lock().unwrap() = (0, 1);
+            Ok(())
+        }
+    }
+
+    /// A shell with the two startup panes and a repository behind the files
+    /// pane, whose tree carries one staged change and one unstaged one.
+    /// Registration leaves the keyboard on the working tree. Returns the
+    /// recording repository and its handle, so a test can both assert what
+    /// was asked of it and aim writes of its own.
+    fn files_shell(
+        cx: &mut TestAppContext,
+    ) -> (
+        gpui::Entity<DevShell>,
+        Arc<RecordingRepo>,
+        gitten_git::Handle,
+    ) {
+        let mut tree = Status::default();
+        tree.staged.push(gitten_core::status::StagedEntry {
+            path: "gone.txt".into(),
+            change: gitten_core::status::Change::Deleted,
+            old_path: None,
+            kind: gitten_core::status::Kind::File,
+            submodule: Default::default(),
+        });
+        tree.unstaged.push(gitten_core::status::UnstagedEntry {
+            path: "notes.md".into(),
+            change: gitten_core::status::Change::Modified,
+            kind: gitten_core::status::Kind::File,
+            submodule: Default::default(),
+        });
+        tree_shell(cx, tree)
+    }
+
+    /// The same shell over any tree a test names — the untracked and
+    /// conflict rows the fixed fixture above does not carry.
+    fn tree_shell(
+        cx: &mut TestAppContext,
+        tree: Status,
+    ) -> (
+        gpui::Entity<DevShell>,
+        Arc<RecordingRepo>,
+        gitten_git::Handle,
+    ) {
+        let calls = Arc::default();
+        let repo = Arc::new(RecordingRepo::new(Arc::clone(&calls)));
+        let handle: gitten_git::Handle = repo.clone();
+        let shell = shell(None, cx);
+        shell.update(cx, |shell, cx| {
+            let host = Rc::new(Host::new());
+            let files = cx.new(|_| {
+                crate::views::files::Files::from_prepared(crate::views::files::prepare(
+                    tree,
+                    "r",
+                    Default::default(),
+                ))
+            });
+            files.update(cx, |f, _| {
+                f.run_view("view.bottom", &host); // onto the last row: a file
+            });
+            shell.panes.register(
+                "files",
+                Screen::files(files, Generation::default(), "files"),
+            );
+            shell.repo = Some((PathBuf::from("/recorded"), handle.clone()));
+            cx.set_global(config::Active(Rc::new(Host::new())));
+        });
+        (shell, repo, handle)
+    }
+
+    /// A shell over a two-entry stash stack, with the repository recording
+    /// behind it and the keyboard on the stash pane's newest row. The same
+    /// shape startup builds: root pane, then files, then the stack.
+    fn stashes_shell(cx: &mut TestAppContext) -> (gpui::Entity<DevShell>, Arc<RecordingRepo>) {
+        let stashes = vec![
+            gitten_core::refs::Stash {
+                index: 0,
+                commit: "c0ffee0".into(),
+                message: "On main: hand written".into(),
+            },
+            gitten_core::refs::Stash {
+                index: 1,
+                commit: "c0ffee1".into(),
+                message: "WIP on main: abc1234 seed".into(),
+            },
+        ];
+        let calls = Arc::default();
+        let repo = Arc::new(RecordingRepo {
+            calls: Arc::clone(&calls),
+            head: std::sync::Mutex::new(gitten_core::refs::HeadState::Branch {
+                name: "main".into(),
+                commit: Some("abc1234".into()),
+            }),
+            distance: std::sync::Mutex::new((0, 0)),
+            conflict: AtomicBool::new(false),
+            untracked: std::sync::Mutex::new(Vec::new()),
+            log_answer: std::sync::Mutex::new(Vec::new()),
+            diffs: std::sync::Mutex::new(Vec::new()),
+        });
+        let handle: gitten_git::Handle = repo.clone();
+        let shell = shell(None, cx);
+        shell.update(cx, |shell, cx| {
+            let host = Rc::new(Host::new());
+            let view = cx.new(|_| {
+                crate::views::stashes::Stashes::from_prepared(crate::views::stashes::prepare(
+                    &stashes, "r",
+                ))
+            });
+            view.update(cx, |s, _| {
+                s.run_view("view.top", &host);
+            });
+            let files = cx.new(|_| {
+                crate::views::files::Files::from_prepared(crate::views::files::prepare(
+                    Status::default(),
+                    "r",
+                    Default::default(),
+                ))
+            });
+            shell.panes.register(
+                "files",
+                Screen::files(files, Generation::default(), "r · 0 changed"),
+            );
+            shell.panes.register(
+                "stashes",
+                Screen::stashes(view, Generation::default(), "r · 2 parked"),
+            );
+            shell.repo = Some((PathBuf::from("/recorded"), handle));
+            cx.set_global(config::Active(Rc::new(Host::new())));
+        });
+        (shell, repo)
+    }
+
+    /// A shell over a working-tree diff pane: the keyboard on the first line
+    /// row of the first hunk, the repository recording behind it. `arg` is
+    /// the diff's revspec — empty for the working tree, a commit for the
+    /// refusal tests.
+    fn diff_shell(
+        cx: &mut TestAppContext,
+        arg: &'static str,
+    ) -> (gpui::Entity<DevShell>, Arc<RecordingRepo>) {
+        let raw = "\
+diff --git a/one.txt b/one.txt
+--- a/one.txt
++++ b/one.txt
+@@ -1,3 +1,3 @@
+ alpha
+-beta
++BETA
+ gamma
+";
+        let calls = Arc::default();
+        let repo = Arc::new(RecordingRepo::new(Arc::clone(&calls)));
+        let handle: gitten_git::Handle = repo.clone();
+        let shell = shell(None, cx);
+        shell.update(cx, |shell, cx| {
+            let host = Rc::new(Host::new());
+            let view = cx.new(|cx| {
+                crate::views::diff::Diff::new(
+                    gitten_core::parse_unified_diff(raw),
+                    host.clone(),
+                    cx,
+                )
+            });
+            // Off the file header and onto the hunk's first line — where
+            // space means "this hunk".
+            view.update(cx, |d, _| {
+                d.run_view("view.down", &host);
+            });
+            // The main region is where a diff lives now: installed there and
+            // handed the keyboard, exactly as a selection's enter would.
+            shell.main = Screen::diff(
+                view,
+                Some(Source::Repo {
+                    path: PathBuf::from("/recorded"),
+                    arg: arg.into(),
+                }),
+                Generation::default(),
+                "diff",
+            );
+            shell.set_spot(super::Spot::Main, cx);
+            shell.repo = Some((PathBuf::from("/recorded"), handle));
+            cx.set_global(config::Active(Rc::new(Host::new())));
+        });
+        (shell, repo)
+    }
+
+    /// A shell whose diff is an untracked file's whole-addition hunk.
+    ///
+    /// The fake's status names `fresh.txt` untracked — the fact the refusal
+    /// classifies by; a fixture whose status stayed silent would send the
+    /// patch to git instead, as a tracked file's hunk deserves.
+    fn creation_diff_shell(
+        cx: &mut TestAppContext,
+    ) -> (gpui::Entity<DevShell>, Arc<RecordingRepo>) {
+        let (shell, repo) = addition_diff_shell(
+            cx,
+            "\
+diff --git a/fresh.txt b/fresh.txt
+--- /dev/null
++++ b/fresh.txt
+@@ -0,0 +1,2 @@
++first
++second
+",
+        );
+        repo.arm_untracked(&["fresh.txt"]);
+        (shell, repo)
+    }
+
+    /// A shell whose diff is one whole-addition hunk — the shape an
+    /// untracked file's diff and a `[diff] context = 0` insertion share,
+    /// which is exactly why classification is not the numbers' job. Status
+    /// stays as the fake holds it: nothing here is untracked unless a test
+    /// arms it.
+    fn addition_diff_shell(
+        cx: &mut TestAppContext,
+        raw: &str,
+    ) -> (gpui::Entity<DevShell>, Arc<RecordingRepo>) {
+        let calls = Arc::default();
+        let repo = Arc::new(RecordingRepo::new(Arc::clone(&calls)));
+        let handle: gitten_git::Handle = repo.clone();
+        let shell = shell(None, cx);
+        shell.update(cx, |shell, cx| {
+            let host = Rc::new(Host::new());
+            let view = cx.new(|cx| {
+                crate::views::diff::Diff::new(
+                    gitten_core::parse_unified_diff(raw),
+                    host.clone(),
+                    cx,
+                )
+            });
+            view.update(cx, |d, _| {
+                d.run_view("view.down", &host);
+            });
+            shell.main = Screen::diff(
+                view,
+                Some(Source::Repo {
+                    path: PathBuf::from("/recorded"),
+                    arg: String::new(),
+                }),
+                Generation::default(),
+                "diff",
+            );
+            shell.set_spot(super::Spot::Main, cx);
+            shell.repo = Some((PathBuf::from("/recorded"), handle));
+            cx.set_global(config::Active(Rc::new(Host::new())));
+        });
+        (shell, repo)
+    }
+
+    /// Puts a caller-visible runner pair into the shell, so a test submits
+    /// into the very queue [`DevShell::drain_jobs`] drains.
+    fn wire_runner(shell: &gpui::Entity<DevShell>, cx: &mut TestAppContext) -> Submitter {
+        let jobs = Runner::new();
+        let submitter = jobs.submitter();
+        shell.update(cx, |shell, _| {
+            shell.jobs = jobs;
+            shell.submitter = submitter.clone();
+        });
+        submitter
+    }
+
+    /// Drives the production pump — [`DevShell::drain_jobs`], the same call
+    /// the live window makes from its timer — until `done` says an event has
+    /// landed. No test-local event reading; what a window does, this does.
+    #[track_caller]
+    fn pump_until(
+        shell: &gpui::Entity<DevShell>,
+        cx: &mut TestAppContext,
+        done: impl Fn(&DevShell) -> bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            shell.update(cx, |shell, cx| shell.drain_jobs(cx));
+            if shell.read_with(cx, |shell, _| done(shell)) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the pump never saw the event land"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    /// Waits through the pump for one successful write, then lets the refresh
+    /// it scheduled apply — the whole production path from queue to screen.
+    #[track_caller]
+    fn pump_write(shell: &gpui::Entity<DevShell>, cx: &mut TestAppContext) {
+        let before = shell.read_with(cx, |shell, _| shell.generation);
+        pump_until(shell, cx, |shell| shell.generation > before);
+        cx.run_until_parked();
+    }
+
+    struct Fails;
+
+    impl Job for Fails {
+        fn name(&self) -> &str {
+            "fails"
+        }
+
+        fn run(self: Box<Self>) -> Result<(), String> {
+            Err("git commit: hook declined".into())
+        }
+    }
+
+    #[gpui::test]
+    fn space_acts_on_the_row_by_the_side_it_sits_on(cx: &mut TestAppContext) {
+        let (shell, repo, _handle) = files_shell(cx);
+        // The cursor starts on the last row: notes.md, under *unstaged*.
+        shell.update(cx, |shell, cx| shell.run_command("files.stage", cx));
+        pump_write(&shell, cx);
+        assert_eq!(repo.wrote(), vec!["stage notes.md"]);
+        // The refresh rails ran: the pane re-acquired against the (empty)
+        // post-write tree, which is what makes the file visibly move.
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.generation.get() > 0);
+        });
+
+        // Back to the top — which is gone.txt under *staged*, the heading
+        // above it being furniture the cursor skips: same key, other
+        // direction.
+        shell.update(cx, |shell, cx| {
+            let Some(Screen::Files { view, .. }) = shell.active() else {
+                panic!("files pane lost");
+            };
+            let host = Rc::new(Host::new());
+            view.update(cx, |f, _| {
+                f.run_view("view.top", &host);
+            });
+        });
+        shell.update(cx, |shell, cx| shell.run_command("files.stage", cx));
+        pump_write(&shell, cx);
+        assert_eq!(repo.wrote(), vec!["stage notes.md", "unstage gone.txt"]);
+    }
+
+    // ------------------------------------------------------- the stash verbs
+
+    #[gpui::test]
+    fn space_applies_the_stash_row_through_the_pump(cx: &mut TestAppContext) {
+        let (shell, repo) = stashes_shell(cx);
+        // The keyboard starts on stash@{0}, the newest entry.
+        shell.update(cx, |shell, cx| shell.run_command("stashes.apply", cx));
+        pump_write(&shell, cx);
+        assert_eq!(repo.wrote(), vec!["stash apply stash@0"]);
+        // And the generation rails ran, as they do after every write.
+        shell.read_with(cx, |shell, _| assert!(shell.generation.get() > 0));
+    }
+
+    #[gpui::test]
+    fn pop_runs_without_asking_and_names_its_own_index(cx: &mut TestAppContext) {
+        let (shell, repo) = stashes_shell(cx);
+        shell.update(cx, |shell, cx| {
+            let Some(Screen::Stashes { view, .. }) = shell.active() else {
+                panic!("stashes pane lost");
+            };
+            let host = Rc::new(Host::new());
+            view.update(cx, |v, _| {
+                v.run_view("view.bottom", &host); // onto stash@{1}
+            });
+        });
+        shell.update(cx, |shell, cx| shell.run_command("stashes.pop", cx));
+        pump_write(&shell, cx);
+        assert_eq!(
+            repo.wrote(),
+            vec!["stash pop stash@1"],
+            "the index travels, whatever row it came from"
+        );
+    }
+
+    #[gpui::test]
+    fn a_drop_arms_then_confirms_on_the_second_press_of_the_same_row(cx: &mut TestAppContext) {
+        let (shell, repo) = stashes_shell(cx);
+        // History focuses the commits pane, so hand the keyboard back to
+        // the stashes pane this test is about. The workspace stays up:
+        // the preview schedule early-outs outside Changes, and the
+        // arm/confirm behavior under test never depended on the stack.
+        shell.update(cx, |shell, cx| {
+            shell.run_command("workspace.history", cx);
+            shell.focus_named("stashes", cx);
+        });
+
+        // First press: asked, in the band; nothing written.
+        shell.update(cx, |shell, cx| shell.run_command("stashes.drop", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(repo.wrote().is_empty());
+            assert!(
+                shell
+                    .notice
+                    .as_ref()
+                    .map(Notice::text)
+                    .unwrap_or_default()
+                    .contains("drop stash@{0}? press again"),
+                "{:?}",
+                shell.notice
+            );
+        });
+
+        // Second press on the same row: spent, written, question cleared.
+        shell.update(cx, |shell, cx| shell.run_command("stashes.drop", cx));
+        pump_write(&shell, cx);
+        assert_eq!(repo.wrote(), vec!["stash drop stash@0"]);
+        shell.read_with(cx, |shell, _| assert!(shell.notice.is_none()));
+    }
+
+    #[gpui::test]
+    fn a_cursor_move_disarms_an_armed_stash_drop(cx: &mut TestAppContext) {
+        let (shell, repo) = stashes_shell(cx);
+        shell.update(cx, |shell, cx| {
+            let Some(Screen::Stashes { view, .. }) = shell.active() else {
+                panic!("stashes pane lost");
+            };
+            let host = Rc::new(Host::new());
+            view.update(cx, |v, _| {
+                v.run_view("view.bottom", &host); // arm target: stash@{1}
+            });
+        });
+        shell.update(cx, |shell, cx| shell.run_command("stashes.drop", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(
+                shell
+                    .notice
+                    .as_ref()
+                    .map(Notice::text)
+                    .unwrap_or_default()
+                    .contains("drop stash@{1}?"),
+                "{:?}",
+                shell.notice
+            );
+        });
+
+        // One step up: the keyboard left the question's row, so the next
+        // press asks about the row it lands on instead of executing.
+        shell.update(cx, |shell, cx| {
+            let Some(Screen::Stashes { view, .. }) = shell.active() else {
+                panic!("stashes pane lost");
+            };
+            let host = Rc::new(Host::new());
+            view.update(cx, |v, _| {
+                v.run_view("view.up", &host);
+            });
+        });
+        shell.update(cx, |shell, cx| shell.run_command("stashes.drop", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(repo.wrote().is_empty(), "nothing was dropped");
+            assert!(
+                shell
+                    .notice
+                    .as_ref()
+                    .map(Notice::text)
+                    .unwrap_or_default()
+                    .contains("drop stash@{0}?"),
+                "the question followed the keyboard: {:?}",
+                shell.notice
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn the_stash_verbs_say_so_outside_the_stash_pane(cx: &mut TestAppContext) {
+        let (shell, repo, _handle) = files_shell(cx);
+        shell.update(cx, |shell, cx| shell.run_command("stashes.apply", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(repo.wrote().is_empty());
+            assert!(
+                shell
+                    .notice
+                    .as_ref()
+                    .map(Notice::text)
+                    .unwrap_or_default()
+                    .contains("not supported here"),
+                "{:?}",
+                shell.notice
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn files_stash_parks_the_tree_and_the_refresh_rails_run(cx: &mut TestAppContext) {
+        let (shell, repo, _handle) = files_shell(cx);
+        shell.update(cx, |shell, cx| shell.run_command("files.stash", cx));
+        // The whole production path: job queued, drained by the same pump the
+        // window runs, generation bumped, every repository pane re-acquired.
+        pump_write(&shell, cx);
+        assert_eq!(repo.wrote(), vec!["stash push None"]);
+        shell.read_with(cx, |shell, _| assert!(shell.generation.get() > 0));
+
+        // Over a fixture there is nothing to park, and the key says so.
+        shell.update(cx, |shell, _| shell.repo = None);
+        shell.update(cx, |shell, cx| shell.run_command("files.stash", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(
+                shell
+                    .notice
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("no working tree to park"),
+                "{:?}",
+                shell.notice
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn stashes_focus_reaches_the_registered_pane_and_says_so_when_there_is_none(
+        cx: &mut TestAppContext,
+    ) {
+        let bare = shell(None, cx);
+        let (shell, _repo) = stashes_shell(cx);
+        // Registration left the keyboard on the stack; named dispatch gets
+        // back there from anywhere.
+        shell.update(cx, |shell, _cx| {
+            shell.panes.focus(0);
+        });
+        shell.update(cx, |shell, cx| shell.run_command("stashes.focus", cx));
+        shell.read_with(cx, |shell, app| {
+            assert_eq!(shell.panes.focused_name(), "stashes");
+            assert_eq!(shell.active_label(app).as_ref(), "r · 2 parked");
+        });
+
+        // And with no such resident — a fixture has no stash stack — the
+        // command is answered with a sentence, not silence.
+        bare.update(cx, |shell, cx| shell.run_command("stashes.focus", cx));
+        bare.read_with(cx, |shell, _| {
+            assert!(shell.notice.is_some(), "a missing pane went unsaid");
+        });
+    }
+
+    #[gpui::test]
+    fn commit_opens_the_field_and_the_accepted_text_becomes_the_job(cx: &mut TestAppContext) {
+        let (shell, repo, _handle) = files_shell(cx);
+
+        shell.update(cx, |shell, cx| shell.run_command("files.commit", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.input.is_some(), "no field opened");
+        });
+
+        // Typed text, as the platform would have left it; the rest of this
+        // test drives the real accept path.
+        shell.update(cx, |shell, cx| {
+            let text = "fix: the \"thing\"\n\nand a body";
+            let field = cx.new(|cx| input::Input::new("commit", "commit message", text, cx));
+            shell.open_input(field, cx);
+            shell.prompt = Some(super::Prompt::CommitMessage);
+        });
+        shell.update(cx, |shell, cx| shell.run_command("input.accept", cx));
+
+        pump_write(&shell, cx);
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.input.is_none(), "the field stayed open");
+        });
+        assert_eq!(
+            repo.wrote(),
+            vec![format!("commit fix: the \"thing\"\n\nand a body")],
+            "the message arrived byte-for-byte"
+        );
+    }
+
+    #[gpui::test]
+    fn an_empty_commit_refuses_at_accept_without_submitting_anything(cx: &mut TestAppContext) {
+        let (shell, repo, _handle) = files_shell(cx);
+        shell.update(cx, |shell, cx| shell.run_command("files.commit", cx));
+        // The field opens empty and is accepted empty — the shape of hitting
+        // enter on an untouched prompt.
+        shell.update(cx, |shell, cx| shell.run_command("input.accept", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.input.is_none());
+            assert!(
+                shell
+                    .notice
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("message"),
+                "the refusal went unsaid: {:?}",
+                shell.notice
+            );
+        });
+        // Nothing ever reached the queue, however long the worker waits.
+        std::thread::sleep(Duration::from_millis(100));
+        shell.read_with(cx, |shell, _| {
+            if let Some(event) = shell.jobs.try_next() {
+                panic!("a refused commit still submitted: {event:?}");
+            }
+        });
+        assert!(repo.wrote().is_empty());
+    }
+
+    #[gpui::test]
+    fn a_failed_write_lands_on_the_error_band_and_still_reacquires(cx: &mut TestAppContext) {
+        let (shell, _repo, _handle) = files_shell(cx);
+        let submit = wire_runner(&shell, cx);
+        assert!(submit.submit(Box::new(Fails)).is_ok());
+
+        // The production pump, not a test-local read of the queue — through
+        // the failure *and* the re-acquire wave it schedules, which is the
+        // point: a refused write may have left work behind.
+        pump_until(&shell, cx, |shell| shell.error.is_some());
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(
+                shell.error.as_deref(),
+                // The summary, not the record: git's argv is stripped, git's
+                // words are not.
+                Some("hook declined"),
+                "the repository's own words reached the band"
+            );
+            assert!(shell.running.is_none(), "the job still reads as running");
+            assert!(
+                shell.generation > Generation::default(),
+                "a refusal left the panes believing they are current"
+            );
+            assert_eq!(shell.refresh_pending, 0, "the wave never came home");
+        });
+    }
+
+    struct CommitJob {
+        fail: bool,
+    }
+
+    impl Job for CommitJob {
+        fn name(&self) -> &str {
+            "commit"
+        }
+
+        fn run(self: Box<Self>) -> Result<(), String> {
+            match self.fail {
+                true => Err("git commit: hook declined".into()),
+                false => Ok(()),
+            }
+        }
+    }
+
+    /// The inspector's draft against the commit finish line: a refused
+    /// commit keeps its words standing beside git's verbatim error (and
+    /// drops the dialog); a clean finish spends exactly that
+    /// repository's draft. The production pump both times — submit,
+    /// drain, and the re-acquire wave — never a test-local event read.
+    #[gpui::test]
+    fn a_refused_commit_keeps_its_draft_and_a_clean_one_spends_it(cx: &mut TestAppContext) {
+        let (shell, _repo, _handle) = files_shell(cx);
+        let submit = wire_runner(&shell, cx);
+        let key = shell.read_with(cx, |shell, _| shell.draft_key().expect("a recorded repo"));
+        let draft = || super::CommitDraft {
+            summary: "keep the gutter still".into(),
+            description: String::new(),
+        };
+
+        // Refused: the words survive, the dialog does not, the error is
+        // git's own.
+        shell.update(cx, |shell, _| {
+            shell.drafts.insert(key.clone(), draft());
+            shell.pending_commit_key = Some(key.clone());
+            shell.commit_confirm = true;
+        });
+        assert!(submit.submit(Box::new(CommitJob { fail: true })).is_ok());
+        pump_until(&shell, cx, |shell| shell.error.is_some());
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, _| {
+            assert!(
+                shell
+                    .drafts
+                    .get(&key)
+                    .is_some_and(super::CommitDraft::has_message),
+                "the refused commit spent its draft"
+            );
+            assert!(
+                !shell.commit_confirm,
+                "the dialog stood over a finished job"
+            );
+            assert_eq!(
+                shell.error.as_deref(),
+                Some("hook declined"),
+                "the band paraphrased the hook"
+            );
+        });
+
+        // Clean: exactly this repository's draft is spent.
+        shell.update(cx, |shell, _| {
+            shell.error = None;
+            shell.pending_commit_key = Some(key.clone());
+        });
+        assert!(submit.submit(Box::new(CommitJob { fail: false })).is_ok());
+        pump_until(&shell, cx, |shell| shell.pending_commit_key.is_none());
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, _| {
+            assert!(
+                !shell.drafts.contains_key(&key),
+                "the clean commit kept its draft"
+            );
+        });
+    }
+
+    /// An error keeps its record whole and reads as its first line: git's
+    /// argv is the prefix the band strips, and git's words are what survives.
+    #[test]
+    fn an_error_arrives_whole_and_reads_as_its_first_line() {
+        let e = GitError::new("git push origin main: error: failed to push some refs\nhint: …");
+        assert_eq!(
+            e.full, "git push origin main: error: failed to push some refs\nhint: …",
+            "the record is kept verbatim"
+        );
+        assert_eq!(
+            e.summary, "error: failed to push some refs",
+            "the first non-empty line of git's own words"
+        );
+
+        let bare = GitError::new("fatal: not a git repository");
+        assert_eq!(bare.summary, "fatal: not a git repository");
+    }
+
+    /// `esc` peels the message overlay first, the error second, and only then
+    /// falls through to the ladder the key was already on.
+    #[gpui::test]
+    async fn esc_peels_the_overlay_then_the_error_then_the_ladder(cx: &mut TestAppContext) {
+        let shell = shell(None, cx);
+        shell.update(cx, |shell, _| {
+            shell.error = Some(GitError::new("git commit: hook declined"));
+            shell.show_message = true;
+        });
+
+        // First `esc`: the overlay closes, the error stands.
+        shell.update(cx, |shell, cx| shell.back(cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(!shell.show_message, "the overlay closed");
+            assert!(shell.error.is_some(), "the error outlives its overlay");
+        });
+
+        // Second: the error itself is gone.
+        shell.update(cx, |shell, cx| shell.back(cx));
+        shell.read_with(cx, |shell, _| assert!(shell.error.is_none()));
+    }
+
+    #[gpui::test]
+    fn a_successful_job_bumps_the_generation_and_reacquires_through_the_pump(
+        cx: &mut TestAppContext,
+    ) {
+        let (shell, repo, handle) = files_shell(cx);
+        let submit = wire_runner(&shell, cx);
+        assert!(submit
+            .submit(Box::new(gitten_app::verbs::Write::stage(
+                &handle,
+                b"notes.md".to_vec()
+            )))
+            .is_ok());
+
+        let before = shell.read_with(cx, |shell, _| shell.generation);
+        pump_write(&shell, cx);
+        assert_eq!(
+            repo.wrote(),
+            vec!["stage notes.md"],
+            "the write ran off-thread against the real handle"
+        );
+        shell.read_with(cx, |shell, _cx| {
+            assert!(shell.generation > before, "the bump never happened");
+            assert!(shell.error.is_none());
+            // Re-acquisition applied: every pane's generation caught up with
+            // the shell's, through refresh_stale and no test help.
+            for screen in shell.panes.iter() {
+                match screen {
+                    Screen::Files { generation, .. } => {
+                        assert_eq!(generation.get(), shell.generation);
+                    }
+                    // A branches pane carries no source of its own — it is
+                    // always about this window's repository, like files.
+                    Screen::Branches { generation, .. } => {
+                        assert_eq!(generation.get(), shell.generation);
+                    }
+                    Screen::Commits { source, .. } => {
+                        assert!(matches!(source, Source::Fixtures), "a fixture stays put")
+                    }
+                    other => panic!(
+                        "unexpected pane kind: {}",
+                        match other {
+                            Screen::Custom(_) => "custom",
+                            Screen::Diff { .. } => "diff",
+                            Screen::Stashes { .. } => "stashes",
+                            Screen::Commits { .. }
+                            | Screen::Files { .. }
+                            | Screen::Branches { .. } => {
+                                unreachable!()
+                            }
+                        }
+                    ),
+                }
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn an_extension_pane_stages_through_the_same_writes_a_builtin_gets(cx: &mut TestAppContext) {
+        // Rule 1, exercised rather than asserted: a pane that shipped with no
+        // verb of its own runs a stage-equivalent from inside its `run`, off
+        // the rails dispatch hands it, and the result is indistinguishable —
+        // queued, run, generation bumped, pane re-acquired.
+        let (shell, repo, _handle) = files_shell(cx);
+        let ran = Rc::new(Cell::new(false));
+        let refreshed = Rc::new(Cell::new(Generation::default()));
+        shell.update(cx, |shell, cx| {
+            shell.register_pane(
+                "extension",
+                ExtensionPane {
+                    ran: ran.clone(),
+                    generation: refreshed.clone(),
+                },
+                cx,
+            );
+        });
+
+        shell.update(cx, |shell, cx| shell.run_command("extension.stage", cx));
+        assert!(ran.get(), "the extension could not reach the rails");
+        pump_write(&shell, cx);
+        assert_eq!(repo.wrote(), vec!["stage notes.md"]);
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.generation.get() > 0);
+        });
+        // And the write's generation reached the extension pane's own refresh,
+        // exactly as it reached every built-in pane's.
+        let target = shell.read_with(cx, |shell, _| shell.generation);
+        assert_eq!(refreshed.get(), target);
+    }
+
+    #[gpui::test]
+    fn the_file_verbs_say_so_where_they_cannot_act(cx: &mut TestAppContext) {
+        // No repository at all (a fixture), commits pane focused.
+        let shell = shell(None, cx);
+        shell.update(cx, |shell, cx| shell.run_command("files.stage", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(shell
+                .notice
+                .as_deref()
+                .unwrap_or_default()
+                .contains("not supported here"));
+        });
+        shell.update(cx, |shell, cx| {
+            shell.notice = None;
+            shell.run_command("files.commit", cx);
+        });
+        shell.read_with(cx, |shell, _| {
+            assert!(shell
+                .notice
+                .as_deref()
+                .unwrap_or_default()
+                .contains("not supported here"));
+        });
+
+        // A files pane over a fixture: the pane is right, the repository is
+        // still missing. The tree carries one untracked file so there is a
+        // row to act on — the missing repository is what this wants to hear
+        // about, not an empty tree.
+        shell.update(cx, |shell, cx| {
+            let mut tree = Status::default();
+            tree.untracked.push(gitten_core::status::UntrackedEntry {
+                path: "loose.txt".into(),
+            });
+            let host = Rc::new(Host::new());
+            let files = cx.new(|_| {
+                crate::views::files::Files::from_prepared(crate::views::files::prepare(
+                    tree,
+                    "",
+                    Default::default(),
+                ))
+            });
+            files.update(cx, |f, _| {
+                f.run_view("view.bottom", &host); // onto loose.txt
+            });
+            shell.panes.register(
+                "files",
+                Screen::files(files, Generation::default(), "files"),
+            );
+        });
+        shell.update(cx, |shell, cx| shell.run_command("files.stage", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(
+                shell
+                    .notice
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("fixture"),
+                "{:?}",
+                shell.notice
+            );
+        });
+
+        // And a clean tree: nothing under the keyboard to act on. The only
+        // way to have nothing there — the cursor never rests on a heading.
+        let (shell, repo, _handle) = tree_shell(cx, Status::default());
+        shell.update(cx, |shell, cx| shell.run_command("files.stage", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(
+                shell
+                    .notice
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("nothing selected"),
+                "{:?}",
+                shell.notice
+            );
+        });
+        assert!(repo.wrote().is_empty());
+    }
+
+    #[gpui::test]
+    fn discard_asks_on_the_first_press_and_acts_on_the_second(cx: &mut TestAppContext) {
+        let (shell, repo, _handle) = files_shell(cx);
+        // The keyboard starts on notes.md under *unstaged*: the question is
+        // "discard", and it is asked once in the band.
+        shell.update(cx, |shell, cx| shell.run_command("files.discard", cx));
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(
+                shell.notice.as_ref().map(Notice::text),
+                Some("discard notes.md? press again to confirm"),
+                "{:?}",
+                shell.notice
+            );
+        });
+        // Nothing was queued for a first press, however long the worker waits.
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(repo.wrote().is_empty());
+
+        // The second press on the same row spends the arm and rides the rails:
+        // job off-thread, generation bump, re-acquire — everything stage rides.
+        shell.update(cx, |shell, cx| shell.run_command("files.discard", cx));
+        pump_write(&shell, cx);
+        assert_eq!(repo.wrote(), vec!["discard notes.md"]);
+    }
+
+    #[gpui::test]
+    fn standing_questions_carry_clickable_answers(cx: &mut TestAppContext) {
+        // The band button must name the armed command: clicking is running
+        // it through the same dispatch the palette uses.
+        let (shell, _repo, _handle) = files_shell(cx);
+        shell.update(cx, |shell, cx| shell.run_command("files.discard", cx));
+        let answers = shell.read_with(cx, |shell, _| match &shell.notice {
+            Some(Notice::Question { answers, .. }) => answers.clone(),
+            other => panic!("no standing question: {other:?}"),
+        });
+        assert_eq!(
+            answers
+                .iter()
+                .map(|answer| (answer.label, answer.command))
+                .collect::<Vec<_>>(),
+            [("Discard", "files.discard")],
+        );
+
+        // The reset menu arms three strengths, each its own command.
+        let (history, _repo) = history_shell(cx);
+        history.update(cx, |shell, cx| shell.run_command("commits.reset-menu", cx));
+        let answers = history.read_with(cx, |shell, _| match &shell.notice {
+            Some(Notice::Question { answers, .. }) => answers.clone(),
+            other => panic!("no standing question: {other:?}"),
+        });
+        assert_eq!(
+            answers
+                .iter()
+                .map(|answer| (answer.label, answer.command))
+                .collect::<Vec<_>>(),
+            [
+                ("Soft", "commits.reset-soft"),
+                ("Mixed", "commits.reset-mixed"),
+                ("Hard", "commits.reset-hard"),
+            ],
+        );
+    }
+
+    #[gpui::test]
+    fn back_dismisses_a_standing_question(cx: &mut TestAppContext) {
+        // Cancel is back is Esc: the sentence leaves, nothing runs. The
+        // arm lapses with the row, so answering again re-arms honestly.
+        let (shell, repo, _handle) = files_shell(cx);
+        shell.update(cx, |shell, cx| shell.run_command("files.discard", cx));
+        shell.update(cx, |shell, cx| shell.run_command("back", cx));
+        shell.read_with(cx, |shell, _| assert!(shell.notice.is_none()));
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(repo.wrote().is_empty());
+    }
+
+    #[gpui::test]
+    fn an_untracked_discard_says_delete_because_that_is_what_it_does(cx: &mut TestAppContext) {
+        let mut tree = Status::default();
+        tree.staged.push(gitten_core::status::StagedEntry {
+            path: "gone.txt".into(),
+            change: gitten_core::status::Change::Deleted,
+            old_path: None,
+            kind: gitten_core::status::Kind::File,
+            submodule: Default::default(),
+        });
+        tree.untracked.push(gitten_core::status::UntrackedEntry {
+            path: "loose.txt".into(),
+        });
+        let (shell, repo, _handle) = tree_shell(cx, tree);
+        // The keyboard is on loose.txt, which no earlier version exists for.
+        shell.update(cx, |shell, cx| shell.run_command("files.discard", cx));
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(
+                shell.notice.as_ref().map(Notice::text),
+                Some("delete loose.txt? press again to confirm"),
+                "{:?}",
+                shell.notice
+            );
+        });
+
+        shell.update(cx, |shell, cx| shell.run_command("files.discard", cx));
+        pump_write(&shell, cx);
+        assert_eq!(
+            repo.wrote(),
+            vec!["delete loose.txt"],
+            "the untracked mechanics ran, not a checkout"
+        );
+    }
+
+    #[gpui::test]
+    fn moving_the_keyboard_disarms_and_a_staged_row_refuses_aloud(cx: &mut TestAppContext) {
+        let (shell, repo, _handle) = files_shell(cx);
+
+        // Arm on the unstaged row...
+        shell.update(cx, |shell, cx| shell.run_command("files.discard", cx));
+        // ...then move onto the staged twin section's file. The move itself
+        // disarmed; what lands here is a refusal, not an execution.
+        shell.update(cx, |shell, cx| {
+            let Some(Screen::Files { view, .. }) = shell.active() else {
+                panic!("files pane lost");
+            };
+            view.update(cx, |f, _| {
+                f.run_view("view.top", &Rc::new(Host::new())); // gone.txt, staged
+            });
+        });
+        shell.update(cx, |shell, cx| shell.run_command("files.discard", cx));
+        shell.read_with(cx, |shell, _| {
+            let notice = shell.notice.as_ref().map(Notice::text).unwrap_or_default();
+            assert!(
+                notice.contains("staged") && notice.contains("unstage"),
+                "the staged row said why it refused: {notice:?}"
+            );
+        });
+        assert!(repo.wrote().is_empty(), "a refusal queued nothing");
+
+        // Back on the unstaged row, the dance runs from the top: ask, then act.
+        shell.update(cx, |shell, cx| {
+            let Some(Screen::Files { view, .. }) = shell.active() else {
+                panic!("files pane lost");
+            };
+            view.update(cx, |f, _| {
+                f.run_view("view.bottom", &Rc::new(Host::new())); // notes.md
+            });
+        });
+        shell.update(cx, |shell, cx| shell.run_command("files.discard", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(shell
+                .notice
+                .as_deref()
+                .unwrap_or_default()
+                .contains("press again"));
+        });
+        shell.update(cx, |shell, cx| shell.run_command("files.discard", cx));
+        pump_write(&shell, cx);
+        assert_eq!(repo.wrote(), vec!["discard notes.md"]);
+    }
+
+    #[gpui::test]
+    fn stage_all_takes_every_row_by_the_side_the_keyboard_sits_in(cx: &mut TestAppContext) {
+        let (shell, repo, _handle) = files_shell(cx);
+
+        // Keyboard on the unstaged row: stage everything that side holds,
+        // unstaged and untracked together, as one job.
+        shell.update(cx, |shell, cx| shell.run_command("files.stage-all", cx));
+        pump_write(&shell, cx);
+        assert_eq!(repo.wrote(), vec!["stage-many notes.md"]);
+
+        // Onto the staged section and the same key unstages the other side.
+        shell.update(cx, |shell, cx| {
+            let Some(Screen::Files { view, .. }) = shell.active() else {
+                panic!("files pane lost");
+            };
+            view.update(cx, |f, _| {
+                f.run_view("view.top", &Rc::new(Host::new())); // gone.txt
+            });
+        });
+        shell.update(cx, |shell, cx| shell.run_command("files.stage-all", cx));
+        pump_write(&shell, cx);
+        assert_eq!(
+            repo.wrote(),
+            vec!["stage-many notes.md", "unstage-many gone.txt"],
+            "the cursor's side decided both directions"
+        );
+    }
+
+    // ---------------------------------------------------------- the hunk verbs
+
+    #[gpui::test]
+    fn space_stages_the_hunk_under_the_keyboard(cx: &mut TestAppContext) {
+        let (shell, repo) = diff_shell(cx, "");
+        wire_runner(&shell, cx);
+
+        // Space: the hunk under the keyboard goes to the index as one job,
+        // named for the patch's size because there is no path to name.
+        shell.update(cx, |shell, cx| shell.run_command("diff.stage-hunk", cx));
+        pump_write(&shell, cx);
+        let wrote = repo.wrote();
+        assert_eq!(wrote.len(), 1, "{wrote:?}");
+        assert!(
+            wrote[0].starts_with("stage-patch ") && wrote[0].ends_with(" bytes"),
+            "{wrote:?}"
+        );
+        // One write, one finish: the band is clear and the count moved.
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(shell.generation.get(), 1);
+            assert_eq!(shell.running, None);
+            assert_eq!(shell.error, None);
+        });
+    }
+
+    #[gpui::test]
+    fn u_unstages_the_hunk_back_out_of_the_index(cx: &mut TestAppContext) {
+        // A fresh pane rather than the staged one above: a successful write
+        // re-acquires every repository pane, and the fake behind this shell
+        // answers that read with an empty tree — after which there is no
+        // hunk under the keyboard, exactly as on a cleaned-up working tree.
+        let (shell, repo) = diff_shell(cx, "");
+        wire_runner(&shell, cx);
+
+        shell.update(cx, |shell, cx| shell.run_command("diff.unstage-hunk", cx));
+        pump_write(&shell, cx);
+        assert!(
+            repo.wrote()[0].starts_with("unstage-patch "),
+            "{:?}",
+            repo.wrote()
+        );
+    }
+
+    #[gpui::test]
+    fn a_commit_diff_has_nothing_to_stage_and_says_so(cx: &mut TestAppContext) {
+        let (shell, repo) = diff_shell(cx, "abc1234");
+        wire_runner(&shell, cx);
+
+        for command in ["diff.stage-hunk", "diff.unstage-hunk", "diff.discard-hunk"] {
+            shell.update(cx, |shell, cx| shell.run_command(command, cx));
+            shell.read_with(cx, |shell, _| {
+                let notice = shell.notice.as_ref().map(Notice::text).unwrap_or_default();
+                assert!(notice.contains("between commits"), "{command}: {notice:?}");
+            });
+        }
+        assert!(repo.wrote().is_empty(), "nothing was queued");
+    }
+
+    #[gpui::test]
+    fn discarding_a_hunk_asks_twice_on_the_same_spot(cx: &mut TestAppContext) {
+        let (shell, repo) = diff_shell(cx, "");
+        wire_runner(&shell, cx);
+
+        shell.update(cx, |shell, cx| shell.run_command("diff.discard-hunk", cx));
+        shell.read_with(cx, |shell, _| {
+            let notice = shell.notice.as_ref().map(Notice::text).unwrap_or_default();
+            assert!(
+                notice.contains("press again") && notice.contains("hunk"),
+                "{notice:?}"
+            );
+        });
+        assert!(repo.wrote().is_empty(), "the question queued nothing");
+
+        // Second press on the same spot spends the arm and runs.
+        shell.update(cx, |shell, cx| shell.run_command("diff.discard-hunk", cx));
+        pump_write(&shell, cx);
+        assert_eq!(repo.wrote().len(), 1, "{:?}", repo.wrote());
+        assert!(
+            repo.wrote()[0].starts_with("discard-patch "),
+            "{:?}",
+            repo.wrote()
+        );
+    }
+
+    #[gpui::test]
+    fn an_untracked_file_refuses_hunk_verbs_and_names_the_pane_that_serves_it(
+        cx: &mut TestAppContext,
+    ) {
+        let (shell, repo) = creation_diff_shell(cx);
+        wire_runner(&shell, cx);
+
+        for command in ["diff.stage-hunk", "diff.unstage-hunk", "diff.discard-hunk"] {
+            shell.update(cx, |shell, cx| shell.run_command(command, cx));
+            shell.read_with(cx, |shell, _| {
+                let notice = shell.notice.as_ref().map(Notice::text).unwrap_or_default();
+                assert!(notice.contains("files pane"), "{command}: {notice:?}");
+            });
+        }
+        assert!(repo.wrote().is_empty(), "the refusal queued nothing");
+    }
+
+    #[gpui::test]
+    fn a_tracked_file_s_addition_hunk_travels_even_with_no_old_numbers(cx: &mut TestAppContext) {
+        // The shape `[diff] context = 0` makes of an insertion mid-file:
+        // every line an addition, no old number anywhere — which looks like
+        // a creation and is not one. Status says the file is tracked work,
+        // so the hunk synthesizes and goes to git; only status can tell
+        // this apart from fresh.txt, and nothing else was asked.
+        let raw = "\
+diff --git a/added.txt b/added.txt
+--- a/added.txt
++++ b/added.txt
+@@ -3,0 +4,2 @@
++added one
++added two
+";
+        let (shell, repo) = addition_diff_shell(cx, raw);
+        wire_runner(&shell, cx);
+
+        shell.update(cx, |shell, cx| shell.run_command("diff.stage-hunk", cx));
+        let notice = shell.read_with(cx, |shell, _| {
+            shell.notice.as_ref().map(|n| n.text().to_string())
+        });
+        assert_ne!(
+            notice.as_deref(),
+            Some("that hunk adds a new file — stage or unstage it whole from the files pane"),
+            "the numbers alone must not classify this a creation"
+        );
+        // The verb submits; the write lands when the queue drains, as in
+        // every window.
+        pump_write(&shell, cx);
+        let wrote = repo.wrote();
+        assert_eq!(wrote.len(), 1, "notice was {notice:?}");
+        assert!(
+            wrote[0].starts_with("stage-patch "),
+            "the hunk went to git: {:?}",
+            wrote[0]
+        );
+    }
+
+    #[gpui::test]
+    fn hunk_verbs_off_a_diff_pane_are_answered_like_unknown_commands(cx: &mut TestAppContext) {
+        let (shell, _repo, _handle) = tree_shell(cx, Status::default());
+
+        shell.update(cx, |shell, cx| shell.run_command("diff.stage-hunk", cx));
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(
+                shell.notice.as_ref().map(Notice::text),
+                Some("diff.stage-hunk is not supported here")
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn staging_everything_when_there_is_nothing_says_so_and_queues_nothing(
+        cx: &mut TestAppContext,
+    ) {
+        let (shell, repo, _handle) = files_shell(cx);
+        // A clean tree flattens to nothing, so the cursor sits nowhere.
+        shell.update(cx, |shell, cx| {
+            let Some(Screen::Files { view, .. }) = shell.active() else {
+                panic!("files pane lost");
+            };
+            view.update(cx, |f, cx| {
+                f.replace_prepared(
+                    crate::views::files::prepare(Status::default(), "r", Default::default()),
+                    &config::host(cx),
+                );
+            });
+        });
+        shell.update(cx, |shell, cx| shell.run_command("files.stage-all", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(
+                shell
+                    .notice
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("nothing"),
+                "{:?}",
+                shell.notice
+            );
+        });
+        assert!(repo.wrote().is_empty());
+    }
+
+    #[gpui::test]
+    fn ignore_answers_for_an_untracked_file_and_nowhere_else(cx: &mut TestAppContext) {
+        let (shell, repo, _handle) = files_shell(cx);
+        // notes.md is tracked-and-modified: .gitignore governs nothing here,
+        // and the command says so rather than succeeding at nothing.
+        shell.update(cx, |shell, cx| shell.run_command("files.ignore", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(
+                shell
+                    .notice
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("untracked"),
+                "{:?}",
+                shell.notice
+            );
+        });
+        assert!(repo.wrote().is_empty());
+
+        // The row it does answer: an untracked file goes to .gitignore as one
+        // write job; the refresh after it drops the entry from status.
+        let mut tree = Status::default();
+        tree.untracked.push(gitten_core::status::UntrackedEntry {
+            path: "loose.txt".into(),
+        });
+        let (shell, repo, _handle) = tree_shell(cx, tree);
+        shell.update(cx, |shell, cx| shell.run_command("files.ignore", cx));
+        pump_write(&shell, cx);
+        assert_eq!(repo.wrote(), vec!["ignore loose.txt"]);
+    }
+
+    // ------------------------------------------------- the history verbs
+
+    #[gpui::test]
+    fn soft_and_mixed_resets_ask_twice_too(cx: &mut TestAppContext) {
+        // A reset that silently shortened the commit list read as data loss
+        // to the one person whose opinion of this UI counts, so every strength
+        // asks the same question hard does: arm, say it in the band, spend.
+        let (shell, repo) = history_shell(cx);
+        let target = "0".repeat(40);
+
+        // The question is the asking: `g` opens it — nothing written, the
+        // band says what is being asked — and `s` is the answer, soft.
+        shell.update(cx, |shell, cx| shell.run_command("commits.reset-menu", cx));
+        std::thread::sleep(Duration::from_millis(50));
+        shell.read_with(cx, |shell, _| {
+            assert!(
+                repo.wrote().is_empty(),
+                "opening the question wrote nothing"
+            );
+            assert!(
+                shell
+                    .notice
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("reset to abc000? Commands"),
+                "the question went unsaid: {:?}",
+                shell.notice
+            );
+        });
+        shell.update(cx, |shell, cx| shell.run_command("commits.reset-soft", cx));
+        pump_write(&shell, cx);
+        assert_eq!(repo.wrote(), vec![format!("reset --soft {target}")]);
+
+        // The answer spent the question, so a strength outside a
+        // standing question reaches nothing — the menu must open again first.
+        shell.update(cx, |shell, cx| shell.run_command("commits.reset-mixed", cx));
+        std::thread::sleep(Duration::from_millis(50));
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(repo.wrote().len(), 1, "no strength fires without its menu");
+            // And the orphaned answer does not execute and does not ask:
+            // the asking is the menu's, and an answer that opened a question
+            // by itself would be two presses deciding a hard reset.
+            assert!(
+                shell
+                    .notice
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("no reset is being asked"),
+                "the orphaned strength went unsaid: {:?}",
+                shell.notice
+            );
+        });
+        shell.update(cx, |shell, cx| shell.run_command("commits.reset-menu", cx));
+        shell.update(cx, |shell, cx| shell.run_command("commits.reset-mixed", cx));
+        pump_write(&shell, cx);
+        assert_eq!(
+            repo.wrote(),
+            vec![
+                format!("reset --soft {target}"),
+                format!("reset --mixed {target}")
+            ],
+            "the second command of each strength is the yes"
+        );
+    }
+
+    #[gpui::test]
+    fn a_hard_reset_asks_twice_then_rides_the_pump(cx: &mut TestAppContext) {
+        let (shell, repo) = history_shell(cx);
+        let view = match shell.read_with(cx, |shell, _| shell.active().cloned()) {
+            Some(Screen::Commits { view, .. }) => view,
+            _ => panic!("no commits pane"),
+        };
+
+        // `g` opens the question; nothing has run and the band asks, naming
+        // the three answers — `h` among them, captured only while the
+        // question stands.
+        shell.update(cx, |shell, cx| shell.run_command("commits.reset-menu", cx));
+        std::thread::sleep(Duration::from_millis(50));
+        shell.read_with(cx, |shell, _| {
+            assert!(repo.wrote().is_empty(), "nothing was reset yet");
+            assert!(
+                shell
+                    .notice
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("reset to abc000? Commands: soft · mixed · hard"),
+                "the question went unsaid: {:?}",
+                shell.notice
+            );
+        });
+        view.read_with(cx, |v, _| {
+            assert_eq!(v.armed_sha(), Some("0".repeat(40)));
+        });
+
+        // The answering command runs the whole production path: job queued
+        // by dispatch, drained by the same pump the window runs, generation
+        // bumped, panes re-acquired. The asking was the menu; the answer is
+        // the yes.
+        shell.update(cx, |shell, cx| shell.run_command("commits.reset-hard", cx));
+        pump_write(&shell, cx);
+        assert_eq!(
+            repo.wrote(),
+            vec![format!("reset --hard {}", "0".repeat(40))]
+        );
+        shell.read_with(cx, |shell, _| assert!(shell.generation.get() > 0));
+    }
+
+    #[gpui::test]
+    fn a_cursor_move_disarms_a_hard_reset_before_any_yes_can_land(cx: &mut TestAppContext) {
+        let (shell, repo) = history_shell(cx);
+        shell.update(cx, |shell, cx| shell.run_command("commits.reset-menu", cx));
+        shell.update(cx, |shell, cx| shell.run_command("commits.reset-hard", cx));
+        pump_write(&shell, cx);
+        assert_eq!(
+            repo.wrote(),
+            vec![format!("reset --hard {}", "0".repeat(40))]
+        );
+
+        // The keyboard moves off the answered row — without a command in
+        // between, exactly as a wheel does it. The question dies with the
+        // cursor; the mode stack has not heard yet.
+        shell.update(cx, |shell, cx| {
+            let Some(Screen::Commits { view, .. }) = shell.active() else {
+                panic!("no commits pane");
+            };
+            let host = Rc::new(Host::new());
+            view.update(cx, |v, _| v.run_view("view.down", &host));
+        });
+        // The stale mode still resolves `h` — and it may not fire and may
+        // not ask: the question it answered is gone, and the asking is g's.
+        shell.update(cx, |shell, cx| shell.run_command("commits.reset-hard", cx));
+        std::thread::sleep(Duration::from_millis(50));
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(
+                repo.wrote().len(),
+                1,
+                "a stale yes reached a different commit: {:?}",
+                repo.wrote()
+            );
+            assert!(
+                shell
+                    .notice
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("no reset is being asked"),
+                "{:?}",
+                shell.notice
+            );
+        });
+    }
+
+    // ---------------------------------------------- the rebase rewrites
+
+    /// Five straight-line commits, newest first, with shas readable in
+    /// assertions: `"00…"·40` at HEAD down to `"44…"·40` at the root, each
+    /// commit's parent exactly the next one's sha — the straight line
+    /// [`gitten_core::rebase::compose`] demands.
+    fn linear_chain() -> Vec<Commit> {
+        let sha = |k: u8| format!("{:02x}", k).repeat(20);
+        (0..5u8)
+            .map(|k| Commit {
+                sha: sha(k),
+                short: format!("abc0{k}"),
+                parents: match k {
+                    4 => Vec::new(),
+                    _ => vec![sha(k + 1)],
+                }
+                .into_boxed_slice(),
+                author: "".into(),
+                timestamp: 0,
+                subject: format!("s{k}"),
+            })
+            .collect()
+    }
+
+    /// A commits pane over a repository whose `log` answers with that same
+    /// straight line — the pair the rewrite verbs compose from.
+    fn rebase_shell(cx: &mut TestAppContext) -> (gpui::Entity<DevShell>, Arc<RecordingRepo>) {
+        let calls = Arc::default();
+        let repo = Arc::new(RecordingRepo::new(Arc::clone(&calls)));
+        repo.serve_log(linear_chain());
+        let handle: gitten_git::Handle = repo.clone();
+        let shell = shell(None, cx);
+        shell.update(cx, |shell, cx| {
+            let view = cx.new(|_| Commits::new(linear_chain(), Rc::new(Host::new())));
+            cx.set_global(config::Active(Rc::new(Host::new())));
+            shell.panes.register(
+                "commits",
+                Screen::commits(view, Source::Fixtures, Generation::default(), "~/src"),
+            );
+            shell.repo = Some((PathBuf::from("/recorded"), handle));
+        });
+        (shell, repo)
+    }
+
+    #[gpui::test]
+    fn squash_up_asks_twice_then_rides_the_pump_with_a_whole_plan(cx: &mut TestAppContext) {
+        let (shell, repo) = rebase_shell(cx);
+
+        // First press on HEAD: asked, not acted.
+        shell.update(cx, |shell, cx| shell.run_command("commits.squash-up", cx));
+        std::thread::sleep(Duration::from_millis(50));
+        shell.read_with(cx, |shell, _| {
+            assert!(repo.wrote().is_empty());
+            assert!(
+                shell
+                    .notice
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("squash abc00 into its parent?"),
+                "{:?}",
+                shell.notice
+            );
+        });
+
+        // Second press composes the plan and queues the job through the
+        // production dispatch: folding HEAD into its parent replays the
+        // parent first (a plan may not open with a squash) and sits on the
+        // grandparent's sha.
+        shell.update(cx, |shell, cx| shell.run_command("commits.squash-up", cx));
+        pump_write(&shell, cx);
+        assert_eq!(
+            repo.wrote(),
+            vec![format!(
+                "rebase onto {} with plan pick {}\nsquash {}\n",
+                "02".repeat(20),
+                "01".repeat(20),
+                "00".repeat(20)
+            )]
+        );
+        shell.read_with(cx, |shell, _| assert!(shell.generation.get() > 0));
+    }
+
+    #[gpui::test]
+    fn drop_composes_a_plan_that_omits_only_the_selected_commit(cx: &mut TestAppContext) {
+        let (shell, repo) = rebase_shell(cx);
+
+        // The keyboard moves to the second-newest commit…
+        shell.update(cx, |shell, cx| {
+            let Some(Screen::Commits { view, .. }) = shell.active() else {
+                panic!("no commits pane");
+            };
+            let host = Rc::new(Host::new());
+            view.update(cx, |v, _| v.run_view("view.down", &host));
+        });
+
+        // …and two presses drop exactly it: the plan sits on its parent,
+        // replays everything newer, and carries no line for the dropped
+        // commit itself.
+        for _ in 0..2 {
+            shell.update(cx, |shell, cx| shell.run_command("commits.drop-commit", cx));
+        }
+        pump_write(&shell, cx);
+        assert_eq!(
+            repo.wrote(),
+            vec![format!(
+                "rebase onto {} with plan pick {}\n",
+                "02".repeat(20),
+                "00".repeat(20)
+            )]
+        );
+    }
+
+    #[gpui::test]
+    fn a_merge_under_the_keyboard_refuses_in_words_and_queues_nothing(cx: &mut TestAppContext) {
+        let calls = Arc::default();
+        let repo = Arc::new(RecordingRepo::new(Arc::clone(&calls)));
+        let mut merged = linear_chain();
+        merged[1] = Commit {
+            parents: vec!["03".repeat(20), "ee".repeat(20)].into_boxed_slice(),
+            ..merged[1].clone()
+        };
+        repo.serve_log(merged.clone());
+        let handle: gitten_git::Handle = repo.clone();
+        let shell = shell(None, cx);
+        shell.update(cx, |shell, cx| {
+            let view = cx.new(|_| Commits::new(merged, Rc::new(Host::new())));
+            cx.set_global(config::Active(Rc::new(Host::new())));
+            shell.panes.register(
+                "commits",
+                Screen::commits(view, Source::Fixtures, Generation::default(), "~/src"),
+            );
+            shell.repo = Some((PathBuf::from("/recorded"), handle));
+        });
+
+        // The keyboard moves onto the merge itself, then arm, spend, refuse:
+        // the merge would be flattened, said in words, with no job queued
+        // behind the sentence.
+        shell.update(cx, |shell, cx| {
+            let Some(Screen::Commits { view, .. }) = shell.active() else {
+                panic!("no commits pane");
+            };
+            let host = Rc::new(Host::new());
+            view.update(cx, |v, _| v.run_view("view.down", &host));
+        });
+        for _ in 0..2 {
+            shell.update(cx, |shell, cx| shell.run_command("commits.drop-commit", cx));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        shell.read_with(cx, |shell, _| {
+            assert!(repo.wrote().is_empty(), "{:?}", repo.wrote());
+            assert!(
+                shell
+                    .notice
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("flatten"),
+                "{:?}",
+                shell.notice
+            );
+        });
+    }
+
+    /// A branches pane with `main` under HEAD and `other` beside it — the
+    /// aim `commits.rebase-onto` takes from the pane the keyboard is over.
+    fn rebase_branches_shell(
+        cx: &mut TestAppContext,
+    ) -> (gpui::Entity<DevShell>, Arc<RecordingRepo>) {
+        let calls = Arc::default();
+        let repo = Arc::new(RecordingRepo::new(Arc::clone(&calls)));
+        let handle: gitten_git::Handle = repo.clone();
+        let shell = shell(None, cx);
+        shell.update(cx, |shell, cx| {
+            let prepared = crate::views::branches::prepare(
+                vec![branch_ref("main", true), branch_ref("other", false)],
+                Vec::new(),
+                None,
+                Vec::new(),
+                &gitten_core::theme::Theme::default(),
+                "test",
+            );
+            let label = prepared.label.clone();
+            let view = cx.new(|_| crate::views::branches::Branches::from_prepared(prepared));
+            cx.set_global(config::Active(Rc::new(Host::new())));
+            shell.panes.register(
+                "branches",
+                Screen::branches(view, Generation::default(), label),
+            );
+            shell.repo = Some((PathBuf::from("/recorded"), handle));
+        });
+        (shell, repo)
+    }
+
+    #[gpui::test]
+    fn rebase_onto_asks_twice_then_moves_this_branch_onto_the_selection(cx: &mut TestAppContext) {
+        let (shell, repo) = rebase_branches_shell(cx);
+
+        // The keyboard walks past the heading and past main (HEAD's own
+        // row) onto `other`.
+        shell.update(cx, |shell, cx| {
+            let host = Rc::new(Host::new());
+            for _ in 0..5 {
+                let under = match shell.active() {
+                    Some(Screen::Branches { view, .. }) => view.read(cx).cursor_text(),
+                    _ => panic!("no branches pane"),
+                };
+                if under == "other" {
+                    break;
+                }
+                shell.active().unwrap().run("view.down", &host, None, cx);
+            }
+            assert_eq!(
+                match shell.active() {
+                    Some(Screen::Branches { view, .. }) => view.read(cx).cursor_text(),
+                    _ => unreachable!(),
+                },
+                "other",
+                "the keyboard never reached the branch"
+            );
+        });
+
+        shell.update(cx, |shell, cx| shell.run_command("commits.rebase-onto", cx));
+        std::thread::sleep(Duration::from_millis(50));
+        shell.read_with(cx, |shell, _| {
+            assert!(repo.wrote().is_empty());
+            assert!(
+                shell
+                    .notice
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("rebase this branch onto other?"),
+                "{:?}",
+                shell.notice
+            );
+        });
+
+        shell.update(cx, |shell, cx| shell.run_command("commits.rebase-onto", cx));
+        pump_write(&shell, cx);
+        assert_eq!(repo.wrote(), vec!["rebase onto other"]);
+        shell.read_with(cx, |shell, _| assert!(shell.generation.get() > 0));
+    }
+
+    #[gpui::test]
+    fn abort_and_continue_reach_the_queue_by_their_own_names(cx: &mut TestAppContext) {
+        // The way out of a stranded rebase is two named commands, reachable
+        // whatever pane holds the keyboard — repository-level verbs, like
+        // push and pull. No selection read, no confirmation dance: both
+        // only mean something while git holds a state, and git's own answer
+        // says so when there is none.
+        let (shell, repo) = history_shell(cx);
+
+        shell.update(cx, |shell, cx| shell.run_command("rebase.abort", cx));
+        pump_write(&shell, cx);
+        assert_eq!(repo.wrote(), vec!["rebase abort"]);
+        shell.read_with(cx, |shell, _| assert!(shell.generation.get() > 0));
+
+        shell.update(cx, |shell, cx| shell.run_command("rebase.continue", cx));
+        pump_write(&shell, cx);
+        assert_eq!(repo.wrote(), vec!["rebase abort", "rebase continue"]);
+        shell.read_with(cx, |shell, _| assert!(shell.generation.get() > 1));
+    }
+
+    #[gpui::test]
+    fn revert_lands_the_inverse_through_the_pump_without_asking(cx: &mut TestAppContext) {
+        let (shell, repo) = history_shell(cx);
+        shell.update(cx, |shell, cx| shell.run_command("commits.revert", cx));
+        pump_write(&shell, cx);
+        assert_eq!(repo.wrote(), vec![format!("revert {}", "0".repeat(40))]);
+        shell.read_with(cx, |shell, _| assert!(shell.generation.get() > 0));
+    }
+
+    #[gpui::test]
+    fn cherry_pick_rides_the_pump_and_refuses_a_detached_head(cx: &mut TestAppContext) {
+        // Same terms as revert: nothing existing moves, so no confirmation
+        // dance — the keypress is the job, through production dispatch.
+        let (shell, repo) = history_shell(cx);
+        shell.update(cx, |shell, cx| shell.run_command("commits.cherry-pick", cx));
+        pump_write(&shell, cx);
+        assert_eq!(
+            repo.wrote(),
+            vec![format!("cherry-pick {}", "0".repeat(40))]
+        );
+        shell.read_with(cx, |shell, _| {
+            assert!(shell
+                .notice
+                .as_deref()
+                .unwrap_or_default()
+                .contains("picked"));
+        });
+
+        // Detached HEAD refuses before anything is queued: a pick lands on
+        // *the current branch*, and detached means there is none.
+        repo.detach();
+        shell.update(cx, |shell, cx| shell.run_command("commits.cherry-pick", cx));
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(repo.wrote().len(), 1, "nothing was queued");
+        shell.read_with(cx, |shell, _| {
+            assert!(
+                shell
+                    .notice
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("detached"),
+                "the refusal went unsaid: {:?}",
+                shell.notice
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn a_new_tag_opens_the_field_and_the_accepted_text_becomes_the_job(cx: &mut TestAppContext) {
+        let (shell, repo) = history_shell(cx);
+
+        shell.update(cx, |shell, cx| shell.run_command("commits.new-tag", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.input.is_some(), "no field opened");
+            assert!(matches!(shell.prompt, Some(super::Prompt::TagName { .. })));
+        });
+
+        // Typed text, as the platform would have left it; the real accept
+        // path carries it into the job aimed at the row captured at open.
+        shell.update(cx, |shell, cx| {
+            let field = cx.new(|cx| input::Input::new("new tag", "tag name", "v1", cx));
+            shell.open_input(field, cx);
+            shell.prompt = Some(super::Prompt::TagName {
+                target: "commits".into(),
+                at: "0".repeat(40),
+            });
+        });
+        shell.update(cx, |shell, cx| shell.run_command("input.accept", cx));
+        pump_write(&shell, cx);
+        assert_eq!(repo.wrote(), vec![format!("tag v1 at {}", "0".repeat(40))]);
+        shell.read_with(cx, |shell, _| assert!(shell.generation.get() > 0));
+
+        // An empty accept refuses beside the field and queues nothing.
+        shell.update(cx, |shell, cx| shell.run_command("commits.new-tag", cx));
+        shell.update(cx, |shell, cx| shell.run_command("input.accept", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.input.is_none());
+            assert!(
+                shell
+                    .notice
+                    .as_ref()
+                    .map(Notice::text)
+                    .unwrap_or_default()
+                    .contains("name"),
+                "the refusal went unsaid: {:?}",
+                shell.notice
+            );
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(repo.wrote().len(), 1, "the empty accept queued nothing");
+
+        // Padding around the name is field noise, not part of it: what is
+        // queued is the trimmed name.
+        shell.update(cx, |shell, cx| {
+            let field = cx.new(|cx| input::Input::new("new tag", "tag name", " v2 ", cx));
+            shell.open_input(field, cx);
+            shell.prompt = Some(super::Prompt::TagName {
+                target: "commits".into(),
+                at: "0".repeat(40),
+            });
+        });
+        shell.update(cx, |shell, cx| shell.run_command("input.accept", cx));
+        pump_write(&shell, cx);
+        let expected = format!("tag v2 at {}", "0".repeat(40));
+        assert_eq!(
+            repo.wrote().last().map(String::as_str),
+            Some(expected.as_str()),
+            "the padding never reached git"
+        );
+    }
+
+    #[gpui::test]
+    fn a_conflicted_revert_says_what_git_said_and_shows_what_it_left(cx: &mut TestAppContext) {
+        // Both panes over one repository: the commits pane to aim revert
+        // from — registered last, so it holds the keyboard — and the status
+        // pane that has to show what the refusal left behind.
+        let calls = Arc::default();
+        let repo = Arc::new(RecordingRepo::new(Arc::clone(&calls)));
+        repo.arm_conflict();
+        let handle: gitten_git::Handle = repo.clone();
+        let shell = shell(None, cx);
+        let files = shell.update(cx, |shell, cx| {
+            cx.set_global(config::Active(Rc::new(Host::new())));
+            let files = cx.new(|_| {
+                crate::views::files::Files::from_prepared(crate::views::files::prepare(
+                    Status::default(),
+                    "r",
+                    Default::default(),
+                ))
+            });
+            shell.panes.register(
+                "files",
+                Screen::files(files.clone(), Generation::default(), "files"),
+            );
+            let commits = cx.new(|_| Commits::new(search_history(), Rc::new(Host::new())));
+            shell.panes.register(
+                "commits",
+                Screen::commits(commits, Source::Fixtures, Generation::default(), "~/src"),
+            );
+            shell.repo = Some((PathBuf::from("/recorded"), handle));
+            files
+        });
+
+        shell.update(cx, |shell, cx| shell.run_command("commits.revert", cx));
+        pump_until(&shell, cx, |shell| shell.error.is_some());
+        cx.run_until_parked();
+
+        shell.read_with(cx, |shell, _| {
+            assert!(
+                shell
+                    .error
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("could not revert"),
+                "git's own words reached the band: {:?}",
+                shell.error
+            );
+        });
+        files.read_with(cx, |f, _| {
+            assert_eq!(
+                f.paths_in(crate::views::files::Section::Conflicts),
+                vec![gitten_core::status::PathBytes::from("poem.txt")],
+                "the unmerged path the revert left is on screen"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn a_conflicted_cherry_pick_says_what_git_said_and_shows_what_it_left(cx: &mut TestAppContext) {
+        // The same shape as the conflicted revert: the pick refuses with
+        // git's own words in the band, and the files pane re-acquires
+        // through the drain_jobs failure arm — a refusal is not proof the
+        // repository stood still, and an unmerged path nobody can see is a
+        // question nobody can answer.
+        let calls = Arc::default();
+        let repo = Arc::new(RecordingRepo::new(Arc::clone(&calls)));
+        repo.arm_conflict();
+        let handle: gitten_git::Handle = repo.clone();
+        let shell = shell(None, cx);
+        let files = shell.update(cx, |shell, cx| {
+            cx.set_global(config::Active(Rc::new(Host::new())));
+            let files = cx.new(|_| {
+                crate::views::files::Files::from_prepared(crate::views::files::prepare(
+                    Status::default(),
+                    "r",
+                    Default::default(),
+                ))
+            });
+            shell.panes.register(
+                "files",
+                Screen::files(files.clone(), Generation::default(), "files"),
+            );
+            let commits = cx.new(|_| Commits::new(search_history(), Rc::new(Host::new())));
+            shell.panes.register(
+                "commits",
+                Screen::commits(commits, Source::Fixtures, Generation::default(), "~/src"),
+            );
+            shell.repo = Some((PathBuf::from("/recorded"), handle));
+            files
+        });
+
+        shell.update(cx, |shell, cx| shell.run_command("commits.cherry-pick", cx));
+        pump_until(&shell, cx, |shell| shell.error.is_some());
+        cx.run_until_parked();
+
+        shell.read_with(cx, |shell, _| {
+            assert!(
+                shell
+                    .error
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("could not apply"),
+                "git's own words reached the band: {:?}",
+                shell.error
+            );
+        });
+        files.read_with(cx, |f, _| {
+            assert_eq!(
+                f.paths_in(crate::views::files::Section::Conflicts),
+                vec![gitten_core::status::PathBytes::from("poem.txt")],
+                "the unmerged path the pick left is on screen"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn a_stranded_pick_is_walked_out_by_its_own_commands_not_rebases(cx: &mut TestAppContext) {
+        // A conflicted pick leaves git holding the question under
+        // CHERRY_PICK_HEAD. Rebase's abort/continue answer that state with
+        // git's "no rebase in progress" — true and useless — so the way out
+        // is the pair beside the pick key, dispatching to the pick's own
+        // verbs.
+        let (shell, repo) = history_shell(cx);
+
+        // Abort: the refused pick's question, put back where it started.
+        repo.arm_conflict();
+        shell.update(cx, |shell, cx| shell.run_command("commits.cherry-pick", cx));
+        pump_until(&shell, cx, |shell| shell.error.is_some());
+        assert_eq!(
+            repo.wrote(),
+            vec![format!("cherry-pick {}", "0".repeat(40))]
+        );
+        let generation = shell.read_with(cx, |shell, _| shell.generation.get());
+        shell.update(cx, |shell, cx| {
+            shell.run_command("commits.cherry-pick-abort", cx)
+        });
+        pump_write(&shell, cx);
+        assert_eq!(
+            repo.wrote().last().map(String::as_str),
+            Some("cherry-pick abort"),
+            "the pick's own abort ran"
+        );
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.generation.get() > generation);
+        });
+
+        // Continue: the conflict resolved by hand, the pick lands as its
+        // own commit — the verb runs, the band re-acquires.
+        repo.clear_conflict();
+        let generation = shell.read_with(cx, |shell, _| shell.generation.get());
+        shell.update(cx, |shell, cx| {
+            shell.run_command("commits.cherry-pick-continue", cx)
+        });
+        pump_write(&shell, cx);
+        assert_eq!(
+            repo.wrote().last().map(String::as_str),
+            Some("cherry-pick continue")
+        );
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.generation.get() > generation);
+            assert!(
+                shell
+                    .notice
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("continued"),
+                "the finish said so: {:?}",
+                shell.notice
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn the_history_verbs_say_so_outside_the_commits_pane(cx: &mut TestAppContext) {
+        let (shell, _repo, _handle) = files_shell(cx);
+        for command in [
+            "commits.reset-soft",
+            "commits.reset-hard",
+            "commits.revert",
+            "commits.cherry-pick",
+            "commits.new-tag",
+        ] {
+            shell.update(cx, |shell, cx| shell.run_command(command, cx));
+        }
+        shell.read_with(cx, |shell, _| {
+            assert!(shell
+                .notice
+                .as_deref()
+                .unwrap_or_default()
+                .contains("not supported here"));
+        });
+    }
+
+    #[gpui::test]
+    fn amend_opens_the_field_and_the_accepted_text_becomes_the_job(cx: &mut TestAppContext) {
+        let (shell, repo, _handle) = files_shell(cx);
+
+        shell.update(cx, |shell, cx| shell.run_command("files.amend", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.input.is_some(), "no field opened");
+        });
+
+        // Typed text, as the platform would have left it; the real accept
+        // path carries it into the job.
+        shell.update(cx, |shell, cx| {
+            let field = cx.new(|cx| input::Input::new("amend", "amend message", "rewritten", cx));
+            shell.open_input(field, cx);
+            shell.prompt = Some(super::Prompt::AmendMessage);
+        });
+        shell.update(cx, |shell, cx| shell.run_command("input.accept", cx));
+        pump_write(&shell, cx);
+        assert_eq!(repo.wrote(), vec!["amend rewritten"]);
+    }
+
+    #[gpui::test]
+    fn an_empty_amend_refuses_at_accept_without_submitting_anything(cx: &mut TestAppContext) {
+        let (shell, repo, _handle) = files_shell(cx);
+        shell.update(cx, |shell, cx| shell.run_command("files.amend", cx));
+        shell.update(cx, |shell, cx| shell.run_command("input.accept", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.input.is_none());
+            assert!(
+                shell
+                    .notice
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("message"),
+                "the refusal went unsaid: {:?}",
+                shell.notice
+            );
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(repo.wrote().is_empty());
+    }
+
+    // ------------------------------------------------------- the branch verbs
+
+    /// A shell with the branches pane registered over the recording
+    /// repository — `feature` and `main` local (main under HEAD),
+    /// `origin/main` remote. The keyboard starts on `feature`, row 1.
+    fn branches_shell(
+        cx: &mut TestAppContext,
+    ) -> (
+        gpui::Entity<DevShell>,
+        Arc<RecordingRepo>,
+        gitten_git::Handle,
+    ) {
+        let calls = Arc::default();
+        let repo = Arc::new(RecordingRepo::new(Arc::clone(&calls)));
+        let handle: gitten_git::Handle = repo.clone();
+        let shell = shell(None, cx);
+        shell.update(cx, |shell, cx| {
+            let prepared = crate::views::branches::prepare(
+                vec![branch_ref("feature", false), branch_ref("main", true)],
+                vec![gitten_core::refs::RemoteBranch {
+                    remote: gitten_core::refs::RefName::from("origin"),
+                    branch: gitten_core::refs::RefName::from("main"),
+                    commit: "0123456789abcdef0123456789abcdef01234567".into(),
+                }],
+                Some(gitten_core::refs::HeadState::Branch {
+                    name: gitten_core::refs::RefName::from("main"),
+                    commit: None,
+                }),
+                Vec::new(),
+                &gitten_core::theme::Theme::default(),
+                "r",
+            );
+            // The pane opens past the `LOCAL` heading, on feature: the
+            // cursor never rests on a heading, so no step is needed.
+            let view = cx.new(|_| crate::views::branches::Branches::from_prepared(prepared));
+            shell.panes.register(
+                "branches",
+                Screen::branches(view, Generation::default(), "r · 2 local · 1 remote"),
+            );
+            shell.repo = Some((PathBuf::from("/recorded"), handle.clone()));
+            cx.set_global(config::Active(Rc::new(Host::new())));
+        });
+        (shell, repo, handle)
+    }
+
+    /// Walks the keyboard onto a named branch row.
+    #[track_caller]
+    fn onto(shell: &gpui::Entity<DevShell>, name: &str, cx: &mut TestAppContext) {
+        shell.update(cx, |shell, cx| {
+            let Some(Screen::Branches { view, .. }) = shell.active() else {
+                panic!("branches pane lost");
+            };
+            let host = Rc::new(Host::new());
+            view.update(cx, |b, _| {
+                b.run_view("view.top", &host);
+                loop {
+                    let hit = b.current().is_some_and(|t| match t {
+                        crate::views::branches::Target::Local(n) => n.as_bytes() == name.as_bytes(),
+                        crate::views::branches::Target::Remote { remote, branch } => {
+                            format!("{}/{}", remote.to_string_lossy(), branch.to_string_lossy())
+                                == name
+                        }
+                        _ => false,
+                    });
+                    if hit || !b.run_view("view.down", &host) {
+                        break;
+                    }
+                }
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn checkout_rides_the_rails_and_every_pane_reacquires(cx: &mut TestAppContext) {
+        let (shell, repo, _handle) = branches_shell(cx);
+        // The keyboard is already on feature; space's command is what a key
+        // resolves to, run through named dispatch like every other verb.
+        shell.update(cx, |shell, cx| shell.run_command("branches.checkout", cx));
+
+        pump_write(&shell, cx);
+        assert_eq!(
+            repo.wrote(),
+            vec!["checkout feature"],
+            "the write ran off-thread against the real handle"
+        );
+        // The chain that matters: success bumped the generation, and every
+        // repository pane — the working tree included — re-acquired against
+        // the new HEAD through refresh_stale, no test help.
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.generation > Generation::default(), "no bump");
+            for screen in shell.panes.iter() {
+                match screen {
+                    Screen::Files { generation, .. }
+                    | Screen::Branches { generation, .. }
+                    | Screen::Stashes { generation, .. } => {
+                        assert_eq!(generation.get(), shell.generation);
+                    }
+                    Screen::Commits { .. } | Screen::Diff { .. } | Screen::Custom(_) => {}
+                }
+            }
+        });
+    }
+
+    // ------------------------------------------------------- the sync verbs
+
+    /// The tracking line the branches pane draws for main right now.
+    #[track_caller]
+    fn main_upstream_line(shell: &gpui::Entity<DevShell>, cx: &TestAppContext) -> String {
+        shell.read_with(cx, |shell, cx| {
+            let Some(Screen::Branches { view, .. }) = shell.active() else {
+                panic!("branches pane lost");
+            };
+            view.read(cx)
+                .row_slice()
+                .iter()
+                .find_map(|r| match r {
+                    crate::views::branches::Row::Local(l) if l.name.as_bytes() == b"main" => {
+                        Some(match &l.counts {
+                            Some(counts) => [counts.ahead.as_deref(), counts.behind.as_deref()]
+                                .into_iter()
+                                .flatten()
+                                .collect::<Vec<_>>()
+                                .join(" "),
+                            None if l.gone => "(gone)".into(),
+                            None => String::new(),
+                        })
+                    }
+                    _ => None,
+                })
+                .unwrap_or_default()
+        })
+    }
+
+    #[gpui::test]
+    fn the_sync_keys_run_through_the_pump_and_the_counts_follow(cx: &mut TestAppContext) {
+        let (shell, repo, _handle) = branches_shell(cx);
+
+        // f first: the remote has moved on its own, and fetch is how this
+        // side learns. The verb runs off-thread through the real queue...
+        shell.update(cx, |shell, cx| shell.run_command("repo.fetch", cx));
+        pump_write(&shell, cx);
+        assert_eq!(repo.wrote(), vec!["fetch --all"]);
+        assert_eq!(repo.counts(), (0, 1));
+        // The clean finish stamps the bar's recency — fetch side only.
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.last_fetch.is_some());
+            assert!(shell.last_push.is_none());
+        });
+        // ...the finish names itself in the band...
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(shell.notice.as_ref().map(Notice::text), Some("fetched"));
+        });
+        // ...and the branches panel re-acquired through the production
+        // drain_jobs rails: one behind, drawn where the counts live.
+        let line = main_upstream_line(&shell, cx);
+        assert!(line.contains("↓1"), "{line}");
+
+        // p closes that distance git's way — fast-forward or nothing.
+        shell.update(cx, |shell, cx| shell.run_command("repo.pull", cx));
+        pump_write(&shell, cx);
+        assert_eq!(repo.wrote(), vec!["fetch --all", "pull"]);
+        assert_eq!(repo.counts(), (0, 0));
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(shell.notice.as_ref().map(Notice::text), Some("pulled"));
+        });
+        let line = main_upstream_line(&shell, cx);
+        assert!(!line.contains('↓'), "in sync reads as a bare name: {line}");
+
+        // A local commit opens the other direction; P spends it. Origin
+        // stands in only because the fake tracks nothing — here it tracks.
+        *repo.distance.lock().unwrap() = (1, 0);
+        shell.update(cx, |shell, cx| shell.run_command("repo.push", cx));
+        pump_write(&shell, cx);
+        assert_eq!(
+            repo.wrote(),
+            vec!["fetch --all", "pull", "push origin main"]
+        );
+        assert_eq!(repo.counts(), (0, 0));
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(
+                shell.notice.as_ref().map(Notice::text),
+                Some("pushed origin main")
+            );
+            // ...and the push stamps its own side of the recency.
+            assert!(shell.last_push.is_some());
+        });
+        let line = main_upstream_line(&shell, cx);
+        assert!(!line.contains('↑'), "{line}");
+    }
+
+    #[gpui::test]
+    fn the_sync_keys_say_so_where_they_cannot_act(cx: &mut TestAppContext) {
+        // A fixture has no repository behind any pane; every sync key says
+        // so instead of pretending.
+        let shell = shell(None, cx);
+        shell.update(cx, |shell, cx| shell.run_command("repo.push", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(shell
+                .notice
+                .as_deref()
+                .unwrap_or_default()
+                .contains("fixture"));
+        });
+
+        // Detached HEAD is a place, not a branch: nothing under HEAD to aim
+        // a push at, refused before any job exists.
+        let (shell, repo, _handle) = branches_shell(cx);
+        repo.detach();
+        shell.update(cx, |shell, cx| shell.run_command("repo.push", cx));
+        assert_eq!(repo.wrote(), Vec::<String>::new());
+        shell.read_with(cx, |shell, _| {
+            assert!(shell
+                .notice
+                .as_deref()
+                .unwrap_or_default()
+                .contains("detached"));
+        });
+    }
+
+    #[gpui::test]
+    fn checkout_says_so_where_it_cannot_act(cx: &mut TestAppContext) {
+        // Over another pane entirely.
+        let (shell, repo, _handle) = branches_shell(cx);
+        shell.update(cx, |shell, _| {
+            shell.panes.focus(0); // the commits root
+        });
+        shell.update(cx, |shell, cx| shell.run_command("branches.checkout", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(shell
+                .notice
+                .as_deref()
+                .unwrap_or_default()
+                .contains("not supported here"));
+        });
+        assert!(repo.wrote().is_empty());
+
+        // On the detached row itself: a place, not a branch to move to.
+        let (shell, repo, _handle) = branches_shell(cx);
+        shell.update(cx, |shell, cx| {
+            let host = config::host(cx);
+            let Some(Screen::Branches { view, .. }) = shell.active() else {
+                panic!("branches pane lost");
+            };
+            view.update(cx, |b, _| {
+                b.replace_prepared(
+                    crate::views::branches::prepare(
+                        vec![branch_ref("main", false)],
+                        Vec::new(),
+                        Some(gitten_core::refs::HeadState::Detached {
+                            commit: "0123456789abcdef".into(),
+                        }),
+                        Vec::new(),
+                        &gitten_core::theme::Theme::default(),
+                        "",
+                    ),
+                    &host,
+                );
+            });
+        });
+        shell.update(cx, |shell, cx| {
+            // The fixture above carries one local branch, so row 1 is it;
+            // back up to the detached row itself.
+            let host = Rc::new(Host::new());
+            let Some(Screen::Branches { view, .. }) = shell.active() else {
+                panic!("branches pane lost");
+            };
+            view.update(cx, |b, _| {
+                b.run_view("view.top", &host); // the detached row
+            });
+        });
+        shell.update(cx, |shell, cx| shell.run_command("branches.checkout", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(shell
+                .notice
+                .as_deref()
+                .unwrap_or_default()
+                .contains("detached"));
+        });
+        assert!(repo.wrote().is_empty());
+
+        // No repository behind the window at all.
+        let (shell, repo, _handle) = branches_shell(cx);
+        shell.update(cx, |shell, _| shell.repo = None);
+        shell.update(cx, |shell, cx| shell.run_command("branches.checkout", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(shell
+                .notice
+                .as_deref()
+                .unwrap_or_default()
+                .contains("fixture"));
+        });
+        assert!(repo.wrote().is_empty());
+    }
+
+    #[gpui::test]
+    fn new_branch_opens_a_field_and_the_accepted_name_becomes_the_job(cx: &mut TestAppContext) {
+        let (shell, repo, _handle) = branches_shell(cx);
+
+        shell.update(cx, |shell, cx| shell.run_command("branches.new", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.input.is_some(), "no field opened");
+            assert!(matches!(
+                shell.prompt,
+                Some(super::Prompt::BranchName { .. })
+            ));
+        });
+
+        // Typed as the platform would leave it, then accepted through the
+        // real accept path.
+        let typed = shell.read_with(cx, |shell, _| shell.input.clone().unwrap());
+        typed.update(cx, |field, cx| field.replace(None, "hotfix", cx));
+        shell.update(cx, |shell, cx| shell.run_command("input.accept", cx));
+        pump_write(&shell, cx);
+        assert_eq!(repo.wrote(), vec!["create hotfix"]);
+        shell.read_with(cx, |shell, _| assert!(shell.input.is_none()));
+    }
+
+    #[gpui::test]
+    fn rename_pre_fills_the_rows_own_name_and_accepts_a_replacement(cx: &mut TestAppContext) {
+        let (shell, repo, _handle) = branches_shell(cx);
+        // The keyboard sits on feature.
+
+        shell.update(cx, |shell, cx| shell.run_command("branches.rename", cx));
+        let typed = shell.read_with(cx, |shell, _app| shell.input.clone().unwrap());
+        assert_eq!(
+            typed.read_with(cx, |field, _| field.value().to_string()),
+            "feature",
+            "the field started from the row's own name"
+        );
+
+        typed.update(cx, |field, cx| field.replace(None, "f2", cx));
+        shell.update(cx, |shell, cx| shell.run_command("input.accept", cx));
+        pump_write(&shell, cx);
+        assert_eq!(
+            repo.wrote(),
+            vec!["rename feature f2"],
+            "the old bytes travelled with the job"
+        );
+
+        // A remote row refuses to be renamed before any field opens.
+        let (shell, repo, _handle) = branches_shell(cx);
+        onto(&shell, "origin/main", cx);
+        shell.update(cx, |shell, cx| shell.run_command("branches.rename", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.input.is_none(), "a prompt opened over a remote");
+            assert!(shell
+                .notice
+                .as_deref()
+                .unwrap_or_default()
+                .contains("local"));
+        });
+        assert!(repo.wrote().is_empty());
+
+        // An empty accept is refused without submitting anything — proven by
+        // the production pump running dry, not by hoping the worker waited.
+        let (shell, repo, _handle) = branches_shell(cx);
+        shell.update(cx, |shell, cx| shell.run_command("branches.new", cx));
+        shell.update(cx, |shell, cx| shell.run_command("input.accept", cx));
+        pump_until(&shell, cx, |_| true);
+        assert!(repo.wrote().is_empty(), "an unnamed branch was submitted");
+        shell.read_with(cx, |shell, _| {
+            assert!(shell
+                .notice
+                .as_ref()
+                .map(Notice::text)
+                .unwrap_or_default()
+                .contains("name"));
+        });
+    }
+
+    #[gpui::test]
+    fn a_non_utf8_rename_opens_empty_rather_than_pre_filling_mojibake(cx: &mut TestAppContext) {
+        // The one way the lossy pre-fill could corrupt something: accept on
+        // an untouched field would rename a legal Latin-1 branch to its own
+        // U+FFFD spelling — a different refname. Empty is what honesty
+        // looks like here; the bytes still ride the prompt for whoever
+        // actually types a replacement.
+        let calls = Arc::default();
+        let repo = Arc::new(RecordingRepo::new(Arc::clone(&calls)));
+        let handle: gitten_git::Handle = repo.clone();
+        let shell = shell(None, cx);
+        shell.update(cx, |shell, cx| {
+            let prepared = crate::views::branches::prepare(
+                vec![gitten_core::refs::Branch {
+                    name: gitten_core::refs::RefName::from_bytes(b"f\xe9ature"),
+                    ..branch_ref("unused", false)
+                }],
+                Vec::new(),
+                None,
+                Vec::new(),
+                &gitten_core::theme::Theme::default(),
+                "r",
+            );
+            let view = cx.new(|_| crate::views::branches::Branches::from_prepared(prepared));
+            view.update(cx, |b, _| {
+                b.run_view("view.down", &Rc::new(Host::new())); // onto f<latin1-e>ature
+            });
+            shell.panes.register(
+                "branches",
+                Screen::branches(view, Generation::default(), "branches"),
+            );
+            shell.repo = Some((PathBuf::from("/recorded"), handle.clone()));
+            cx.set_global(config::Active(Rc::new(Host::new())));
+        });
+
+        shell.update(cx, |shell, cx| shell.run_command("branches.rename", cx));
+        let typed = shell.read_with(cx, |shell, _app| shell.input.clone().unwrap());
+        assert_eq!(
+            typed.read_with(cx, |field, _| field.value().to_string()),
+            "",
+            "the mojibake was never offered as if it were the name"
+        );
+
+        // Typing a replacement still aims at the real bytes.
+        typed.update(cx, |field, cx| field.replace(None, "ok", cx));
+        shell.update(cx, |shell, cx| shell.run_command("input.accept", cx));
+        pump_write(&shell, cx);
+        // RecordingRepo logs through from_utf8_lossy; the *bytes* are proven
+        // at the verb layer — here the old side is what matters: it is the
+        // branch that was under the keyboard.
+        assert_eq!(repo.wrote(), vec!["rename f\u{FFFD}ature ok"]);
+    }
+
+    #[gpui::test]
+    fn delete_asks_once_then_acts_and_remote_rows_refuse_outright(cx: &mut TestAppContext) {
+        let (shell, repo, _handle) = branches_shell(cx);
+
+        // First press on feature: asked, in the band, nothing queued.
+        shell.update(cx, |shell, cx| shell.run_command("branches.delete", cx));
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(
+                shell.notice.as_ref().map(Notice::text),
+                Some("delete branch feature? press again to confirm"),
+                "{:?}",
+                shell.notice
+            );
+        });
+        // The production pump runs dry: nothing was ever submitted, and the
+        // drain through the real path is what proves it.
+        pump_until(&shell, cx, |_| true);
+        assert!(repo.wrote().is_empty());
+
+        // Second press on the same row spends the arm.
+        shell.update(cx, |shell, cx| shell.run_command("branches.delete", cx));
+        pump_write(&shell, cx);
+        assert_eq!(repo.wrote(), vec!["delete feature"]);
+        // A remote row refuses before arming — deliberate scope tonight:
+        // a tracking ref is its remote's shadow, pruned by fetch.
+        let (shell, repo, _handle) = branches_shell(cx);
+        onto(&shell, "origin/main", cx);
+        shell.update(cx, |shell, cx| shell.run_command("branches.delete", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(shell
+                .notice
+                .as_deref()
+                .unwrap_or_default()
+                .contains("remote"));
+        });
+        assert!(repo.wrote().is_empty());
+
+        // And a cursor move between presses disarms, exactly as discard does.
+        let (shell, repo, _handle) = branches_shell(cx);
+        shell.update(cx, |shell, cx| shell.run_command("branches.delete", cx)); // arm feature
+        onto(&shell, "main", cx); // move
+        shell.update(cx, |shell, cx| shell.run_command("branches.delete", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(
+                shell
+                    .notice
+                    .as_ref()
+                    .map(Notice::text)
+                    .unwrap_or_default()
+                    .contains("main"),
+                "the question moved to the new row: {:?}",
+                shell.notice
+            );
+        });
+        assert!(repo.wrote().is_empty(), "the stale arm never fired");
+    }
+
+    #[gpui::test]
+    fn branches_focus_reaches_its_registered_pane(cx: &mut TestAppContext) {
+        let (shell, _repo, _handle) = branches_shell(cx);
+        // Registration focused the branches pane; go back to the root first.
+        shell.update(cx, |shell, cx| shell.run_command("pane.prev", cx));
+        shell.read_with(cx, |shell, _| {
+            assert_ne!(shell.active_view_name(), "branches");
+        });
+
+        // Named dispatch — the same path Commands and menus run.
+        shell.update(cx, |shell, cx| shell.run_command("branches.focus", cx));
+        shell.read_with(cx, |shell, app| {
+            assert_eq!(shell.panes.focused_index(), 1);
+            assert_eq!(
+                shell.active_label(app).as_ref(),
+                "r · 2 local · 1 remote",
+                "the label carries the count"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn a_refresh_reanchors_the_keyboard_on_its_branch(cx: &mut TestAppContext) {
+        let (shell, _repo, _handle) = branches_shell(cx);
+        onto(&shell, "feature", cx);
+
+        // A refresh that adds a branch above shifts every row; the keyboard
+        // follows its branch, not its index.
+        shell.update(cx, |shell, cx| {
+            let Some(Screen::Branches { view, .. }) = shell.active() else {
+                panic!("branches pane lost");
+            };
+            view.update(cx, |b, cx| {
+                let prepared = crate::views::branches::prepare(
+                    vec![
+                        branch_ref("aaa", false),
+                        branch_ref("feature", false),
+                        branch_ref("main", true),
+                    ],
+                    Vec::new(),
+                    Some(gitten_core::refs::HeadState::Branch {
+                        name: gitten_core::refs::RefName::from("main"),
+                        commit: None,
+                    }),
+                    Vec::new(),
+                    &gitten_core::theme::Theme::default(),
+                    "",
+                );
+                b.replace_prepared(prepared, &config::host(cx));
+            });
+        });
+
+        shell.read_with(cx, |shell, cx| {
+            let Some(Screen::Branches { view, .. }) = shell.active() else {
+                panic!("branches pane lost");
+            };
+            match view.read(cx).current() {
+                Some(crate::views::branches::Target::Local(name)) => {
+                    assert_eq!(name.as_bytes(), b"feature", "the anchor held");
+                }
+                other => panic!("still on a branch, got {other:?}"),
+            }
+        });
+
+        // And a refresh whose branch vanished clamps instead of lying.
+        shell.update(cx, |shell, cx| {
+            let Some(Screen::Branches { view, .. }) = shell.active() else {
+                panic!("branches pane lost");
+            };
+            view.update(cx, |b, cx| {
+                b.replace_prepared(
+                    crate::views::branches::prepare(
+                        vec![branch_ref("main", true)],
+                        Vec::new(),
+                        None,
+                        Vec::new(),
+                        &gitten_core::theme::Theme::default(),
+                        "",
+                    ),
+                    &config::host(cx),
+                );
+            });
+        });
+        shell.read_with(cx, |shell, cx| {
+            let Some(Screen::Branches { view, .. }) = shell.active() else {
+                panic!("branches pane lost");
+            };
+            assert!(view.read(cx).current().is_some(), "clamped onto a row");
+        });
+    }
+}
+
+#[cfg(test)]
+mod title_tests {
+    use super::{expand_project_path, repo_title, same_project_path, SECTION_MIN_H};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn a_repository_under_home_is_spelled_from_tilde_and_cut_at_its_name() {
+        assert_eq!(
+            repo_title(
+                Path::new("/Users/me/src/plait"),
+                Some(Path::new("/Users/me"))
+            ),
+            ("~/src/".to_string(), "plait".to_string())
+        );
+    }
+
+    #[test]
+    fn a_repository_elsewhere_keeps_its_whole_parent() {
+        assert_eq!(
+            repo_title(Path::new("/srv/git/plait"), Some(Path::new("/Users/me"))),
+            ("/srv/git/".to_string(), "plait".to_string())
+        );
+        assert_eq!(
+            repo_title(Path::new("/srv/git/plait"), None),
+            ("/srv/git/".to_string(), "plait".to_string())
+        );
+    }
+
+    #[test]
+    fn home_itself_and_the_root_still_have_a_bright_half() {
+        assert_eq!(
+            repo_title(Path::new("/Users/me"), Some(Path::new("/Users/me"))),
+            (String::new(), "~".to_string())
+        );
+        assert_eq!(
+            repo_title(Path::new("/"), None),
+            (String::new(), "/".to_string())
+        );
+    }
+
+    #[test]
+    fn one_checkout_spelled_two_ways_is_one_project() {
+        // The temp dir exists, so both spellings canonicalise onto it.
+        let dir = std::env::temp_dir();
+        assert!(same_project_path(&dir, &dir.join(".")));
+        assert!(!same_project_path(
+            &dir,
+            &PathBuf::from("/no-such-project-anywhere")
+        ));
+        // Neither side exists: raw comparison, and still no panic.
+        assert!(same_project_path(
+            Path::new("/no-such-project-anywhere"),
+            Path::new("/no-such-project-anywhere")
+        ));
+        assert!(!same_project_path(
+            Path::new("/no-such-project-anywhere"),
+            Path::new("/no-other-such-project-anywhere")
+        ));
+    }
+
+    #[test]
+    fn a_path_field_absolute_is_taken_as_it_stands() {
+        let current = Path::new("/repo/alpha");
+        assert_eq!(
+            expand_project_path("/repo/beta", current),
+            PathBuf::from("/repo/beta")
+        );
+    }
+
+    #[test]
+    fn a_relative_path_resolves_beside_the_current_repository() {
+        // Projects live beside each other, not under the launch directory.
+        let current = Path::new("/repo/alpha");
+        assert_eq!(
+            expand_project_path("beta", current),
+            PathBuf::from("/repo/beta")
+        );
+        assert_eq!(
+            expand_project_path("  beta  ", current),
+            PathBuf::from("/repo/beta")
+        );
+    }
+
+    #[test]
+    fn tilde_expands_to_home() {
+        let Some(home) = std::env::var_os("HOME") else {
+            return;
+        };
+        assert_eq!(
+            expand_project_path("~/src/beta", Path::new("/repo/alpha")),
+            PathBuf::from(home).join("src/beta")
+        );
+    }
+
+    #[test]
+    fn the_minimum_window_holds_every_sections_floor() {
+        let floors = 4.0 * SECTION_MIN_H + super::TITLE_H + crate::chrome::STATUS_H;
+        let options = super::window_options("test".into());
+        let Some(min) = options.window_min_size else {
+            panic!("the window declares no minimum size");
+        };
+        assert!(min.height >= gpui::px(floors));
+    }
+}

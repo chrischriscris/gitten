@@ -206,6 +206,22 @@ pub fn stage_or_unstage(client: &mut impl FileClient) {
     }
 }
 
+/// The sidebar checkbox's verb: stage the row's remainder, or unstage the row.
+///
+/// A partially staged file occupies two rows — its staged twin and its
+/// unstaged twin — and the checkbox sits on each. The unstaged twin's box
+/// stages the whole path, which stages exactly the remainder: everything else
+/// the path holds is already staged, so a whole-file `stage` and a synthesized
+/// remainder patch land the index in the same state, and the one-job whole-file
+/// verb keeps the single generation bump a patch per hunk would not. A fully
+/// staged row unstages the whole path. That is [`stage_or_unstage`]'s rule read
+/// through twins, and it submits through the same [`Write`] constructors — one
+/// implementation, two doors — so this stays a name for the checkbox's
+/// semantics rather than a second staging path.
+pub fn stage_remainder_or_unstage(client: &mut impl FileClient) {
+    stage_or_unstage(client);
+}
+
 /// `files.stage-all`: act on every path on the cursor's side of the index.
 pub fn stage_all(client: &mut impl FileClient) {
     let staging = client.cursor_section() != Some(FileSection::Staged);
@@ -3269,6 +3285,27 @@ mod tests {
             assert_eq!(client.jobs, [expected]);
             assert!(client.said.is_empty());
         }
+    }
+
+    #[test]
+    fn the_checkbox_verb_stages_remainders_and_unstages_wholes() {
+        // The unstaged twin's box stages the path, which is exactly the
+        // remainder; the staged twin's box unstages it whole.
+        for (section, expected) in [
+            (FileSection::Staged, "unstage file"),
+            (FileSection::Unstaged, "stage file"),
+            (FileSection::Untracked, "stage file"),
+        ] {
+            let mut client = Fake::with(None);
+            client.selected = Some(Fake::file(section, b"file", "file"));
+            stage_remainder_or_unstage(&mut client);
+            assert_eq!(client.jobs, [expected]);
+            assert!(client.said.is_empty());
+        }
+        let mut none = Fake::with(None);
+        stage_remainder_or_unstage(&mut none);
+        assert_eq!(none.said, ["nothing selected to stage"]);
+        assert!(none.jobs.is_empty());
     }
 
     #[test]

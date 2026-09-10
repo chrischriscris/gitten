@@ -7,7 +7,7 @@
 //!
 //! It lives here rather than in `core` for one reason: reading a file is I/O,
 //! and `core` does none — the same rule that makes `gitten-git` its own crate.
-//! It lived in `gitten-shell` until there were three clients, at which point the
+//! It lived in `gitten-gui` until there were three clients, at which point the
 //! window was the only one that could read the file, which is not a property a
 //! config format should have.
 //!
@@ -218,7 +218,7 @@ pub fn apply(host: &mut Host, text: &str) -> Vec<String> {
     };
 
     if let Some(font) = doc.get("font") {
-        apply_font(&mut host.font, font, &mut warn);
+        apply_font(&mut host.font, &mut host.chrome_family, font, &mut warn);
     }
     if let Some(theme) = doc.get("theme") {
         apply_theme(host, theme, &mut warn);
@@ -478,7 +478,12 @@ fn apply_diff(host: &mut Host, value: &toml::Value, warn: &mut Vec<String>) {
     }
 }
 
-fn apply_font(font: &mut Font, value: &toml::Value, warn: &mut Vec<String>) {
+fn apply_font(
+    font: &mut Font,
+    chrome_family: &mut String,
+    value: &toml::Value,
+    warn: &mut Vec<String>,
+) {
     let Some(t) = value.as_table() else {
         warn.push("config: [font] is not a table".into());
         return;
@@ -515,6 +520,13 @@ fn apply_font(font: &mut Font, value: &toml::Value, warn: &mut Vec<String>) {
                     }
                 }
                 None => warn.push("config: font.monospaced must be true or false".into()),
+            },
+            // The chrome face is a name only, never measured: sidebar,
+            // inspector, toolbar and headers draw in it while diff rows
+            // keep `family`. An empty value keeps the shipped default.
+            "chrome_family" => match v.as_str() {
+                Some(s) if !s.trim().is_empty() => *chrome_family = s.to_string(),
+                _ => warn.push("config: font.chrome_family must be a non-empty string".into()),
             },
             other => warn.push(format!("config: unknown key font.{other}")),
         }
@@ -557,7 +569,12 @@ fn apply_theme(host: &mut Host, value: &toml::Value, warn: &mut Vec<String>) {
                         host.themes.names().join(", ")
                     ));
                 }
+                // A palette defined here has no house label, so the picker
+                // reads the name it was given rather than the one it was
+                // built on top of.
                 host.theme.name = name.to_string();
+                host.theme.label = name.to_string();
+                host.theme.family.clear();
             }
             None => warn.push("config: theme.name must be a string".into()),
         }
@@ -567,6 +584,16 @@ fn apply_theme(host: &mut Host, value: &toml::Value, warn: &mut Vec<String>) {
         match key.as_str() {
             // Read above, before anything it is the base for.
             "name" => {}
+            // Display metadata, and the only strings in this table: a picker
+            // reads them, and a palette renamed here keeps its own words.
+            "label" => match v.as_str() {
+                Some(s) => theme.label = s.to_string(),
+                None => warn.push("config: theme.label must be a string".into()),
+            },
+            "family" => match v.as_str() {
+                Some(s) => theme.family = s.to_string(),
+                None => warn.push("config: theme.family must be a string".into()),
+            },
             "min_contrast" => match number(v) {
                 // 1.0 is "no floor at all", 21.0 is black on white. Outside that
                 // the contrast resolver has nothing to aim at.
@@ -723,7 +750,10 @@ pub fn dump(host: &Host) -> String {
     out.push_str(&format!("size = {:?}\n", f.size));
     out.push_str("# Both of these apply on the next launch, not on save.\n");
     out.push_str(&format!("monospaced = {}\n", f.monospaced));
-    out.push_str(&format!("advance = {:?}\n\n", f.advance));
+    out.push_str(&format!("advance = {:?}\n", f.advance));
+    out.push_str("# The window chrome's face (sidebar, inspector, toolbar, headers).\n");
+    out.push_str("# A name only, never measured: diff rows keep `family` whatever this says.\n");
+    out.push_str(&format!("chrome_family = {:?}\n\n", host.chrome_family));
 
     out.push_str("# All of these apply on the next launch. The first five decide what the\n");
     out.push_str("# diff *is* and are read before a window exists; the last two are how it\n");
@@ -795,6 +825,8 @@ pub fn dump(host: &Host) -> String {
         t.name,
         host.themes.names().join(", ")
     ));
+    out.push_str(&format!("label = {:?}\n", t.label));
+    out.push_str(&format!("family = {:?}\n", t.family));
     out.push_str(&format!("min_contrast = {:?}\n", t.min_contrast));
     out.push_str(&format!("min_furniture = {:?}\n", t.min_furniture));
     out.push_str(&format!("lanes = [{}]\n", hex_list(&t.lanes)));
@@ -1166,6 +1198,24 @@ mod tests {
     }
 
     #[test]
+    fn the_workspace_doors_are_bindable_from_the_config_file() {
+        use gitten_core::command::{Key, Modes, Resolve};
+        let mut h = host();
+        let warn = apply(
+            &mut h,
+            "[keys]\n\"W\" = \"workspace.changes\"\n\"H\" = \"workspace.history\"\n",
+        );
+        assert!(warn.is_empty(), "{warn:?}");
+        assert!(h.commands.known("workspace.changes"));
+        assert!(h.commands.known("workspace.history"));
+        assert!(h.commands.known("workspace.preview"));
+        assert_eq!(
+            h.keys.resolve(&Modes::new(), &[Key::char('W')]),
+            Resolve::Run("workspace.changes")
+        );
+    }
+
+    #[test]
     fn a_key_can_be_unbound_and_not_only_moved() {
         use gitten_core::command::{Key, Modes, Resolve};
         let mut h = host();
@@ -1284,26 +1334,22 @@ mod tests {
 
     #[test]
     fn a_theme_written_in_the_file_is_registered_under_its_name() {
-        // Which is what puts it in the picker beside the shipped seven: the
+        // Which is what puts it in the picker beside the shipped set: the
         // frontend lists a registry, so a palette somebody wrote by hand has to
         // be *in* one to be reachable at all.
         let mut h = host();
         let text = "[theme]\nname = \"solarized-ish\"\n\n[theme.diff]\nadded_bg = \"#073642\"\n";
         let warn = apply(&mut h, text);
         assert!(warn.is_empty(), "{warn:?}");
-        assert_eq!(
-            h.themes.names(),
-            vec![
-                "dark",
-                "light",
-                "slate",
-                "gruvbox",
-                "catppuccin",
-                "tokyo-night",
-                "rose-pine",
-                "solarized-ish"
-            ]
-        );
+        let builtin = gitten_core::theme::Themes::builtin();
+        let mut expected = builtin.names();
+        expected.push("solarized-ish");
+        assert_eq!(h.themes.names(), expected);
+        // A hand-written palette has no house label; the picker reads the
+        // name rather than the theme it was built on top of.
+        let mine = h.themes.get("solarized-ish").unwrap();
+        assert_eq!(mine.label, "solarized-ish");
+        assert!(mine.family.is_empty());
         assert_eq!(
             h.themes.get("solarized-ish").map(|t| t.diff.added_bg),
             Some(0x073642)
@@ -1323,16 +1369,8 @@ mod tests {
         assert!(warn.is_empty(), "{warn:?}");
         assert_eq!(
             h.themes.names(),
-            vec![
-                "dark",
-                "light",
-                "slate",
-                "gruvbox",
-                "catppuccin",
-                "tokyo-night",
-                "rose-pine"
-            ],
-            "an eighth entry appeared"
+            gitten_core::theme::Themes::builtin().names(),
+            "correcting a built-in added an entry"
         );
         assert_eq!(
             h.themes.get("slate").map(|t| t.chrome.accent),
@@ -1604,6 +1642,7 @@ mod tests {
             monospaced: true,
             advance: 0.5,
         };
+        original.chrome_family = "Iosevka Aile".into();
         original.differ.select("patience");
         original.differ.context = 5;
         original.differ.whitespace = Whitespace::Change;
@@ -1630,6 +1669,10 @@ mod tests {
             "theme did not survive:\n{text}"
         );
         assert_eq!(restored.font, original.font, "font did not survive");
+        assert_eq!(
+            restored.chrome_family, original.chrome_family,
+            "font.chrome_family did not survive"
+        );
         assert_eq!(
             restored.differ.selected(),
             "patience",

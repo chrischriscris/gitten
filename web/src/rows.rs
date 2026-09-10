@@ -2,9 +2,10 @@
 //!
 //! Nearly nothing, and deliberately: the flattening, the break table, the
 //! reflow and the mapping from a visual row back to a line are all
-//! [`gitten_core::rows`], because a browser needing the same row *index space*
-//! as the window is the whole reason that module exists. What is left here is
-//! the pair of durations a stats readout wants and a name to hold it all under.
+//! [`gitten_core::rows`], because a second client needing the same row *index
+//! space* as the window is the whole reason that module exists. What is left
+//! here is the pair of durations a stats readout wants and a name to hold it
+//! all under.
 //!
 //! The one thing this door has an opinion about is which of `core`'s two
 //! mappings it holds — [`Visual`], the prefix sum, rather than the order table
@@ -12,7 +13,7 @@
 //! one binary search to find its start; see [`gitten_core::rows::Visual`] for
 //! why that is the seam rather than a second implementation.
 //!
-//! What the browser is left with is drawing, which is the whole point of
+//! What a client is left with is drawing, which is the whole point of
 //! [`gitten_core::prepared`] — see its module docs.
 
 use gitten_core::prepared::Prepared;

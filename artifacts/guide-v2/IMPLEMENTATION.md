@@ -25,7 +25,7 @@ The app occupies its full viewport: no page header, marketing text, guide annota
 
 ## Interaction contract
 
-1. Changes is the default destination. History is a separate destination; it does not consume space in the normal changes workspace.
+1. Changes is the default destination. History is a separate destination; it does not consume space in the normal changes workspace. The History timeline draws the same multi-lane commit graph as the commits list — branches fork and merge in its gutter rather than collapsing to a single rail — beside the selected commit's diff.
 2. Files are grouped by directory. Directory labels appear once; each compact row has a leading stage checkbox, selectable filename, and trailing status. A mixed checkbox and hunk fraction represent partial staging. The reference's group chevrons are decorative; collapsing groups is not implemented here.
 3. Selecting a file changes the diff only. Staging is a separate action. A click on a partially staged file's checkbox stages the remaining hunks; a fully staged checkbox unstages the file.
 4. Hunk actions and file actions update the same index state. The right inspector lists staged files with paths and staged/total hunk counts.

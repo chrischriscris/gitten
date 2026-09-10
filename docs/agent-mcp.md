@@ -59,7 +59,7 @@ available second.
 
 `tools/mcp/` is not a workspace member and holds no Rust. Everything arrives
 through subprocesses — the same `dump` example `./dev dump` prints, the same
-loopback routes a browser reads. That is deliberate: it proves rule 1 from the
+loopback routes an agent reads. That is deliberate: it proves rule 1 from the
 outside. Anything a built-in does, an extension must be able to do too — and
-here is the extension, written without touching `core/`, `shell/`, `web/src`,
+here is the extension, written without touching `core/`, `gui/`, `web/src`,
 `tui/`, or the workspace manifest.

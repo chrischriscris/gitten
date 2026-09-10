@@ -257,6 +257,16 @@ pub struct ChromePalette {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Theme {
     pub name: String,
+    /// What a picker calls this theme. The name is the identity a config file
+    /// and a keymap use; the label is the words a person reads, so the two are
+    /// separate — `github-dark` is not a label anybody wants in a menu.
+    ///
+    /// Empty for a palette defined in `gitten.toml`, which the picker falls
+    /// back to [`name`](Self::name) for.
+    pub label: String,
+    /// The family a picker groups the theme under — `GitHub`, `JetBrains`,
+    /// `Catppuccin`. Empty when a palette has no house, which is most of them.
+    pub family: String,
     /// Contrast floor for token text against whatever it is drawn on, as a WCAG
     /// 2.1 ratio. 4.5 is the standard for body text; a diff wants its comments to
     /// recede, so the shipped themes sit at 3.5 — legible, still quiet. A colour
@@ -314,6 +324,55 @@ impl Default for Theme {
     }
 }
 
+/// One guide-v2 palette, exactly as the reference defines it.
+///
+/// The reference names a theme with these twenty-two colours and no more; see
+/// [`Theme::from_guide`] for the one place they become a [`Theme`]. A palette
+/// is data, so adding one is a function that fills this in and one line in
+/// [`Themes::builtin`].
+#[derive(Debug, Clone, Copy)]
+pub struct GuidePalette {
+    pub name: &'static str,
+    pub label: &'static str,
+    pub family: &'static str,
+    /// The window's main ground — the diff, the inspector, the sidebar and the
+    /// modal fill. The reference tints its sidebar a hair off the surface; the
+    /// desktop's sidebar is the surface, so that tint is not carried.
+    pub surface: Rgb,
+    /// The title strip and the status bar.
+    pub toolbar: Rgb,
+    /// A chip or pill one step above the strip it sits on.
+    pub raised: Rgb,
+    /// Every hairline.
+    pub line: Rgb,
+    /// Primary text.
+    pub text: Rgb,
+    /// Secondary text, placeholders and the hunk marker.
+    pub muted: Rgb,
+    /// Selection ink and the primary action's fill.
+    pub accent: Rgb,
+    /// The row the keyboard is on.
+    pub selected: Rgb,
+    /// Unchanged diff text.
+    pub code: Rgb,
+    /// An added line's background.
+    pub add: Rgb,
+    /// A removed line's background.
+    pub del: Rgb,
+    /// Added text, and the `+` counts.
+    pub green: Rgb,
+    /// Removed text, and the `−` counts.
+    pub red: Rgb,
+    /// The third signal colour: constants, numbers, warnings.
+    pub warn: Rgb,
+    /// The hunk header's band.
+    pub hunk: Rgb,
+    /// Line numbers.
+    pub gutter: Rgb,
+    /// The one token colour the reference highlights with.
+    pub syntax: Rgb,
+}
+
 impl Theme {
     /// The warm, low-contrast dark theme the app opens in. Desaturated on
     /// purpose: the add/remove background already says a line changed, so
@@ -337,6 +396,8 @@ impl Theme {
 
         Self {
             name: "dark".into(),
+            label: "Dark".into(),
+            family: "gitten".into(),
             min_contrast: 3.5,
             min_furniture: 3.0,
             syntax,
@@ -441,6 +502,8 @@ impl Theme {
 
         Self {
             name: "light".into(),
+            label: "Light".into(),
+            family: "gitten".into(),
             min_contrast: 3.5,
             min_furniture: 3.0,
             syntax,
@@ -529,6 +592,8 @@ impl Theme {
 
         Self {
             name: "slate".into(),
+            label: "Slate".into(),
+            family: "gitten".into(),
             min_contrast: 3.5,
             min_furniture: 3.0,
             syntax,
@@ -612,6 +677,8 @@ impl Theme {
 
         Self {
             name: "gruvbox".into(),
+            label: "Gruvbox".into(),
+            family: "gitten".into(),
             min_contrast: 3.5,
             min_furniture: 3.0,
             syntax,
@@ -691,7 +758,9 @@ impl Theme {
         set(Link, Style::fg(0x74c7ec));
 
         Self {
-            name: "catppuccin".into(),
+            name: "catppuccin-mocha".into(),
+            label: "Catppuccin Mocha".into(),
+            family: "Catppuccin".into(),
             min_contrast: 3.5,
             min_furniture: 3.0,
             syntax,
@@ -774,6 +843,8 @@ impl Theme {
 
         Self {
             name: "tokyo-night".into(),
+            label: "Tokyo Night".into(),
+            family: "gitten".into(),
             min_contrast: 3.5,
             min_furniture: 3.0,
             syntax,
@@ -854,6 +925,8 @@ impl Theme {
 
         Self {
             name: "rose-pine".into(),
+            label: "Rosé Pine".into(),
+            family: "gitten".into(),
             min_contrast: 3.5,
             min_furniture: 3.0,
             syntax,
@@ -908,6 +981,545 @@ impl Theme {
             dim: [0; Surface::COUNT],
         }
         .rebuilt()
+    }
+
+    /// The guide-v2 workspace on paper: subdued neutral surfaces, green
+    /// selection, teal accent.
+    ///
+    /// Built like [`Theme::light`] — what carries across is the *ratios*, not
+    /// the hues. The guide reference names its own hexes
+    /// (`artifacts/guide-v2/src/style.css`: `--surface #fff`,
+    /// `--sidebar #f5f5f3`, `--toolbar #fafaf9`, `--line #e5e7e6`,
+    /// `--text #282d31`, `--muted #737b7e`, `--accent #216e61`,
+    /// `--selected #e3eee9`, `--add #edf6ee`, `--del #fbefed`,
+    /// `--hunk #f5f7f8`); those are design targets, and every value below is
+    /// the nearest colour that also clears the floors — `min_contrast` 3.5
+    /// for text, `min_furniture` 3.0 — via `readable()` on all 11 surfaces.
+    /// The token hues are light()'s, proven on paper: the reference specifies
+    /// chrome and diff grounds but no syntax palette, and inventing eleven
+    /// unmeasured token colours is how a theme ships illegible.
+    ///
+    /// Two deliberate carries from the reference:
+    ///
+    /// - **Green selection.** `selection_bg` is the guide's `--selected`
+    ///   `#e3eee9` — the keyboard row reads green, which is the workspace's
+    ///   signature. Mouse-selected *text* keeps a cool blue
+    ///   (`selected_bg`), because a green wash over green added rows would
+    ///   erase what the row says about itself.
+    /// - **Teal accent.** `--accent #216e61` clears the text floor raw on
+    ///   every chrome ground including the green selection, so branch and
+    ///   status ink needs no lifting.
+    pub fn guide() -> Self {
+        use Kind::*;
+        let mut syntax = [Style::fg(0x3a4045); Kind::COUNT];
+        let mut set = |k: Kind, s: Style| syntax[k.index()] = s;
+        set(Comment, Style::fg(0x8a9294).italic());
+        set(Str, Style::fg(0x26662f));
+        set(Number, Style::fg(0x814e0c));
+        set(Keyword, Style::fg(0x1f5f55));
+        set(Type, Style::fg(0x245e87));
+        set(Constant, Style::fg(0x754c16));
+        set(Func, Style::fg(0x644c0e));
+        set(Property, Style::fg(0x514c44));
+        set(Heading, Style::fg(0x282d31).bold());
+        set(Strong, Style::fg(0x33383c).bold());
+        set(Emphasis, Style::fg(0x3f4448).italic());
+        set(Link, Style::fg(0x245e87));
+
+        Self {
+            name: "guide".into(),
+            label: "Guide".into(),
+            family: "gitten".into(),
+            min_contrast: 3.5,
+            min_furniture: 3.0,
+            syntax,
+            diff: DiffPalette {
+                file_bg: 0xececea,
+                file_fg: 0x282d31,
+                adds_fg: 0x367448,
+                dels_fg: 0xa84d45,
+                hunk_bg: 0xf5f7f8,
+                hunk_fg: 0x5a6b70,
+                gutter_fg: 0xb9bcba,
+                rule: 0xe5e7e6,
+                context_bg: 0xffffff,
+                context_fg: 0x3a4045,
+                added_bg: 0xedf6ee,
+                added_fg: 0x1f5233,
+                // Double the line tint's step, like every shipped theme:
+                // the line says "changed", the word says "here".
+                added_word_bg: 0xc4e2c9,
+                removed_bg: 0xfbefed,
+                removed_fg: 0x7e322b,
+                removed_word_bg: 0xf2d2cd,
+                // Lavender, for light()'s reason: the two hues a diff owns
+                // are green and red, and a moved block must recede from both.
+                moved_removed_bg: 0xe9e6ed,
+                moved_added_bg: 0xdcdaea,
+                absent_bg: 0xd8d8d4,
+            },
+            markdown: MarkdownPalette {
+                code_bar: 0xd5d8d5,
+                quote_bar: 0x4d8a7d,
+                marker: 0x737b7e,
+                rule: 0xe0e2e0,
+            },
+            chrome: ChromePalette {
+                bg: 0xf5f5f3,
+                fg: 0x282d31,
+                dim: 0x737b7e,
+                faint: 0xb9bcba,
+                accent: 0x216e61,
+                title_bg: 0xfafaf9,
+                status_bg: 0xf6f6f4,
+                border: 0xe5e7e6,
+                // Raised goes *darker* on paper — elevation on a light
+                // ground is a shadow, not a shine.
+                raised: 0xececea,
+                keycap: 0xe0e0dc,
+                selection_bg: 0xe3eee9,
+                selected_bg: 0xaec6e6,
+                error: 0xa84d45,
+            },
+            lanes: vec![0x1f5f55, 0x2c709f, 0x7e5aaa, 0x29776e, 0xa6533b, 0x57732c],
+            lane_overflow: 0xbbb7b0,
+            authors: vec![0x8a7040, 0x577891, 0x816b99, 0x447e73, 0x95695b, 0x6a7a40],
+            resolved: Vec::new(),
+            gutter: [0; Surface::COUNT],
+            marker: [0; Surface::COUNT],
+            dim: [0; Surface::COUNT],
+        }
+        .rebuilt()
+    }
+
+    /// A theme from one guide-v2 palette.
+    ///
+    /// The reference (`artifacts/guide-v2`) defines a theme as a flat table of
+    /// CSS variables and nothing else. [`GuidePalette`] is that table as `core`
+    /// data; this is the one mapping onto the desktop's richer [`Theme`], so a
+    /// palette is added by writing twenty-two colours rather than by copying the
+    /// derivation below.
+    ///
+    /// The chrome and diff surfaces are the reference's own hexes. Everything
+    /// the reference does not name — the word-level row tints, the moved blocks,
+    /// the absent half of a split row, the resolved syntax and dim tables — is
+    /// derived here with the same ratios the hand-built themes use, because a
+    /// theme that only a browser can read is a theme the window cannot open.
+    pub fn from_guide(p: GuidePalette) -> Self {
+        use Kind::*;
+        let dark = luminance(p.surface) < 0.35;
+        let toward = match dark {
+            true => 0xffffff,
+            false => 0x000000,
+        };
+        // One step off the ground, in the direction elevation goes: lighter on
+        // a dark theme, darker on paper.
+        let step = |from: Rgb, t: f32| mix(from, toward, t);
+
+        // The chrome inks the contrast floors are measured on. Resolving here
+        // — rather than at every render — keeps a palette's raw accent from
+        // shipping illegible on its own selection wash.
+        let chrome_bgs = [p.surface, p.toolbar, p.toolbar, p.selected];
+        let clear = |c: Rgb| chrome_bgs.iter().fold(c, |c, bg| readable(c, *bg, 3.5));
+        let fg = clear(p.text);
+        let accent = clear(p.accent);
+        let error = clear(p.red);
+
+        // A palette may legitimately use pure black ink (VS Code Light+, IntelliJ
+        // Light). `Style::fg(0)` is also what an unset entry looks like, so the
+        // one-bit nudge keeps the "every class was assigned" sentinel honest
+        // without a visible change.
+        let ink = |c: Rgb| c.max(1);
+        let mut syntax = [Style::fg(ink(p.code)); Kind::COUNT];
+        let mut set = |k: Kind, s: Style| syntax[k.index()] = s;
+        set(Comment, Style::fg(ink(p.muted)).italic());
+        set(Str, Style::fg(ink(p.green)));
+        set(Number, Style::fg(ink(p.warn)));
+        set(Keyword, Style::fg(ink(p.syntax)));
+        set(Type, Style::fg(ink(p.accent)));
+        set(Constant, Style::fg(ink(p.warn)));
+        set(Func, Style::fg(ink(p.accent)));
+        set(Property, Style::fg(ink(p.code)));
+        set(Heading, Style::fg(ink(p.text)).bold());
+        set(Strong, Style::fg(ink(p.text)).bold());
+        set(Emphasis, Style::fg(ink(p.code)).italic());
+        set(Link, Style::fg(ink(p.accent)));
+
+        // The word tint is roughly double the line tint's step, the same
+        // reading-vs-glancing split every hand-built theme keeps.
+        let added_word_bg = mix(p.add, p.green, 0.22);
+        let removed_word_bg = mix(p.del, p.red, 0.22);
+        let moved_removed_bg = mix(p.surface, p.accent, 0.10);
+        let moved_added_bg = mix(p.surface, p.accent, 0.16);
+        let absent_bg = step(
+            p.surface,
+            match dark {
+                true => 0.45,
+                false => 0.15,
+            },
+        );
+        let added_fg = readable(readable(p.green, p.add, 3.5), moved_added_bg, 3.5);
+        let removed_fg = readable(readable(p.red, p.del, 3.5), moved_removed_bg, 3.5);
+        let context_fg = readable(p.code, p.surface, 3.5);
+
+        Self {
+            name: p.name.into(),
+            label: p.label.into(),
+            family: p.family.into(),
+            min_contrast: 3.5,
+            min_furniture: 3.0,
+            syntax,
+            diff: DiffPalette {
+                file_bg: step(p.surface, 0.10),
+                file_fg: p.text,
+                adds_fg: p.green,
+                dels_fg: p.red,
+                hunk_bg: p.hunk,
+                hunk_fg: p.muted,
+                gutter_fg: p.gutter,
+                rule: p.line,
+                context_bg: p.surface,
+                context_fg,
+                added_bg: p.add,
+                added_fg,
+                added_word_bg,
+                removed_bg: p.del,
+                removed_fg,
+                removed_word_bg,
+                moved_removed_bg,
+                moved_added_bg,
+                absent_bg,
+            },
+            markdown: MarkdownPalette {
+                code_bar: p.line,
+                quote_bar: p.accent,
+                marker: p.muted,
+                rule: p.line,
+            },
+            chrome: ChromePalette {
+                bg: p.surface,
+                fg,
+                dim: p.muted,
+                faint: p.gutter,
+                accent,
+                title_bg: p.toolbar,
+                status_bg: p.toolbar,
+                border: p.line,
+                raised: p.raised,
+                keycap: mix(p.raised, p.line, 0.5),
+                selection_bg: p.selected,
+                selected_bg: mix(p.surface, p.accent, 0.30),
+                error,
+            },
+            lanes: vec![
+                p.accent,
+                p.green,
+                p.warn,
+                p.syntax,
+                p.red,
+                mix(p.accent, p.green, 0.5),
+            ],
+            lane_overflow: p.gutter,
+            authors: vec![
+                mix(p.text, p.surface, 0.35),
+                mix(p.accent, p.surface, 0.35),
+                mix(p.green, p.surface, 0.35),
+                mix(p.red, p.surface, 0.35),
+                mix(p.warn, p.surface, 0.35),
+                mix(p.syntax, p.surface, 0.35),
+            ],
+            resolved: Vec::new(),
+            gutter: [0; Surface::COUNT],
+            marker: [0; Surface::COUNT],
+            dim: [0; Surface::COUNT],
+        }
+        .rebuilt()
+    }
+
+    /// Vercel's Geist dark: true black ground, blue accent, magenta syntax.
+    pub fn vercel() -> Self {
+        Self::from_guide(GuidePalette {
+            name: "vercel",
+            label: "Vercel",
+            family: "Geist",
+            surface: 0x0b0b0b,
+            toolbar: 0x0a0a0a,
+            raised: 0x1a1a1a,
+            line: 0x2a2a2a,
+            text: 0xededed,
+            muted: 0x888888,
+            accent: 0x3b82f6,
+            selected: 0x0d2847,
+            code: 0xd4d4d4,
+            add: 0x0e2318,
+            del: 0x2a1414,
+            green: 0x4ade80,
+            red: 0xf87171,
+            warn: 0xf5a623,
+            hunk: 0x131313,
+            gutter: 0x666666,
+            syntax: 0xff0080,
+        })
+    }
+
+    /// Dracula Pro: the plum-and-violet house palette.
+    pub fn dracula_pro() -> Self {
+        Self::from_guide(GuidePalette {
+            name: "dracula-pro",
+            label: "Dracula Pro",
+            family: "Dracula",
+            surface: 0x282a36,
+            toolbar: 0x21222c,
+            raised: 0x343746,
+            line: 0x44475a,
+            text: 0xf8f8f2,
+            muted: 0xa8b0d6,
+            accent: 0xbd93f9,
+            selected: 0x44475a,
+            code: 0xf8f8f2,
+            add: 0x2d4a34,
+            del: 0x4a2a34,
+            green: 0x50fa7b,
+            red: 0xff5555,
+            warn: 0xf1fa8c,
+            hunk: 0x21222c,
+            gutter: 0x7c88b8,
+            syntax: 0xff79c6,
+        })
+    }
+
+    /// Catppuccin Latte: Mocha's cool palette on paper.
+    pub fn catppuccin_latte() -> Self {
+        Self::from_guide(GuidePalette {
+            name: "catppuccin-latte",
+            label: "Catppuccin Latte",
+            family: "Catppuccin",
+            surface: 0xeff1f5,
+            toolbar: 0xe6e9ef,
+            raised: 0xccd0da,
+            line: 0xbcc0cc,
+            text: 0x4c4f69,
+            muted: 0x6c6f85,
+            accent: 0x8839ef,
+            selected: 0xdce0e8,
+            code: 0x4c4f69,
+            add: 0xd8ead9,
+            del: 0xf3d9dd,
+            green: 0x2e7d1f,
+            red: 0xd20f39,
+            warn: 0xb06e00,
+            hunk: 0xe6e9ef,
+            gutter: 0x7c7f93,
+            syntax: 0x8839ef,
+        })
+    }
+
+    /// GitHub Dark: GitHub's own night palette.
+    pub fn github_dark() -> Self {
+        Self::from_guide(GuidePalette {
+            name: "github-dark",
+            label: "GitHub Dark",
+            family: "GitHub",
+            surface: 0x0d1117,
+            toolbar: 0x161b22,
+            raised: 0x21262d,
+            line: 0x30363d,
+            text: 0xe6edf3,
+            muted: 0x8b949e,
+            accent: 0x58a6ff,
+            selected: 0x1f3a5f,
+            code: 0xc9d1d9,
+            add: 0x12261e,
+            del: 0x25171c,
+            green: 0x3fb950,
+            red: 0xf85149,
+            warn: 0xd29922,
+            hunk: 0x161b22,
+            gutter: 0x6e7681,
+            syntax: 0xff7b72,
+        })
+    }
+
+    /// GitHub Light: GitHub's own daylight palette.
+    pub fn github_light() -> Self {
+        Self::from_guide(GuidePalette {
+            name: "github-light",
+            label: "GitHub Light",
+            family: "GitHub",
+            surface: 0xffffff,
+            toolbar: 0xf6f8fa,
+            raised: 0xeaeef2,
+            line: 0xd0d7de,
+            text: 0x1f2328,
+            muted: 0x656d76,
+            accent: 0x0969da,
+            selected: 0xddf4ff,
+            code: 0x1f2328,
+            add: 0xe6ffec,
+            del: 0xffebe9,
+            green: 0x1a7f37,
+            red: 0xcf222e,
+            warn: 0x9a6700,
+            hunk: 0xf6f8fa,
+            gutter: 0x8c959f,
+            syntax: 0xcf222e,
+        })
+    }
+
+    /// Bitbucket Dark: Atlassian's blue-on-charcoal palette.
+    pub fn bitbucket_dark() -> Self {
+        Self::from_guide(GuidePalette {
+            name: "bitbucket-dark",
+            label: "Bitbucket Dark",
+            family: "Atlassian",
+            surface: 0x161a1d,
+            toolbar: 0x1d2125,
+            raised: 0x22272b,
+            line: 0x38414a,
+            text: 0xb6c2cf,
+            muted: 0x9fadbc,
+            accent: 0x579dff,
+            selected: 0x1c2b41,
+            code: 0xb6c2cf,
+            add: 0x1c3329,
+            del: 0x42271d,
+            green: 0x7ee787,
+            red: 0xf87168,
+            warn: 0xf5cd47,
+            hunk: 0x1d2125,
+            gutter: 0x738496,
+            syntax: 0x579dff,
+        })
+    }
+
+    /// Bitbucket Light: Atlassian's blue-on-paper palette.
+    pub fn bitbucket_light() -> Self {
+        Self::from_guide(GuidePalette {
+            name: "bitbucket-light",
+            label: "Bitbucket Light",
+            family: "Atlassian",
+            surface: 0xffffff,
+            toolbar: 0xf7f8f9,
+            raised: 0xf1f2f4,
+            line: 0xdfe1e6,
+            text: 0x172b4d,
+            muted: 0x626f86,
+            accent: 0x0052cc,
+            selected: 0xe9f2ff,
+            code: 0x172b4d,
+            add: 0xe3fcef,
+            del: 0xffedeb,
+            green: 0x1a7f52,
+            red: 0xc9372c,
+            warn: 0xb38600,
+            hunk: 0xf7f8f9,
+            gutter: 0x8590a2,
+            syntax: 0x0052cc,
+        })
+    }
+
+    /// VS Code Dark+: the editor's own night palette.
+    pub fn vscode_dark() -> Self {
+        Self::from_guide(GuidePalette {
+            name: "vscode-dark",
+            label: "VS Code Dark+",
+            family: "Visual Studio Code",
+            surface: 0x1e1e1e,
+            toolbar: 0x333333,
+            raised: 0x2d2d30,
+            line: 0x3c3c3c,
+            text: 0xd4d4d4,
+            muted: 0x858585,
+            accent: 0x569cd6,
+            selected: 0x1a3557,
+            code: 0xd4d4d4,
+            add: 0x203021,
+            del: 0x3a2121,
+            green: 0x89d185,
+            red: 0xf14c4c,
+            warn: 0xdcdcaa,
+            hunk: 0x252526,
+            gutter: 0x858585,
+            syntax: 0x569cd6,
+        })
+    }
+
+    /// VS Code Light+: the editor's own daylight palette.
+    pub fn vscode_light() -> Self {
+        Self::from_guide(GuidePalette {
+            name: "vscode-light",
+            label: "VS Code Light+",
+            family: "Visual Studio Code",
+            surface: 0xffffff,
+            toolbar: 0xe7e7e7,
+            raised: 0xe8e8e8,
+            line: 0xe5e5e5,
+            text: 0x000000,
+            muted: 0x6a6a6a,
+            accent: 0x005fb8,
+            selected: 0xadd6ff,
+            code: 0x000000,
+            add: 0xe6ffed,
+            del: 0xffeef0,
+            green: 0x008000,
+            red: 0xe51400,
+            warn: 0x795e26,
+            hunk: 0xf3f3f3,
+            gutter: 0x6a6a6a,
+            syntax: 0x0000ff,
+        })
+    }
+
+    /// IntelliJ Darcula: JetBrains' dark editor palette.
+    pub fn intellij_darcula() -> Self {
+        Self::from_guide(GuidePalette {
+            name: "intellij-darcula",
+            label: "IntelliJ Darcula",
+            family: "JetBrains",
+            surface: 0x2b2b2b,
+            toolbar: 0x3c3f41,
+            raised: 0x3c3f41,
+            line: 0x323232,
+            text: 0xa9b7c6,
+            muted: 0x808080,
+            accent: 0x6ba7e0,
+            selected: 0x214283,
+            code: 0xa9b7c6,
+            add: 0x2f4032,
+            del: 0x40292c,
+            green: 0x8fbc6f,
+            red: 0xe06c68,
+            warn: 0xcc7832,
+            hunk: 0x313335,
+            gutter: 0x7a7d7f,
+            syntax: 0xcc7832,
+        })
+    }
+
+    /// IntelliJ Light: JetBrains' daylight editor palette.
+    pub fn intellij_light() -> Self {
+        Self::from_guide(GuidePalette {
+            name: "intellij-light",
+            label: "IntelliJ Light",
+            family: "JetBrains",
+            surface: 0xffffff,
+            toolbar: 0xebebeb,
+            raised: 0xe6e6e6,
+            line: 0xd1d1d1,
+            text: 0x000000,
+            muted: 0x808080,
+            accent: 0x2f6fa8,
+            selected: 0xa6d2ff,
+            code: 0x000000,
+            add: 0xe6ffec,
+            del: 0xffecec,
+            green: 0x008000,
+            red: 0xd00000,
+            warn: 0x9e880d,
+            hunk: 0xf2f2f2,
+            gutter: 0x909090,
+            syntax: 0x0033b3,
+        })
     }
 
     /// Recompute the resolved table. Required after changing `syntax`, `diff` or
@@ -1091,7 +1703,9 @@ impl Default for Themes {
 }
 
 impl Themes {
-    /// The seven shipped palettes, in the order a picker shows them.
+    /// The shipped palettes, in the order a picker shows them: gitten's own
+    /// hand-tuned set first, then the guide-v2 reference's, which is the design
+    /// the window was built to.
     pub fn builtin() -> Self {
         Self(vec![
             Theme::dark(),
@@ -1101,6 +1715,18 @@ impl Themes {
             Theme::catppuccin(),
             Theme::tokyo_night(),
             Theme::rose_pine(),
+            Theme::guide(),
+            Theme::vercel(),
+            Theme::dracula_pro(),
+            Theme::catppuccin_latte(),
+            Theme::github_dark(),
+            Theme::github_light(),
+            Theme::bitbucket_dark(),
+            Theme::bitbucket_light(),
+            Theme::vscode_dark(),
+            Theme::vscode_light(),
+            Theme::intellij_darcula(),
+            Theme::intellij_light(),
         ])
     }
 
@@ -1340,9 +1966,21 @@ mod tests {
                 "light",
                 "slate",
                 "gruvbox",
-                "catppuccin",
+                "catppuccin-mocha",
                 "tokyo-night",
-                "rose-pine"
+                "rose-pine",
+                "guide",
+                "vercel",
+                "dracula-pro",
+                "catppuccin-latte",
+                "github-dark",
+                "github-light",
+                "bitbucket-dark",
+                "bitbucket-light",
+                "vscode-dark",
+                "vscode-light",
+                "intellij-darcula",
+                "intellij-light",
             ]
         );
         assert_eq!(r.get("light").map(|t| t.chrome.bg), Some(0xfaf7f1));
@@ -1352,26 +1990,15 @@ mod tests {
         let mut mine = Theme::dark();
         mine.chrome.bg = 0x010203;
         r.register(mine);
-        assert_eq!(r.len(), 7, "registering a known name added an entry");
+        assert_eq!(r.len(), 19, "registering a known name added an entry");
         assert_eq!(r.get("dark").map(|t| t.chrome.bg), Some(0x010203));
 
         // And one nobody shipped is simply another theme.
         let mut theirs = Theme::slate();
         theirs.name = "solarized-ish".into();
         r.register(theirs);
-        assert_eq!(
-            r.names(),
-            vec![
-                "dark",
-                "light",
-                "slate",
-                "gruvbox",
-                "catppuccin",
-                "tokyo-night",
-                "rose-pine",
-                "solarized-ish"
-            ]
-        );
+        assert_eq!(r.len(), 20);
+        assert_eq!(r.names().last().copied(), Some("solarized-ish"));
     }
 
     #[test]
@@ -1379,7 +2006,12 @@ mod tests {
         let r = Themes::builtin();
         assert_eq!(r.after("dark").map(|t| t.name.as_str()), Some("light"));
         assert_eq!(r.after("slate").map(|t| t.name.as_str()), Some("gruvbox"));
-        assert_eq!(r.after("rose-pine").map(|t| t.name.as_str()), Some("dark"));
+        assert_eq!(r.after("rose-pine").map(|t| t.name.as_str()), Some("guide"));
+        assert_eq!(r.after("guide").map(|t| t.name.as_str()), Some("vercel"));
+        assert_eq!(
+            r.after("intellij-light").map(|t| t.name.as_str()),
+            Some("dark")
+        );
         // A theme defined in the file and then renamed leaves this behind, and
         // the answer has to be a theme rather than nothing.
         assert_eq!(r.after("gone").map(|t| t.name.as_str()), Some("dark"));

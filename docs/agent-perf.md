@@ -84,17 +84,17 @@ cargo run -q -p gitten-tui --example tti --release .   # single side, terminal o
   `q` on the pty master ends each run. `spawn → startup frame flushed` adds
   the deferred sidebars and preview; binaries older than the deferral never
   print it and its absence is reported, not an error.
-- The **desktop** number is the wall clock around `target/release/gitten-shell`
+- The **desktop** number is the wall clock around `target/release/gitten-gui`
   under `GITTEN_START_QUIT=1` — the client quits itself at the first rows. A
   window does appear, briefly; that is the measurement. The side is skipped
-  with a note when the binary is missing, and `GITTEN_TTI_SHELL=0` turns it
+  with a note when the binary is missing, and `GITTEN_TTI_GUI=0` turns it
   off (check.sh does, to stay windowless).
 
 Against another vintage — the only comparison that means anything:
 
 ```sh
 GITTEN_BASELINE=$OLD/target/release/gitten-tui \
-GITTEN_BASELINE_SHELL=$OLD/target/release/gitten-shell \
+GITTEN_BASELINE_GUI=$OLD/target/release/gitten-gui \
 cargo run -q -p gitten-tui --example tti --release .
 ```
 
@@ -113,7 +113,7 @@ vintage, not by re-reading these paragraphs.
 
 The suite advises and never gates. The one enforcement is opt-in:
 `GITTEN_TTI_MAX_FIRST_FRAME_MS`, `GITTEN_TTI_MAX_FILLED_MS` and
-`GITTEN_TTI_MAX_SHELL_MS` — set one and a median past it exits non-zero.
+`GITTEN_TTI_MAX_GUI_MS` — set one and a median past it exits non-zero.
 Unset, every run exits 0. Two structural tests in `tui/src/main.rs` pin the
 ordering the number depends on — the skeleton defers the startup loads, a
 fixture launch defers nothing — because a timing that drifts is read here, but

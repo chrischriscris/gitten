@@ -2263,7 +2263,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "gitten-shell"
+name = "gitten-gui"
 version = "0.0.0"
 dependencies = [
  "anyhow",

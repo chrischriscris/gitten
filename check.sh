@@ -51,8 +51,8 @@ report app cargo test -q -p gitten-app
 # protocol and untracked status were tested by nothing that anybody ran. Its
 # tests build their own scratch repositories, so they are as headless as the rest.
 report git cargo test -q -p gitten-git
-# The browser door. Headless too — every test in it is a payload or a row
-# index, and neither needs a socket.
+# The loopback agent door. Headless too — every test in it is a payload or a
+# row index, and neither needs a socket.
 report web cargo test -q -p gitten-web
 # The terminal door, and the only frontend whose *drawing* is tested: its screen
 # is a cell buffer, so "this row is a removal, red on dark red, with the changed
@@ -60,7 +60,7 @@ report web cargo test -q -p gitten-web
 report tui cargo test -q -p gitten-tui
 # The desktop drawing tests use GPUI's headless test context: no window appears,
 # but the real uniform list is laid out and its visible rows are measured.
-report shell cargo test -q -p gitten-shell
+report gui cargo test -q -p gitten-gui
 
 echo
 echo "── trees ───────────────────────────────────────────────"
@@ -192,14 +192,14 @@ echo "── tti (terminal, advisory) ──────────────
 # a spawn, a missing marker), never on a timing. Thresholds are opt-in via
 # GITTEN_TTI_MAX_* and none is set here. GITTEN_TTI=0 skips it;
 # GITTEN_TTI_ROUNDS sets the rounds (3; the example defaults to 7 by hand).
-# The desktop side is off (GITTEN_TTI_SHELL=0): this script opens no windows,
+# The desktop side is off (GITTEN_TTI_GUI=0): this script opens no windows,
 # and that number needs one — run the example without it for the desktop.
 if [ "${GITTEN_TTI:-1}" = "0" ]; then
   echo "  skipped (GITTEN_TTI=0)"
 else
   if cargo build -q --release -p gitten-tui; then
     tti_status=0
-    ROUNDS="${GITTEN_TTI_ROUNDS:-3}" GITTEN_TTI_SHELL=0 SETTLE=0 \
+    ROUNDS="${GITTEN_TTI_ROUNDS:-3}" GITTEN_TTI_GUI=0 SETTLE=0 \
       cargo run -q -p gitten-tui --example tti --release -- . 2>&1 \
       | sed 's/^/  /' || tti_status=$?
     if [ "$tti_status" -ne 0 ]; then

@@ -4,7 +4,7 @@ version = "0.0.0"
 edition = "2021"
 
 # The terminal door. Everything above drawing is `core` and `gitten-git`, exactly
-# as it is for the window and the browser; what is here is a cell grid, the
+# as it is for the window and the agent API; what is here is a cell grid, the
 # presentations that fill it and the escape codes that put it on screen.
 #
 # Two dependencies, and the line between them matters. `crossterm` is what

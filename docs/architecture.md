@@ -17,9 +17,9 @@ and anyone can write another.
    └──┬──────────────────┬──────────────────┬─────────────────────────────┘
       │                  │                  │
  ┌────▼───────┐ ┌────────▼─────┐ ┌──────────▼──┐   ┌──────────────────┐
- │gitten-shell │ │  gitten-tui   │ │  gitten-web  │   │ yours            │
+ │gitten-gui   │ │  gitten-tui   │ │  gitten-web  │   │ yours            │
  │GPUI window │ │cells, raw tty│ │loopback HTTP│   │ AnyElement, a    │
- │            │ │              │ │  + a page   │   │ cell, a payload  │
+ │            │ │              │ │  agent JSON │   │ cell, a payload  │
  └────────────┘ └──────────────┘ └─────────────┘   └──────────────────┘
 ```
 
@@ -29,11 +29,11 @@ same `gitten.toml`, the same keymap. What differs is the type a `Rows`
 implementation returns — an `AnyElement`, a row of cells, a JSON payload — and
 that is the only reason the `Rows` trait itself cannot live in `core`.
 
-**The three are not equal.** `gitten-shell` is the product; `gitten-tui` is
-planned and built and comes after it; `gitten-web` is a proof that the boundary
-holds and not a thing anybody asked to ship. A feature asked for without a client
-named means the window. See [clients.md](clients.md), and `AGENTS.md` for the
-tie-break when a shared seam and a good window disagree.
+**The clients are not equal.** `gitten-gui` is the product; `gitten-tui` comes
+after it; `gitten-web` is the loopback agent API and `cli/` the non-interactive
+agent door, and neither is a thing anybody asked to ship as a product. A feature
+asked for without a client named means the window. See [clients.md](clients.md),
+and `AGENTS.md` for the tie-break when a shared seam and a good window disagree.
 
 `core/examples/paint.rs` is a fourth, tiny client: a real diff in ANSI, no
 crate of its own, and still the cheapest place to look at a colour.
@@ -61,7 +61,7 @@ because it compiles in a second and its tests need no window.
 | `refs.rs` | branches, remote branches, HEAD, stashes, remotes, tags, reflog — names as bytes, absence as data |
 | `search.rs` | commit-list search: the index folded once per load, substring per keystroke |
 | `patch.rs` | chosen hunks synthesized into one unified patch, for the stage/unstage/discard-hunk verbs |
-| `theme.rs` | every colour as `0xRRGGBB` data, the seven shipped palettes, contrast resolution |
+| `theme.rs` | every colour as `0xRRGGBB` data, the shipped palettes, contrast resolution |
 | `font.rs` | the face as data: family, size, and whether a char is a column |
 | `host.rs` | the struct that holds the swappable pieces |
 
@@ -171,21 +171,22 @@ one frontend whose *drawing* is unit-tested. See [terminal.md](terminal.md).
 
 ## gitten-web
 
-**A proof, not a product.** It exists to answer one question — can a client
-written in a different language, with no access to any of this crate's types,
-draw a gitten diff? — and the answer being yes is what says `core` has no UI in
-it. Nobody asked for a web app and the roadmap does not have one.
+**A door, not a product.** It began as a proof that a client written in a
+different language, with no access to any of this crate's types, could draw a
+gitten diff — and the answer being yes is what said `core` has no UI in it. The
+browser page is gone; what remains is the loopback JSON API an agent reads, and
+`cli/` and `gitten-tui` carry the boundary proof now.
 
 Read it that way when deciding whether to invest in it. It still holds its own
-row flattening (`rows.rs`) and its own keymap (`ui/app.js`), and those are worth
-*knowing about* rather than worth fixing: closing them buys a client nobody
-ships. What matters is that it never constrains `core` — if `gitten-web` ever
-wants something in `core` that the window does not, the window wins.
+row flattening (`rows.rs`), which is worth *knowing about* rather than worth
+fixing: closing it buys a client nobody ships. What matters is that it never
+constrains `core` — if `gitten-web` ever wants something in `core` that the
+window does not, the window wins.
 
-A loopback HTTP server and a page. No third-party dependencies of its own: the
-server is a `TcpListener`, the JSON writer is a `String`. Everything above
-drawing runs natively in the process you started, so nothing needs a wasm target;
-the browser re-implements the drawing.
+A loopback HTTP server. No third-party dependencies of its own: the server is a
+`TcpListener`, the JSON writer is a `String`. Everything above drawing runs
+natively in the process you started, so nothing needs a wasm target; what
+crosses the wire is rows as JSON.
 
 | file | what lives there |
 |---|---|
@@ -194,13 +195,12 @@ the browser re-implements the drawing.
 | `rows.rs` | the diff flattened to rows, and the wrap table |
 | `log.rs` | the commit list, with `core::graph`'s plan resolved once |
 | `http.rs`, `json.rs` | a server and a writer, both a few hundred lines |
-| `ui/` | one page for both views: a virtual list, the theme as custom properties, SVG for the graph |
 
 The graph crosses the wire as `core::graph::plan` — the halves, not a drawing of
-them — so the browser's SVG paths and the window's Bézier curves are the same
-shape from the same numbers.
+them — so a client's SVG paths and the window's Bézier curves are the same shape
+from the same numbers.
 
-## gitten-shell
+## gitten-gui
 
 GPUI. Drawing and input, and as little else as possible.
 
@@ -223,7 +223,7 @@ GPUI. Drawing and input, and as little else as possible.
 | `graph.rs` | lane geometry and painting: quads, paths, one canvas per row |
 | `settings.rs` | the settings panel: every knob as rows built from the registries |
 | `config.rs` | config reload wiring, widget-theme sync and the live `Host` global |
-| `session.rs` | the row you were on, so `./dev desktop` can put you back after a restart |
+| `session.rs` | the row you were on, so `./dev gui` can put you back after a restart |
 | `stats.rs` | the counting allocator and the `GITTEN_STATS` overlay |
 | `assets/icon.svg` | the mark: three lanes weaving. `./dev bundle` renders the iconset from it |
 
@@ -283,10 +283,10 @@ Two checks, both cheap to run against a diff:
 
 Listed so nobody reads an intention as a description:
 
-- **`cli/`.** Referenced throughout as the second door. `gitten-tui` and
-  `gitten-web` now stand in as the proof that the boundary holds; what `cli/`
-  would still add is a non-interactive door — a diff to stdout, an exit status —
-  and `tui/examples/dump.rs` is most of it already.
+- **A non-interactive human door.** `cli/` exists for agents (`gitten inspect`,
+  `gitten dispatch`, text or `--json`) and joins `gitten-tui` as the proof the
+  boundary holds, but there is no plain "a diff to stdout, an exit status" for a
+  person; `tui/examples/dump.rs` is most of it.
 - **A settings panel.** Configurable keybindings and the shared command/help
   registries exist. The panel reads those same names and holds every live knob
   in one surface — see

@@ -5,8 +5,8 @@
 //! one uniform list so that a 714k-line diff scrolls through a virtualized list
 //! however large it is. That flattening, the wrap index over it and the map from
 //! a row on screen back to a line were written three times — once in
-//! `gitten-shell`, once in `gitten-web`, once about to be — which is what *don't
-//! put logic in `shell/` that `cli/` would have to duplicate* is warning about.
+//! `gitten-gui`, once in `gitten-web`, once about to be — which is what *don't
+//! put logic in `gui/` that `cli/` would have to duplicate* is warning about.
 //! So it is here, and a frontend is left with drawing.
 //!
 //! The map comes in two shapes, because the two ways of reading it want

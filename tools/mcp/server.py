@@ -415,9 +415,9 @@ def tool_dispatch(a):
                 "note": "probe passed but no dispatch call is wired yet"}
     return {"ok": False, "backend": "none", "degraded": True,
             "key": key, "mode": mode,
-            "note": "no machine dispatch yet (WS4): resolve it in the TUI ? "
-                    "panel or web ui/app.js, which read the same core::command "
-                    "map this will call when it lands"}
+            "note": "no machine dispatch yet (WS4): resolve it with "
+                    "`gitten dispatch --run <key>`, which reads the same "
+                    "core::command map this will call when it lands"}
 
 
 def tool_diffcheck(a):

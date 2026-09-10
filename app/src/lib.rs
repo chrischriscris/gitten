@@ -1,7 +1,7 @@
 //! Everything a client needs before it can draw, and nothing that draws.
 //!
-//! gitten is a `core` and a set of clients. A client is a window, a browser tab,
-//! a terminal — or one somebody else writes, which is the point. This crate is
+//! gitten is a `core` and a set of clients. A client is a window, a terminal, a
+//! command line — or one somebody else writes, which is the point. This crate is
 //! what stops "write your own client" meaning "reimplement the startup".
 //!
 //! ```text

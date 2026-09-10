@@ -1,12 +1,12 @@
 //! The command line every client shares.
 //!
-//! `gitten-shell diff . HEAD~2..HEAD` and `gitten-web diff . HEAD~2..HEAD` and
+//! `gitten-gui diff . HEAD~2..HEAD` and `gitten-web diff . HEAD~2..HEAD` and
 //! `gitten-tui diff . HEAD~2..HEAD` are the same words in the same order, and
 //! that is a promise rather than a coincidence: a client is a way of *looking*
 //! at a repository, not a different tool, so the thing you type to reach one
 //! should reach any of them.
 //!
-//! It was written twice before it was written once. `gitten-shell` and
+//! It was written twice before it was written once. `gitten-gui` and
 //! `gitten-web` each had their own `USAGE`, their own `Source`, their own
 //! `--fixtures` arm; the two drifted in their error messages within a week of
 //! each other.
@@ -122,9 +122,9 @@ pub fn parse(args: &[String], default: View) -> Request {
         return Request::Help;
     }
     // `--patch` names a source rather than adjusting one, so it belongs to
-    // this parse and not to any client: the same words name a patch in a
-    // window, a browser tab and a terminal. Taken out first, so it sits where
-    // the line wants it — beside every other flag.
+    // this parse and not to any client: the same words name a patch in every
+    // client. Taken out first, so it sits where the line wants it — beside
+    // every other flag.
     let mut rest = args.to_vec();
     let patch = match take_value(&mut rest, "--patch") {
         Ok(Some(v)) => Some(v),
@@ -215,9 +215,10 @@ pub fn usage(binary: &str, blurb: &str, extra: &str) -> String {
   Pass --fixtures instead of REPO to read fixtures/ instead of a repository.
   A patch needs no checkout at all:  git diff | {binary} diff -
 
-  gitten.toml picks the theme — dark, light or slate, or one it defines itself —
-  and sets the font and the [diff] table: the algorithm, how much whitespace has
-  to match, how much context, and what the presentation and the wrap open on.
+  gitten.toml picks the theme — the gitten and guide-v2 sets, or one it
+  defines itself — and sets the font and the [diff] table: the algorithm, how
+  much whitespace has to match, how much context, and what the presentation and
+  the wrap open on.
   Read from ~/.config/gitten/gitten.toml, or ./gitten.toml when the current
   directory has one, or $GITTEN_CONFIG. Every client reads the same file.
   Start one with:  {binary} config > ~/.config/gitten/gitten.toml
