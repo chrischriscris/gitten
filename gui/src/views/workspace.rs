@@ -7,8 +7,16 @@
 //! [`super::files::Files`]' grouped projection (one selection state, shared),
 //! the center is a plain [`super::diff::Diff`] fed one file's rows, and every
 //! mouse control resolves through the shell's named dispatch. Widths are
-//! fixed px per the spec — 255/266px, 280/295px past [`WIDE_PX`] — read from
-//! the viewport once at composition time, never from inside a view.
+//! fixed px per the spec — 255/266px at an ordinary size, 280/295px past
+//! [`WIDE_PX`], and narrower below the three `max-width` steps, where the
+//! reference spends less on a rail rather than on the diff — read from the
+//! viewport once at composition time, never from inside a view.
+//!
+//! The reference stacks the composer under the diff below 850px; this window
+//! deliberately does not. The spec calls that breakpoint "a narrow-width
+//! reference, not a mandate to degrade desktop usability", and a window that
+//! rearranges itself at 849px is a worse window on a desktop that is merely
+//! narrow. The rails give instead, which costs neither pane its reason.
 
 use super::diff::Diff;
 use super::files::Section;
@@ -26,23 +34,50 @@ pub const INSPECTOR_W: f32 = 266.0;
 pub const WIDE_PX: f32 = 1550.0;
 pub const SIDEBAR_WIDE_W: f32 = 280.0;
 pub const INSPECTOR_WIDE_W: f32 = 295.0;
+/// Below these the reference narrows the rails rather than the diff, which is
+/// the right way round: a file list is scanned by name and a diff is read a
+/// line at a time, so the pane that loses is the one that can still be read.
+/// The numbers are `style.css`'s `max-width` steps against the same
+/// breakpoints, held here as one ladder so no view can invent a rung.
+pub const COMPACT_PX: f32 = 1150.0;
+pub const NARROW_PX: f32 = 850.0;
+pub const SMALLEST_PX: f32 = 650.0;
+pub const SIDEBAR_COMPACT_W: f32 = 225.0;
+pub const SIDEBAR_NARROW_W: f32 = 195.0;
+pub const SIDEBAR_SMALLEST_W: f32 = 152.0;
+pub const INSPECTOR_COMPACT_W: f32 = 230.0;
 
-/// Fixed rail widths for a viewport: the spec's two sizes, picked once at
-/// composition time — the one place a viewport read is allowed.
+/// Fixed rail widths for a viewport: the spec's five sizes, picked once at
+/// composition time — the one place a viewport read is allowed. The top step
+/// is the spec's own wording ("above 1550px"); the rest are its `max-width`
+/// steps, checked from the narrow end so the smallest viewport cannot fall
+/// through to the widest rung.
 pub fn sidebar_width(viewport_w: f32) -> f32 {
-    match viewport_w > WIDE_PX {
-        true => SIDEBAR_WIDE_W,
-        false => SIDEBAR_W,
+    if viewport_w > WIDE_PX {
+        SIDEBAR_WIDE_W
+    } else if viewport_w <= SMALLEST_PX {
+        SIDEBAR_SMALLEST_W
+    } else if viewport_w <= NARROW_PX {
+        SIDEBAR_NARROW_W
+    } else if viewport_w <= COMPACT_PX {
+        SIDEBAR_COMPACT_W
+    } else {
+        SIDEBAR_W
     }
 }
 
 /// [`sidebar_width`]'s twin for the right rail. Sized here — beside the
 /// sidebar's own width — so the center never lays out against a width the
-/// inspector will move.
+/// inspector will move. The inspector has one rung fewer than the sidebar:
+/// the reference gives up on the diff's line numbers sooner than on its
+/// file names, so the composer stops stepping where the sidebar keeps going.
 pub fn inspector_width(viewport_w: f32) -> f32 {
-    match viewport_w > WIDE_PX {
-        true => INSPECTOR_WIDE_W,
-        false => INSPECTOR_W,
+    if viewport_w > WIDE_PX {
+        INSPECTOR_WIDE_W
+    } else if viewport_w <= COMPACT_PX {
+        INSPECTOR_COMPACT_W
+    } else {
+        INSPECTOR_W
     }
 }
 
@@ -161,6 +196,41 @@ pub fn wheel_pixels(scroll: &UniformListScrollHandle, dy: f32) -> bool {
 mod tests {
     use super::*;
     use gpui::ScrollStrategy;
+
+    /// The rail ladder at every rung and at both of its edges, plus the
+    /// property a ladder is for: a viewport that grows never gets a narrower
+    /// rail. Both edges are checked because a rung is a `<=` on the way down
+    /// and a `>` on the way up, and only one of those two mistakes is a size
+    /// nobody would notice.
+    #[test]
+    fn the_rails_step_with_the_viewport_and_never_grow_downward() {
+        for (viewport, sidebar, inspector) in [
+            (400.0, SIDEBAR_SMALLEST_W, INSPECTOR_COMPACT_W),
+            (SMALLEST_PX, SIDEBAR_SMALLEST_W, INSPECTOR_COMPACT_W),
+            (SMALLEST_PX + 1.0, SIDEBAR_NARROW_W, INSPECTOR_COMPACT_W),
+            (NARROW_PX, SIDEBAR_NARROW_W, INSPECTOR_COMPACT_W),
+            (NARROW_PX + 1.0, SIDEBAR_COMPACT_W, INSPECTOR_COMPACT_W),
+            (COMPACT_PX, SIDEBAR_COMPACT_W, INSPECTOR_COMPACT_W),
+            (COMPACT_PX + 1.0, SIDEBAR_W, INSPECTOR_W),
+            (WIDE_PX, SIDEBAR_W, INSPECTOR_W),
+            (WIDE_PX + 1.0, SIDEBAR_WIDE_W, INSPECTOR_WIDE_W),
+        ] {
+            assert_eq!(sidebar_width(viewport), sidebar, "sidebar at {viewport}");
+            assert_eq!(
+                inspector_width(viewport),
+                inspector,
+                "inspector at {viewport}"
+            );
+        }
+        let mut last = 0.0;
+        for step in 0..300 {
+            let viewport = 400.0 + step as f32 * 10.0;
+            let side = sidebar_width(viewport);
+            assert!(side >= last, "the sidebar shrank at {viewport}");
+            assert!(side <= SIDEBAR_WIDE_W, "the sidebar overgrew at {viewport}");
+            last = side;
+        }
+    }
 
     /// The launch destination per the interaction contract: Changes before
     /// any command runs — no toggle to reach it.

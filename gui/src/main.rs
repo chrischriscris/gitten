@@ -7,6 +7,7 @@ mod menu;
 mod modal;
 mod palette;
 mod panes;
+mod qa;
 mod session;
 mod settings;
 mod settings_window;
@@ -4542,10 +4543,34 @@ impl DevShell {
     /// fixture has no working tree to show, and the honest answer to the key
     /// is the same sentence an unbound one gets.
     fn focus_named(&mut self, name: &str, cx: &mut Context<Self>) {
+        self.reclaim_focus();
         match self.panes.position(name) {
             Some(at) => self.focus_pane(at, cx),
             None => self.set_notice(format!("no {name} pane")),
         }
+    }
+
+    /// Forget which element holds the keyboard, so the next frame takes it
+    /// back.
+    ///
+    /// [`DevShell::render`] re-asserts `self.focus` only when its record
+    /// ([`DevShell::focused`]) disagrees with what that frame wants. The guard
+    /// is what keeps a focus claim from being re-made sixty times a second,
+    /// and it is only sound while every claim goes through the record. Four
+    /// fields do not: the palette's filter and the theme picker's, which
+    /// focus themselves from their own `render` precisely so that re-rendering
+    /// cannot drop them, and the composer's Summary and Description. On the
+    /// frame such a field disappears the record still agrees with the frame's
+    /// wish, so nothing re-focuses — and the root element, the only one
+    /// carrying the key listener, stops being the keyboard's target. The
+    /// window then answers no key at all for the rest of its life.
+    ///
+    /// So: every path that moves the keyboard *by name* clears the record
+    /// first. `focus_named` is the door all four overlays close through, which
+    /// is why the repair lives here rather than at each of them — a fifth
+    /// overlay inherits it without knowing this exists.
+    fn reclaim_focus(&mut self) {
+        self.focused = None;
     }
 
     /// `commits.open-diff`: hand the keyboard to the diff region, carrying the
@@ -7057,8 +7082,13 @@ fn open_main_window(launch: Launch, cx: &mut App) {
     // above is in place before any event can be delivered, because none are
     // delivered until this closure yields.
     start::mark("opening window");
+    // Read once per launch and passed along, rather than read wherever it is
+    // wanted: a door that is refused says so on stderr, and a parse run twice
+    // says it twice — a doubled warning reads as a broken window, which is the
+    // opposite of what these are for.
+    let doors = qa::Doors::from_env();
     cx.open_window(
-        window_options(started_title(which, &label).into()),
+        window_options(started_title(which, &label).into(), doors.geom),
         move |window, cx| {
             start::mark("window callback enter");
             // Where the last run of this exact command left off. Restored
@@ -7536,6 +7566,11 @@ fn open_main_window(launch: Launch, cx: &mut App) {
                     } else {
                         shell.sync_main_diff(cx);
                     }
+                    // The QA doors, last and once — see `qa`. After the
+                    // launch destination, so a door overrules the default
+                    // rather than racing it: `GITTEN_QA_VIEW=history` opens
+                    // on History and never on a frame of Changes.
+                    shell.apply_doors(&doors, cx);
                 });
             }
             {
@@ -7803,7 +7838,7 @@ fn started_title(view: View, label: &str) -> String {
 /// gutters — the diff view's wrap budget bottoms out at eight characters and
 /// says so — and the height is [`WINDOW_MIN_H`], because four stacked sections'
 /// floors plus the two strips are more than any smaller number admits.
-fn window_options(title: SharedString) -> WindowOptions {
+fn window_options(title: SharedString, geometry: Option<(f32, f32)>) -> WindowOptions {
     WindowOptions {
         titlebar: Some(TitlebarOptions {
             title: Some(title),
@@ -7811,6 +7846,15 @@ fn window_options(title: SharedString) -> WindowOptions {
             traffic_light_position: Some(point(px(LIGHTS_X), px((TITLE_H - 12.0) / 2.0))),
         }),
         window_min_size: Some(size(px(560.), px(WINDOW_MIN_H))),
+        // A size only when the QA door asked for one — see `qa`. Left absent
+        // the platform places and sizes the window, which is what a person
+        // launching it wants and the one thing a door exists to overrule.
+        window_bounds: geometry.map(|(w, h)| {
+            gpui::WindowBounds::Windowed(gpui::Bounds {
+                origin: Default::default(),
+                size: gpui::size(gpui::px(w), gpui::px(h)),
+            })
+        }),
         ..Default::default()
     }
 }
@@ -8251,6 +8295,33 @@ mod tests {
                 pending_restore: None,
             }
         })
+    }
+
+    #[gpui::test]
+    fn closing_the_palette_hands_the_keyboard_back(cx: &mut TestAppContext) {
+        // The palette's filter focuses itself from its own render, so the
+        // frame loop's record never learns it took the keyboard. Closing it
+        // has to clear that record or nothing ever takes the keyboard back:
+        // live, the window answers no key at all after one cmd-k and esc.
+        let shell = shell(None, cx);
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.set_global(config::Active(Rc::new(Host::new())));
+        });
+        shell.update(cx, |s, cx| s.open_palette(cx));
+        shell.read_with(cx, |s, _| {
+            assert!(s.palette_open, "the palette did not open")
+        });
+        // Stand in for render: the record agrees with the frame's wish, which
+        // is exactly the state that made the window deaf.
+        shell.update(cx, |s, _| s.focused = Some(s.focus.clone()));
+        shell.update(cx, |s, cx| s.close_palette(cx));
+        shell.read_with(cx, |s, _| {
+            assert!(
+                s.focused.is_none(),
+                "the palette gave the keyboard back and the record still claims it"
+            )
+        });
     }
 
     #[gpui::test]
@@ -12668,7 +12739,7 @@ mod title_tests {
     #[test]
     fn the_minimum_window_holds_every_sections_floor() {
         let floors = 4.0 * SECTION_MIN_H + super::TITLE_H + crate::chrome::STATUS_H;
-        let options = super::window_options("test".into());
+        let options = super::window_options("test".into(), None);
         let Some(min) = options.window_min_size else {
             panic!("the window declares no minimum size");
         };

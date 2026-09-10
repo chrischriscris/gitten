@@ -323,6 +323,17 @@ hand over the command. The terminal frontend's `dump` example is the exception
 and exists for it — a frame on stdout interrupts nobody, so look at a colour or
 a glyph there rather than asking someone to open something.
 
+**A window's state is reproducible from the environment, because a hand is not.**
+`GITTEN_QA_GEOM=1280x800`, `GITTEN_QA_VIEW=history`, `GITTEN_QA_DIALOG=commands`
+and `GITTEN_QA_THEME=github-dark` open the window in the state a capture needs,
+and those four are chosen because they are what no argument can say: the
+repository, the revspec and the patch are already the command line, and `diff -`
+takes one on stdin. Each goes through the same entry point a keystroke reaches,
+nothing is persisted, and a value nothing recognises is said on stderr and then
+ignored — a typo that silently photographed the default state is the one failure
+a capture cannot see for itself (`gui/src/qa.rs`). The doors make a launch
+*reproducible*; they do not make it polite, so the rule above still stands.
+
 `rust-toolchain.toml` tracks the channel Zed pins. When GPUI fails with an
 unstable-feature error, that pin has drifted — go read Zed's `rust-toolchain.toml`.
 
@@ -497,6 +508,23 @@ inner ones unique.
 `Rc<Host>` from startup, so the window chrome and the font for the whole window
 silently did not hot-reload while every view inside them did. `config::host(cx)`
 per frame is a refcount bump.
+
+**Five traps, none of them visible in a screenshot.** A `flex_none()` after
+`flex_1()` zeroes the growth — split halves are `flex_1` **and** `min_w(0)`, and
+it is the pair that keeps them from shearing, not either one. A `subscribe`
+callback runs **inside an update of the subscriber**, so a callback that updates
+its own subscriber re-enters it and aborts the process (`entity_map.rs`, "cannot
+update X while it is already being updated"); reach for `cx.defer` past the
+effect cycle instead. The same shape bites through focus: a floating field that
+focuses itself from its own `render` never tells the frame loop, so on the frame
+it disappears nothing takes the keyboard back and the window answers no key at
+all for the rest of its life — `DevShell::reclaim_focus`, called from every path
+that moves the keyboard by name. A test module that does `use super::*` where
+`gpui` is also in scope shadows the builtin `#[test]` with gpui's `test` macro
+and recurses to the limit; import the names the test uses. And a graph curve's
+two halves each anchor on their **own** dot — `core::graph::Curve` says which one
+leaves and which reaches — so a fixture that mirrors one half to make the other
+tears at the row boundary.
 
 ## Don't
 
