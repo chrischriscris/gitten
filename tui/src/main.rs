@@ -17909,6 +17909,28 @@ diff --git a/tracked.txt b/tracked.txt
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         }
 
+        /// git's answer for a *diagnostic* — the reads a failure message
+        /// prints, where a refused read has to say so in the message rather
+        /// than replace it with a second panic. [`Self::ask`] is the read a
+        /// test asserts on, and stays that way.
+        fn probe(&self, args: &[&str]) -> String {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&self.0)
+                .args(Self::setup())
+                .args(args)
+                .output()
+                .expect("git runs");
+            if !out.status.success() {
+                return format!(
+                    "git {:?} refused: {}",
+                    args,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+
         fn write(&self, file: &str, text: &str) {
             std::fs::write(self.0.join(file), text).expect("a scratch file");
         }
@@ -22051,6 +22073,15 @@ shared tail
 
     /// LG-082. A real repository: the fold replays the window with every
     /// marker on the commit it names, and the tree keeps the change.
+    ///
+    /// What is waited for is the *fold*, not the log that looks folded.
+    /// `rebase -i` replays the commit being folded into and amends the
+    /// fixup's patch into it second, so between those two steps `HEAD` is a
+    /// commit named `second` whose tree is still the two-line one — the log
+    /// reads `second\nbase` for the whole of the amend that follows, and a
+    /// wait that stopped at the log would hand the assertion below a
+    /// repository still mid-fold. The standing rebase is the read that says
+    /// the rewrite is still moving; the log is still what it always was.
     #[test]
     fn tui_parity_the_fold_replays_a_real_window_in_gits_order() {
         let g = Git::init("fixup-apply");
@@ -22062,6 +22093,7 @@ shared tail
         g.write("f.txt", "one\ntwo\nthree\n");
         g.git(&["add", "f.txt"]);
         g.git(&["commit", "--fixup", "HEAD"]);
+        let repo = gitten_git::open(&g.0);
         let mut app = repo_app(g.0.as_path());
         app.dispatch("commits.focus");
         app.press(Key::char('U'));
@@ -22075,6 +22107,7 @@ shared tail
             until(Duration::from_secs(10), || {
                 app.pump();
                 g.ask(&["log", "--format=%s"]).trim() == "second\nbase"
+                    && !repo.rebase_in_progress()
             }),
             "the fold never finished: {:?} / {:?}",
             app.message,
@@ -22083,7 +22116,17 @@ shared tail
         assert_eq!(
             g.ask(&["show", "HEAD:./f.txt"]).trim(),
             "one\ntwo\nthree",
-            "the folded change did not survive"
+            // Said beside the failure, and built only on failure: the tree
+            // alone cannot tell a fold still in flight from one that
+            // finished without the change, and only the second is data
+            // loss. The reflog is where the amend either happened or did
+            // not, and the version is the thing a CI-only failure cannot
+            // report from here.
+            "the folded change did not survive · rebase standing: {} · git: {} · status: {:?} · reflog: {:?}",
+            repo.rebase_in_progress(),
+            g.probe(&["--version"]),
+            g.probe(&["status", "--porcelain"]),
+            g.probe(&["reflog", "-5", "--format=%gd %gs"]),
         );
     }
 
