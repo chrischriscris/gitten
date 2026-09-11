@@ -1219,6 +1219,14 @@ struct DevShell {
     refresh_pending: usize,
     refresh_error: Option<String>,
     running: Option<(String, std::time::Instant)>,
+    /// A write queued by the command now running — set in
+    /// [`WindowActs::submit`], spent by the next
+    /// [`DevShell::sync_workspace_preview`], which is the tail of that same
+    /// command. The index is about to move under the selection, so the side
+    /// the selection names *now* is the side the write is emptying: loading
+    /// it can only refuse, and the wave the finished write raises re-aims
+    /// the preview at where the file actually went.
+    queued_write: bool,
     /// The one native text field over the active screen, if a command is
     /// gathering input. Consumers subscribe to its accepted/cancelled event.
     input: Option<Entity<input::Input>>,
@@ -1307,6 +1315,11 @@ struct DevShell {
     /// repository and read per frame. Keyed on the path, because the tests
     /// swap `repo` in place and a memo that trusted construction would lie.
     title_memo: RefCell<Option<(std::path::PathBuf, SharedString, SharedString)>>,
+    /// What the platform's own titlebar was last told, beside the two
+    /// things it was spelled from. A frame that finds both unmoved says
+    /// nothing to the platform and formats nothing — see
+    /// [`DevShell::sync_window_title`], which is the only writer.
+    os_title: RefCell<Option<(std::path::PathBuf, Option<SharedString>)>>,
     /// The Commands palette: open flag, selection into the filtered rows,
     /// the filter field (built once, subscription included), its
     /// subscription, and the mirrored query text.
@@ -1389,7 +1402,9 @@ impl gitten_app::act::Client for WindowActs<'_, '_, '_> {
 
     fn submit(&mut self, job: Box<dyn Job>) -> bool {
         self.shell.notice = None;
-        self.shell.writes().is_some_and(|writes| writes.send(job))
+        let queued = self.shell.writes().is_some_and(|writes| writes.send(job));
+        self.shell.queued_write |= queued;
+        queued
     }
 }
 
@@ -4805,6 +4820,37 @@ impl DevShell {
         view.read(cx).head_info().map(|info| info.label)
     }
 
+    /// Keeps the platform's titlebar level with what the window is showing.
+    ///
+    /// A title is handed to the platform once, when the window opens, and a
+    /// deferred launch opens before it knows what it is looking at —
+    /// [`STARTUP_LOADING`] is the honest word at that moment and a
+    /// permanent lie from the wave's landing onwards. So the window
+    /// re-spells its own title from the repository and HEAD, which is what
+    /// a window list is being asked when several of these are open.
+    ///
+    /// A launch with no repository behind it — a `.diff` fixture, a patch —
+    /// keeps the title it opened with: the path is the only thing this
+    /// could say, and there is none.
+    fn sync_window_title(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((path, _)) = self.repo.clone() else {
+            return;
+        };
+        let head = self.head_label(cx);
+        let key = (path, head);
+        if self.os_title.borrow().as_ref() == Some(&key) {
+            return;
+        }
+        let (_, name) = repo_title(&key.0, home());
+        let label = match &key.1 {
+            Some(head) => format!("{name} \u{00b7} {head}"),
+            None => name,
+        };
+        let view = View::parse(self.which).unwrap_or(View::Commits);
+        window.set_window_title(&started_title(view, &label));
+        *self.os_title.borrow_mut() = Some(key);
+    }
+
     /// Which inspector field holds the keyboard, if one does: `false` for
     /// Summary, `true` for Description. The prompt path keeps its promise
     /// about where the keyboard is by slot; the embedded fields keep it by
@@ -4888,7 +4934,19 @@ impl DevShell {
     /// generation: a staging write's wave re-lands the same selection with
     /// a newer generation, which counts as new — the preview follows the
     /// side that just moved without another keystroke.
+    ///
+    /// A write queued by the command this is the tail of takes that
+    /// re-aiming away from the keyboard's own move: see
+    /// [`DevShell::queued_write`]. The sidebar's stage box moves the
+    /// keyboard onto the row before it stages, so the selection names the
+    /// side the write is about to empty — loading it produced "nothing
+    /// unstaged for f.txt" over a file that had just been staged
+    /// successfully.
     fn sync_workspace_preview(&mut self, cx: &mut Context<Self>) {
+        // Spent here and not below the destination check: a History tail
+        // has no preview to aim, and a flag left standing would suppress
+        // the next schedule Changes asks for.
+        let queued_write = std::mem::take(&mut self.queued_write);
         // Only Changes has a preview to aim; History reads the commits pane
         // and the one diff view instead, and re-aiming the hidden file
         // center there would be a load nobody sees.
@@ -4928,6 +4986,15 @@ impl DevShell {
             self.workspace
                 .sidebar_scroll
                 .scroll_to_item(row, ScrollStrategy::Nearest);
+        }
+        // The write's own wave arrives with a newer generation, so the key
+        // it lands under is new again and the preview aims then — at the
+        // side the file is on rather than the one it left. The rail above
+        // still follows the keyboard: the box moved it, and a row the
+        // window will not scroll to is a row nobody staged.
+        if queued_write {
+            self.workspace.last = Some(key);
+            return;
         }
         // Conflicts render through their own markers presentation, not a
         // diff — Phase 2 leaves the center on the last file.
@@ -4998,8 +5065,18 @@ impl DevShell {
                     }
                     // A side that vanished under the selection — staged the
                     // last hunk, deleted the file — is not a crash: one
-                    // sentence in the band, and the last rows keep standing.
-                    Err(e) => shell.set_notice(e),
+                    // sentence in the band, and the center emptied under the
+                    // header that already names the new file. Keeping the
+                    // last rows standing was worse than an empty pane: the
+                    // header, the status letters and the band all named one
+                    // file while the body was still somebody else's diff.
+                    Err(e) => {
+                        if let Some(center) = shell.workspace.center.clone() {
+                            let host = config::host(cx);
+                            center.update(cx, |d, cx| d.replace(Vec::new(), &host, cx));
+                        }
+                        shell.set_notice(e);
+                    }
                 }
             });
         })
@@ -6227,6 +6304,10 @@ impl Render for DevShell {
         if !self.first_render.replace(true) {
             start::mark("first render");
         }
+        // The platform's titlebar, which is written from here because this
+        // is where the `Window` is. A memo compare per frame, a call only
+        // when the repository or HEAD moved.
+        self.sync_window_title(window, cx);
         let overlay = self.stats.as_mut().map(|s| {
             s.tick();
             (s.frames(), s.rows(), s.heap(), s.load.clone())
@@ -7498,6 +7579,7 @@ fn open_main_window(launch: Launch, cx: &mut App) {
                 refresh_pending: 0,
                 refresh_error: None,
                 running: None,
+                queued_write: false,
                 show_message: false,
                 input: None,
                 prompt: None,
@@ -7510,6 +7592,7 @@ fn open_main_window(launch: Launch, cx: &mut App) {
                 config: shell_config_path,
                 first_render: Cell::new(false),
                 title_memo: RefCell::new(None),
+                os_title: RefCell::new(None),
                 workspace: views::workspace::Workspace::default(),
                 drafts: std::collections::HashMap::new(),
                 commit_confirm: false,
@@ -8257,6 +8340,7 @@ mod tests {
                 refresh_pending: 0,
                 refresh_error: None,
                 running: None,
+                queued_write: false,
                 show_message: false,
                 input: None,
                 prompt: None,
@@ -8269,6 +8353,7 @@ mod tests {
                 config: std::path::PathBuf::new(),
                 first_render: Cell::new(false),
                 title_memo: RefCell::new(None),
+                os_title: RefCell::new(None),
                 workspace: crate::views::workspace::Workspace::default(),
                 drafts: std::collections::HashMap::new(),
                 commit_confirm: false,

@@ -9,7 +9,12 @@
 //! cache rebuilds inside [`super::files::Files::apply_query`]). Every mouse
 //! control resolves through the shell's named dispatch — a click moves the
 //! keyboard first (the files list's own rule: a click is the keyboard coming
-//! back), then dispatches, then asks for a preview re-aim.
+//! back), then dispatches.
+//!
+//! A name asks for the preview re-aim; the stage box does not. The box's
+//! write moves the file to the other side of the index, and the wave that
+//! write raises re-aims the preview at where it went — asking here aims at
+//! the side the write is emptying, one refusal ahead of the answer.
 //!
 //! TODO(Phase 3/4, see plans/desktop-v2/PLAN.md): mixed checkbox + `n/m`
 //! hunk fractions, stage-remainder semantics on partial rows, staged summary
@@ -184,7 +189,6 @@ pub(crate) fn render_sidebar(deps: &SidebarDeps, cx: &mut App) -> AnyElement {
                         let files_click = files.clone();
                         let files_stage = files.clone();
                         let stage_cmd = dispatch.clone();
-                        let preview_after_stage = dispatch.clone();
                         let preview_row = dispatch.clone();
                         // A compact file row: a 14px stage box, filename and a
                         // trailing status — selected in the green tint with
@@ -246,7 +250,6 @@ pub(crate) fn render_sidebar(deps: &SidebarDeps, cx: &mut App) -> AnyElement {
                                                 cx.notify();
                                             });
                                             stage_cmd("files.stage", cx);
-                                            preview_after_stage("workspace.preview", cx);
                                         },
                                     ),
                             )
