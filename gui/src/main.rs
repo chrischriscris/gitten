@@ -1219,6 +1219,18 @@ struct DevShell {
     refresh_pending: usize,
     refresh_error: Option<String>,
     running: Option<(String, std::time::Instant)>,
+    /// The files-pane generation a queued write was sent against — set by
+    /// [`DevShell::queue_write`], the one door the shell's sends leave
+    /// through, and spent by the next [`DevShell::sync_workspace_preview`].
+    /// The index is about to move under the selection, so the side it names
+    /// *now* may be the side the write is emptying: loading it can only
+    /// refuse, and the wave the finished write raises re-aims the preview
+    /// at where the file actually went. A generation and not a flag,
+    /// because a write queued outside a dispatch — the input field's
+    /// accept, the hunk strip's button — has no command tail to spend it:
+    /// the wave lands under a newer generation, which must read as spent
+    /// rather than suppress the very re-aim the record was waiting for.
+    queued_write: Option<u64>,
     /// The one native text field over the active screen, if a command is
     /// gathering input. Consumers subscribe to its accepted/cancelled event.
     input: Option<Entity<input::Input>>,
@@ -1307,6 +1319,11 @@ struct DevShell {
     /// repository and read per frame. Keyed on the path, because the tests
     /// swap `repo` in place and a memo that trusted construction would lie.
     title_memo: RefCell<Option<(std::path::PathBuf, SharedString, SharedString)>>,
+    /// What the platform's own titlebar was last told, beside the two
+    /// things it was spelled from. A frame that finds both unmoved says
+    /// nothing to the platform and formats nothing — see
+    /// [`DevShell::sync_window_title`], which is the only writer.
+    os_title: RefCell<Option<(std::path::PathBuf, Option<SharedString>)>>,
     /// The Commands palette: open flag, selection into the filtered rows,
     /// the filter field (built once, subscription included), its
     /// subscription, and the mirrored query text.
@@ -1389,7 +1406,10 @@ impl gitten_app::act::Client for WindowActs<'_, '_, '_> {
 
     fn submit(&mut self, job: Box<dyn Job>) -> bool {
         self.shell.notice = None;
-        self.shell.writes().is_some_and(|writes| writes.send(job))
+        let Some(writes) = self.shell.writes() else {
+            return false;
+        };
+        self.shell.queue_write(&writes, job)
     }
 }
 
@@ -1767,6 +1787,32 @@ impl DevShell {
         })
     }
 
+    /// The one synchronous door the shell's writes leave through:
+    /// [`WindowActs::submit`] arrives here, and the verbs holding a `Writes`
+    /// call it rather than `Writes::send` — so a successful send also
+    /// records the generation the index is about to move under, which is
+    /// what [`DevShell::sync_workspace_preview`] stands aside for (see
+    /// [`DevShell::queued_write`]). An extension pane holds only `&Writes`
+    /// and sends on it raw: its write raises the same re-aiming wave, it
+    /// simply cannot ask the preview to wait for it first.
+    fn queue_write(&mut self, writes: &Writes, job: Box<dyn Job>) -> bool {
+        let queued = writes.send(job);
+        if queued {
+            self.queued_write = self.preview_generation();
+        }
+        queued
+    }
+
+    /// The generation the workspace preview keys on — the files pane's own —
+    /// or none where no files pane stands, which is also the honest answer
+    /// to "no preview will need to stand aside for this write".
+    fn preview_generation(&self) -> Option<u64> {
+        match self.panes.get("files") {
+            Some(Screen::Files { generation, .. }) => Some(generation.get().get()),
+            _ => None,
+        }
+    }
+
     /// `files.stage`: act on the row the keyboard is on, by the side of the
     /// index it sits on. Staged means unstage; everything else — unstaged,
     /// untracked, a conflict whose resolution is being recorded — means stage.
@@ -2119,7 +2165,7 @@ impl DevShell {
         };
         match built {
             Ok(job) => {
-                if !writes.send(Box::new(job)) {
+                if !self.queue_write(&writes, Box::new(job)) {
                     self.set_notice("the job queue is shutting down");
                 }
             }
@@ -2269,7 +2315,7 @@ impl DevShell {
         self.notice = None; // the question is spent; the running band speaks next
         let job =
             gitten_app::verbs::Write::reset(&writes.repo, mode, commit.sha.clone().into_bytes());
-        if !writes.send(Box::new(job)) {
+        if !self.queue_write(&writes, Box::new(job)) {
             self.set_notice("the job queue is shutting down");
         }
     }
@@ -2296,7 +2342,7 @@ impl DevShell {
             return;
         };
         let job = gitten_app::verbs::Write::revert(&writes.repo, commit.sha.into_bytes());
-        if !writes.send(Box::new(job)) {
+        if !self.queue_write(&writes, Box::new(job)) {
             self.set_notice("the job queue is shutting down");
         }
     }
@@ -2342,7 +2388,7 @@ impl DevShell {
             }
         }
         let job = gitten_app::verbs::Write::cherry_pick(&writes.repo, commit.sha.into_bytes());
-        if !writes.send(Box::new(job)) {
+        if !self.queue_write(&writes, Box::new(job)) {
             self.set_notice("the job queue is shutting down");
         }
     }
@@ -2430,7 +2476,7 @@ impl DevShell {
             }
         };
         let job = gitten_app::verbs::Write::rebase_todo(&writes.repo, upstream, script);
-        if !writes.send(Box::new(job)) {
+        if !self.queue_write(&writes, Box::new(job)) {
             self.set_notice("the job queue is shutting down");
         }
     }
@@ -2448,9 +2494,10 @@ impl DevShell {
             self.set_notice("a fixture has no repository to abort in");
             return;
         };
-        if !writes.send(Box::new(gitten_app::verbs::Write::rebase_abort(
-            &writes.repo,
-        ))) {
+        if !self.queue_write(
+            &writes,
+            Box::new(gitten_app::verbs::Write::rebase_abort(&writes.repo)),
+        ) {
             self.set_notice("the job queue is shutting down");
         }
     }
@@ -2460,9 +2507,10 @@ impl DevShell {
             self.set_notice("a fixture has no repository to continue in");
             return;
         };
-        if !writes.send(Box::new(gitten_app::verbs::Write::rebase_continue(
-            &writes.repo,
-        ))) {
+        if !self.queue_write(
+            &writes,
+            Box::new(gitten_app::verbs::Write::rebase_continue(&writes.repo)),
+        ) {
             self.set_notice("the job queue is shutting down");
         }
     }
@@ -2480,9 +2528,10 @@ impl DevShell {
             self.set_notice("a fixture has no repository to abort in");
             return;
         };
-        if !writes.send(Box::new(gitten_app::verbs::Write::cherry_pick_abort(
-            &writes.repo,
-        ))) {
+        if !self.queue_write(
+            &writes,
+            Box::new(gitten_app::verbs::Write::cherry_pick_abort(&writes.repo)),
+        ) {
             self.set_notice("the job queue is shutting down");
         }
     }
@@ -2492,9 +2541,10 @@ impl DevShell {
             self.set_notice("a fixture has no repository to continue in");
             return;
         };
-        if !writes.send(Box::new(gitten_app::verbs::Write::cherry_pick_continue(
-            &writes.repo,
-        ))) {
+        if !self.queue_write(
+            &writes,
+            Box::new(gitten_app::verbs::Write::cherry_pick_continue(&writes.repo)),
+        ) {
             self.set_notice("the job queue is shutting down");
         }
     }
@@ -2554,7 +2604,7 @@ impl DevShell {
             views::branches::Target::Detached => unreachable!("refused above"),
         };
         let job = gitten_app::verbs::Write::rebase_onto(&writes.repo, upstream);
-        if !writes.send(Box::new(job)) {
+        if !self.queue_write(&writes, Box::new(job)) {
             self.set_notice("the job queue is shutting down");
         }
     }
@@ -2609,7 +2659,7 @@ impl DevShell {
             views::branches::Target::Detached => unreachable!("refused above"),
         };
         let job = gitten_app::verbs::Write::checkout(&writes.repo, name.as_bytes().to_vec());
-        if !writes.send(Box::new(job)) {
+        if !self.queue_write(&writes, Box::new(job)) {
             self.set_notice("the job queue is shutting down");
         }
     }
@@ -2635,7 +2685,7 @@ impl DevShell {
                 }
             },
         };
-        if !writes.send(Box::new(job)) {
+        if !self.queue_write(&writes, Box::new(job)) {
             self.set_notice("the job queue is shutting down");
         }
     }
@@ -2677,7 +2727,7 @@ impl DevShell {
             "stashes.pop" => gitten_app::verbs::Write::stash_pop(&writes.repo, index),
             _ => gitten_app::verbs::Write::stash_drop(&writes.repo, index),
         };
-        if !writes.send(Box::new(job)) {
+        if !self.queue_write(&writes, Box::new(job)) {
             self.set_notice("the job queue is shutting down");
         }
     }
@@ -2780,7 +2830,7 @@ impl DevShell {
             return;
         };
         let job = gitten_app::verbs::Write::checkout(&writes.repo, commit.sha.clone().into_bytes());
-        if !writes.send(Box::new(job)) {
+        if !self.queue_write(&writes, Box::new(job)) {
             self.set_notice("the job queue is shutting down");
         }
     }
@@ -2881,7 +2931,7 @@ impl DevShell {
                 gitten_app::verbs::Write::rename_branch(&writes.repo, from, text.into_bytes())
             }
         };
-        if !writes.send(Box::new(job)) {
+        if !self.queue_write(&writes, Box::new(job)) {
             self.set_notice("the job queue is shutting down");
         }
     }
@@ -2945,7 +2995,7 @@ impl DevShell {
             at.into_bytes(),
             None,
         );
-        if !writes.send(Box::new(job)) {
+        if !self.queue_write(&writes, Box::new(job)) {
             self.set_notice("the job queue is shutting down");
         }
     }
@@ -4805,6 +4855,41 @@ impl DevShell {
         view.read(cx).head_info().map(|info| info.label)
     }
 
+    /// Keeps the platform's titlebar level with what the window is showing.
+    ///
+    /// A title is handed to the platform once, when the window opens, and a
+    /// deferred launch opens before it knows what it is looking at —
+    /// [`STARTUP_LOADING`] is the honest word at that moment and a
+    /// permanent lie from the wave's landing onwards. So the window
+    /// re-spells its own title from the repository and HEAD, which is what
+    /// a window list is being asked when several of these are open.
+    ///
+    /// A launch with no repository behind it — a `.diff` fixture, a patch —
+    /// keeps the title it opened with: the path is the only thing this
+    /// could say, and there is none.
+    fn sync_window_title(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((path, _)) = self.repo.as_ref() else {
+            return;
+        };
+        let head = self.head_label(cx);
+        if self
+            .os_title
+            .borrow()
+            .as_ref()
+            .is_some_and(|(p, h)| p == path && *h == head)
+        {
+            return;
+        }
+        let (_, name) = repo_title(path, home());
+        let label = match &head {
+            Some(head) => format!("{name} \u{00b7} {head}"),
+            None => name,
+        };
+        let view = View::parse(self.which).unwrap_or(View::Commits);
+        window.set_window_title(&started_title(view, &label));
+        *self.os_title.borrow_mut() = Some((path.clone(), head));
+    }
+
     /// Which inspector field holds the keyboard, if one does: `false` for
     /// Summary, `true` for Description. The prompt path keeps its promise
     /// about where the keyboard is by slot; the embedded fields keep it by
@@ -4888,7 +4973,19 @@ impl DevShell {
     /// generation: a staging write's wave re-lands the same selection with
     /// a newer generation, which counts as new — the preview follows the
     /// side that just moved without another keystroke.
+    ///
+    /// A write queued by the command this is the tail of takes that
+    /// re-aiming away from the keyboard's own move: see
+    /// [`DevShell::queued_write`]. The sidebar's stage box moves the
+    /// keyboard onto the row before it stages, so the selection names the
+    /// side the write is about to empty — loading it produced "nothing
+    /// unstaged for f.txt" over a file that had just been staged
+    /// successfully.
     fn sync_workspace_preview(&mut self, cx: &mut Context<Self>) {
+        // Spent here and not below the destination check: a History tail
+        // has no preview to aim, and a record left standing would suppress
+        // the next schedule Changes asks for.
+        let queued_write = self.queued_write.take();
         // Only Changes has a preview to aim; History reads the commits pane
         // and the one diff view instead, and re-aiming the hidden file
         // center there would be a load nobody sees.
@@ -4928,6 +5025,18 @@ impl DevShell {
             self.workspace
                 .sidebar_scroll
                 .scroll_to_item(row, ScrollStrategy::Nearest);
+        }
+        // The write's own wave arrives with a newer generation, so the key
+        // it lands under is new again and the preview aims then — at the
+        // side the file is on rather than the one it left. Suppressing only
+        // an aim under the *queued* generation is what keeps a record that
+        // survived to that wave — a write sent outside a dispatch, with no
+        // command tail to spend it — from vetoing the re-aim it was waiting
+        // for. The rail above still follows the keyboard: the box moved it,
+        // and a row the window will not scroll to is a row nobody staged.
+        if queued_write == Some(gen) {
+            self.workspace.last = Some(key);
+            return;
         }
         // Conflicts render through their own markers presentation, not a
         // diff — Phase 2 leaves the center on the last file.
@@ -4998,8 +5107,18 @@ impl DevShell {
                     }
                     // A side that vanished under the selection — staged the
                     // last hunk, deleted the file — is not a crash: one
-                    // sentence in the band, and the last rows keep standing.
-                    Err(e) => shell.set_notice(e),
+                    // sentence in the band, and the center emptied under the
+                    // header that already names the new file. Keeping the
+                    // last rows standing was worse than an empty pane: the
+                    // header, the status letters and the band all named one
+                    // file while the body was still somebody else's diff.
+                    Err(e) => {
+                        if let Some(center) = shell.workspace.center.clone() {
+                            let host = config::host(cx);
+                            center.update(cx, |d, cx| d.replace(Vec::new(), &host, cx));
+                        }
+                        shell.set_notice(e);
+                    }
                 }
             });
         })
@@ -6227,6 +6346,10 @@ impl Render for DevShell {
         if !self.first_render.replace(true) {
             start::mark("first render");
         }
+        // The platform's titlebar, which is written from here because this
+        // is where the `Window` is. A memo compare per frame, a call only
+        // when the repository or HEAD moved.
+        self.sync_window_title(window, cx);
         let overlay = self.stats.as_mut().map(|s| {
             s.tick();
             (s.frames(), s.rows(), s.heap(), s.load.clone())
@@ -7498,6 +7621,7 @@ fn open_main_window(launch: Launch, cx: &mut App) {
                 refresh_pending: 0,
                 refresh_error: None,
                 running: None,
+                queued_write: None,
                 show_message: false,
                 input: None,
                 prompt: None,
@@ -7510,6 +7634,7 @@ fn open_main_window(launch: Launch, cx: &mut App) {
                 config: shell_config_path,
                 first_render: Cell::new(false),
                 title_memo: RefCell::new(None),
+                os_title: RefCell::new(None),
                 workspace: views::workspace::Workspace::default(),
                 drafts: std::collections::HashMap::new(),
                 commit_confirm: false,
@@ -8257,6 +8382,7 @@ mod tests {
                 refresh_pending: 0,
                 refresh_error: None,
                 running: None,
+                queued_write: None,
                 show_message: false,
                 input: None,
                 prompt: None,
@@ -8269,6 +8395,7 @@ mod tests {
                 config: std::path::PathBuf::new(),
                 first_render: Cell::new(false),
                 title_memo: RefCell::new(None),
+                os_title: RefCell::new(None),
                 workspace: crate::views::workspace::Workspace::default(),
                 drafts: std::collections::HashMap::new(),
                 commit_confirm: false,
@@ -10345,6 +10472,54 @@ diff --git a/fresh.txt b/fresh.txt
         shell.update(cx, |shell, cx| shell.run_command("files.stage", cx));
         pump_write(&shell, cx);
         assert_eq!(repo.wrote(), vec!["stage notes.md", "unstage gone.txt"]);
+    }
+
+    /// A write queued mid-command stands the preview's aim aside for the
+    /// generation it was sent against — the selection names the side the
+    /// write is emptying, and aiming there can only refuse over a file that
+    /// staged cleanly. The record is scoped to that generation precisely so
+    /// a write queued outside a dispatch — the input field's accept has no
+    /// command tail to spend it — cannot veto the wave it was waiting for.
+    #[gpui::test]
+    fn a_queued_write_stands_the_preview_aside_for_its_own_wave(cx: &mut TestAppContext) {
+        let (shell, repo, _handle) = files_shell(cx);
+        // The cursor starts on the last row: notes.md, under *unstaged*.
+        shell.update(cx, |shell, cx| shell.run_command("files.stage", cx));
+        shell.read_with(cx, |shell, _| {
+            // The command's tail spent the record: the preview key was
+            // claimed under the pre-write generation with no load scheduled.
+            assert_eq!(shell.queued_write, None);
+            assert_eq!(shell.workspace.request, 0);
+            assert_eq!(
+                shell.workspace.last,
+                Some((crate::views::files::Section::Unstaged, "notes.md".into(), 0))
+            );
+        });
+
+        // The write's own wave lands under a newer generation and aims.
+        pump_write(&shell, cx);
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(repo.wrote(), vec!["stage notes.md"]);
+            assert!(
+                shell.workspace.request > 0,
+                "the wave never re-aimed the preview"
+            );
+        });
+
+        // A record left over an older generation must not veto the aim —
+        // it reads as spent, not as standing.
+        let before = shell.read_with(cx, |s, _| s.workspace.request);
+        shell.update(cx, |shell, cx| {
+            shell.queued_write = Some(0);
+            shell.workspace.last = None;
+            shell.sync_workspace_preview(cx);
+        });
+        shell.read_with(cx, |shell, _| {
+            assert!(
+                shell.workspace.request > before,
+                "a stale record vetoed the preview's aim"
+            );
+        });
     }
 
     // ------------------------------------------------------- the stash verbs
