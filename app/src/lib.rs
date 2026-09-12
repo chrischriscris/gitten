@@ -61,6 +61,7 @@ pub mod jobs;
 pub mod patchwork;
 pub mod projects;
 pub mod verbs;
+pub mod watch;
 
 use cli::{Request, Source, View};
 use gitten_core::host::Host;

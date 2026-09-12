@@ -1575,6 +1575,66 @@ pub fn open(root: &Path) -> Handle {
     })
 }
 
+/// The three roots a repository watcher has to hold, because git does not
+/// keep them together.
+///
+/// The worktree is where file edits land — `None` for a bare repository,
+/// which has none. The gitdir holds this checkout's own state: the index,
+/// HEAD, the sequencing files a merge or rebase writes. The commondir is
+/// what every worktree of the repository shares — refs, packed-refs, the
+/// logs — and it is why the gitdir alone is not enough: a linked worktree's
+/// gitdir lives under `commondir/worktrees/`, and a commit made in a sibling
+/// worktree moves the common refs, not this one's.
+pub struct WatchTargets {
+    /// The checked-out tree, to be watched for edits. `None` when bare.
+    pub worktree: Option<PathBuf>,
+    /// This checkout's own state directory.
+    pub gitdir: PathBuf,
+    /// The directory every worktree of this repository shares. Equals
+    /// `gitdir` when there is only one worktree.
+    pub commondir: PathBuf,
+}
+
+/// Resolves [`WatchTargets`] for `root`, or `None` when git cannot answer —
+/// `root` is not a repository.
+///
+/// `rev-parse` follows the indirections itself, so a `.git` *file* — a
+/// submodule's, a linked worktree's — is resolved rather than parsed here.
+/// `--show-toplevel` is asked in its own process because it refuses on a
+/// bare repository, and a bare repository still has state worth watching.
+pub fn watch_targets(root: &Path) -> Option<WatchTargets> {
+    let layout = run(
+        root,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--absolute-git-dir",
+            "--git-common-dir",
+        ],
+    )
+    .ok()?;
+    let mut lines = layout
+        .split(|b| *b == b'\n')
+        .map(trimmed)
+        .filter(|l| !l.is_empty());
+    let gitdir = join_raw(root, lines.next()?);
+    let commondir = join_raw(root, lines.next()?);
+    let worktree = run(
+        root,
+        &["rev-parse", "--path-format=absolute", "--show-toplevel"],
+    )
+    .ok()
+    .and_then(|raw| {
+        let at = trimmed(raw.as_slice());
+        (!at.is_empty()).then(|| join_raw(root, at))
+    });
+    Some(WatchTargets {
+        worktree,
+        gitdir,
+        commondir,
+    })
+}
+
 /// The shipped implementation: the `git` binary.
 ///
 /// Private on purpose. It is *an* answer to [`Repo`], not the surface; the day
@@ -12152,6 +12212,87 @@ mod tests {
         );
         assert_ne!(path, root.join(".git").join("rebase-merge"));
         let _ = std::fs::remove_dir_all(linked);
+    }
+
+    #[test]
+    fn watch_targets_name_the_three_roots() {
+        let r = Scratch::new("watch-targets");
+        // Both sides canonicalized: rev-parse's absolute answer and a temp
+        // path can disagree across a symlink (`/var` on macOS).
+        let root = r.0.canonicalize().expect("the repository path");
+        let t = watch_targets(&r.0).expect("a repository answers");
+        let gitdir = t.gitdir.canonicalize().expect("the gitdir exists");
+        assert_eq!(
+            t.worktree
+                .map(|w| w.canonicalize().expect("the worktree exists")),
+            Some(root.clone())
+        );
+        assert_eq!(gitdir, root.join(".git"));
+        assert_eq!(t.commondir, t.gitdir, "one worktree shares nothing");
+    }
+
+    #[test]
+    fn watch_targets_split_a_linked_worktree_from_its_common_dir() {
+        let r = Scratch::new("watch-targets-linked");
+        r.write("base.txt", b"base\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "base"]);
+        let linked = std::env::temp_dir().join(format!(
+            "gitten-git-watch-targets-wt-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&linked);
+        r.git_os(&[
+            "worktree".into(),
+            "add".into(),
+            "-q".into(),
+            "-b".into(),
+            "linked".into(),
+            linked.as_os_str().to_owned(),
+        ]);
+
+        let t = watch_targets(&linked).expect("a linked worktree answers");
+        let root = r.0.canonicalize().expect("the repository path");
+        let linked = linked.canonicalize().expect("the worktree path");
+        assert_eq!(
+            t.worktree
+                .map(|w| w.canonicalize().expect("the worktree exists")),
+            Some(linked.clone())
+        );
+        let gitdir = t.gitdir.canonicalize().expect("the gitdir exists");
+        assert!(
+            gitdir.starts_with(root.join(".git").join("worktrees")),
+            "{gitdir:?} is not the worktree's own gitdir",
+        );
+        // Refs live in the common dir — where a sibling's commit lands.
+        assert_eq!(
+            t.commondir.canonicalize().expect("the commondir exists"),
+            root.join(".git")
+        );
+        let _ = std::fs::remove_dir_all(linked);
+    }
+
+    #[test]
+    fn watch_targets_answer_a_bare_repository_with_no_worktree() {
+        let r = Scratch::bare("watch-targets-bare");
+        let t = watch_targets(&r.0).expect("a bare repository answers");
+        assert_eq!(t.worktree, None);
+        assert_eq!(
+            t.gitdir.canonicalize().expect("the gitdir exists"),
+            r.0.canonicalize().expect("the repository path")
+        );
+    }
+
+    #[test]
+    fn watch_targets_say_nothing_where_git_says_nothing() {
+        let dir = std::env::temp_dir().join(format!(
+            "gitten-git-watch-targets-none-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a temp dir");
+        assert!(watch_targets(&dir).is_none());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

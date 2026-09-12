@@ -24,12 +24,13 @@ use gitten_core::host::Host;
 use gitten_core::refs::ResetMode;
 use gitten_core::theme;
 use gitten_core::{Commit, FileDiff};
+use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::*;
 use stats::Stats;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -230,6 +231,15 @@ const EXTRA: &str = "  `,` opens the settings: the presentation (unified, side-b
 /// `None` means nothing on screen can be re-diffed — a `.diff` fixture was
 /// diffed by somebody else — and the control is drawn inert.
 type Rediff = Rc<dyn Fn(&Host, &Overrides, &str) -> Result<Vec<FileDiff>, String>>;
+
+/// Milliseconds since the epoch, for the watcher's flag — its callback runs
+/// on notify's thread, where an `Instant` cannot be stamped atomically.
+fn epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// Which menu is open. At most one, because two open menus over a diff is two
 /// things to dismiss.
@@ -1232,6 +1242,36 @@ struct DevShell {
     /// the wave lands under a newer generation, which must read as spent
     /// rather than suppress the very re-aim the record was waiting for.
     queued_write: Option<u64>,
+    /// When the repository last changed on disk, stamped by the watcher's
+    /// callback as epoch milliseconds — an `AtomicU64` because that callback
+    /// runs on notify's thread, not ours. Window activation stamps it too:
+    /// coming back to the window is the same question as a file event. Zero
+    /// until anything fires.
+    repo_changed: Arc<AtomicU64>,
+    /// The stamp [`DevShell::note_repo_event`] last turned into a wave — the
+    /// flag is read as `repo_changed > repo_seen`, never cleared, so an
+    /// event that lands while a wave is in flight is still owed one.
+    repo_seen: u64,
+    /// The flag's value at the moment the in-flight wave began. An event is
+    /// stamped after its write completed, so everything stamped before a
+    /// wave's loads spawned is read by that wave — including the churn our
+    /// own writes leave in the flag, which would otherwise buy a second,
+    /// identical wave 250ms after every one. When the wave lands,
+    /// `repo_seen` ratchets up to this.
+    refresh_since: u64,
+    /// The live watcher, and the root it points at. Held because dropping it
+    /// stops the watching; rebuilt by the pump when a repository switch moves
+    /// `repo` under it. The path is remembered even when building failed, so
+    /// a root notify cannot watch is not retried every tick.
+    repo_watch: Option<gitten_app::watch::RepoWatch>,
+    repo_watch_path: Option<std::path::PathBuf>,
+    /// When the last watcher-triggered wave started: the rate floor a stream
+    /// of events is held to. A build writing `target/` buys at most one wave
+    /// per floor, not one per save.
+    repo_wave_at: Instant,
+    /// Held so the registration lives — the window-activation observer's.
+    /// Dropping a `Subscription` deregisters it.
+    _window_subs: Vec<Subscription>,
     /// The one native text field over the active screen, if a command is
     /// gathering input. Consumers subscribe to its accepted/cancelled event.
     input: Option<Entity<input::Input>>,
@@ -3287,6 +3327,7 @@ impl DevShell {
             return;
         };
         self.invalidate_refresh();
+        self.refresh_since = self.repo_changed.load(Ordering::Relaxed);
         let refresh_id = self.refresh_id;
         let host = config::host(cx);
         let target = self.generation;
@@ -3345,6 +3386,9 @@ impl DevShell {
         }
         self.refresh_pending = self.refresh_pending.saturating_sub(1);
         if self.refresh_pending == 0 {
+            // The wave read the repository as of when it began: stamps older
+            // than that boundary are answered by it, newer ones stay owed.
+            self.repo_seen = self.repo_seen.max(self.refresh_since);
             if self.error.is_none() {
                 self.error = self.refresh_error.take().map(GitError::new);
                 self.error_is_load = self.error.is_some();
@@ -3395,6 +3439,73 @@ impl DevShell {
         self.refresh_id = self.refresh_id.saturating_add(1);
         self.refresh_pending = 0;
         self.refresh_error = None;
+    }
+
+    /// The watcher pump's tick: keep the watch pointed at the repository the
+    /// window is on, then turn a settled, unsuppressed flag into the same
+    /// wave `repo.refresh` and a finished write raise.
+    ///
+    /// The flag is consumed only when a wave actually leaves: every early
+    /// return below leaves `repo_changed` unread for the next tick, so a
+    /// burst that arrived during a write — ours or the wave one already
+    /// raised — is still owed a read when it finishes.
+    fn note_repo_event(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.repo.as_ref().map(|(p, _)| p.clone()) else {
+            // A fixture has no repository behind it: nothing to watch, no
+            // wave to raise — and nothing the flag could owe later, since a
+            // switch consumes whatever was stamped by then.
+            return;
+        };
+        if self.repo_watch_path.as_ref() != Some(&path) {
+            self.repo_watch_path = Some(path.clone());
+            self.repo_watch = {
+                let flag = self.repo_changed.clone();
+                match gitten_app::watch::repo(&path, move || {
+                    flag.store(epoch_ms(), Ordering::Relaxed)
+                }) {
+                    Ok(watch) => Some(watch),
+                    Err(e) => {
+                        eprintln!(
+                            "gitten: cannot watch {}: {e}; auto-refresh is off",
+                            path.display()
+                        );
+                        None
+                    }
+                }
+            };
+            // The repository just changed under the window; the switch's own
+            // wave read it already, and a stamp the last repository earned
+            // must not read this one twice.
+            self.repo_seen = self.repo_changed.load(Ordering::Relaxed);
+            return;
+        }
+        let stamp = self.repo_changed.load(Ordering::Relaxed);
+        if stamp <= self.repo_seen {
+            return;
+        }
+        // Still landing: a burst of events means the write is mid-flight and
+        // the wave reads truer after it stops.
+        if epoch_ms().saturating_sub(stamp) < 250 {
+            return;
+        }
+        // A write of ours, or the wave it already raised, re-reads everything
+        // at its own finish; the flag stays set for whatever meanwhile came
+        // from outside.
+        if self.running.is_some() || self.refresh_pending > 0 {
+            return;
+        }
+        // The floor under a stream of changes — a build's worth of `target/`
+        // writes — is lazygit's own external-change cadence: one wave per
+        // two seconds while the tree will not sit still.
+        if self.repo_wave_at.elapsed() < Duration::from_secs(2) {
+            return;
+        }
+        self.repo_seen = stamp;
+        self.repo_wave_at = Instant::now();
+        // The same epoch a finished write opens: everything on screen
+        // predates the newest stamp, so every pane is stale.
+        self.generation = self.generation.advance();
+        self.refresh_stale(cx);
     }
 
     /// One of the platform's menu actions: named dispatch through
@@ -7124,12 +7235,40 @@ impl Render for DevShell {
                         )
                         .child(
                             div()
-                                .id("workspace-commands")
-                                .cursor_pointer()
-                                .child("Commands  ⌘K")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.run_command("commands.palette", cx)
-                                })),
+                                .flex()
+                                .items_center()
+                                .gap(px(14.0))
+                                // The mouse's refresh: the wave `R` raises,
+                                // reachable without the keyboard, and absent
+                                // over a fixture — there is nothing behind
+                                // the rows to re-read.
+                                .when(self.repo.is_some(), |d| {
+                                    d.child(
+                                        div()
+                                            .id("statusbar-refresh")
+                                            .cursor_pointer()
+                                            .child(
+                                                match host.keys.keys_for("repo.refresh").first() {
+                                                    Some(key) => SharedString::from(format!(
+                                                        "Refresh  {key}"
+                                                    )),
+                                                    None => SharedString::from("Refresh"),
+                                                },
+                                            )
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.run_command("repo.refresh", cx)
+                                            })),
+                                    )
+                                })
+                                .child(
+                                    div()
+                                        .id("workspace-commands")
+                                        .cursor_pointer()
+                                        .child("Commands  ⌘K")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.run_command("commands.palette", cx)
+                                        })),
+                                ),
                         )
                         .into_any_element(),
                 }
@@ -7906,6 +8045,13 @@ fn open_main_window(launch: Launch, cx: &mut App) {
                 qa_deferred: Vec::new(),
                 running: None,
                 queued_write: None,
+                repo_changed: Arc::new(AtomicU64::new(0)),
+                repo_seen: 0,
+                refresh_since: 0,
+                repo_watch: None,
+                repo_watch_path: None,
+                repo_wave_at: Instant::now(),
+                _window_subs: Vec::new(),
                 show_message: false,
                 input: None,
                 prompt: None,
@@ -7967,6 +8113,16 @@ fn open_main_window(launch: Launch, cx: &mut App) {
             {
                 let shell = shell.clone();
                 shell.update(cx, |shell, cx| {
+                    // Looking at the window is itself a reason to re-read the
+                    // repository — whatever changed, changed in what was on
+                    // screen before. It stamps the flag rather than firing
+                    // the wave so the same debounce and rate floor decide.
+                    let sub = cx.observe_window_activation(window, |this, window, _| {
+                        if window.is_window_active() {
+                            this.repo_changed.store(epoch_ms(), Ordering::Relaxed);
+                        }
+                    });
+                    shell._window_subs.push(sub);
                     shell.sync_focus(cx);
                     // The workspace is the launch destination per the
                     // interaction contract: build the center, focus the
@@ -8002,6 +8158,26 @@ fn open_main_window(launch: Launch, cx: &mut App) {
                         .timer(Duration::from_millis(50))
                         .await;
                     if shell.update(cx, |shell, cx| shell.drain_jobs(cx)).is_err() {
+                        break;
+                    }
+                })
+                .detach();
+            }
+            // The repository watcher's half of the flag-and-poll shape the
+            // config watcher's is: the callback stamps, this tick decides —
+            // including keeping the watch pointed at the repository a switch
+            // moved the window to, which is why the watcher lives behind the
+            // pump and not at launch.
+            {
+                let shell = shell.downgrade();
+                cx.spawn(async move |cx: &mut AsyncApp| loop {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(150))
+                        .await;
+                    if shell
+                        .update(cx, |shell, cx| shell.note_repo_event(cx))
+                        .is_err()
+                    {
                         break;
                     }
                 })
@@ -8284,8 +8460,8 @@ fn window_options(title: SharedString, geometry: Option<(f32, f32)>) -> WindowOp
 #[cfg(test)]
 mod tests {
     use super::{
-        bare_launch_view, config, input, open_recent, panes, settings_window, DevShell, GitError,
-        Notice, Open, Pane, Refresh, Screen, Writes,
+        bare_launch_view, config, epoch_ms, input, open_recent, panes, settings_window, DevShell,
+        GitError, Notice, Open, Pane, Refresh, Screen, Writes,
     };
     use crate::views::commits::Commits;
     use gitten_app::cli::{Source, View};
@@ -8298,7 +8474,7 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::path::PathBuf;
     use std::rc::Rc;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -8681,6 +8857,13 @@ mod tests {
                 qa_deferred: Vec::new(),
                 running: None,
                 queued_write: None,
+                repo_changed: Arc::new(AtomicU64::new(0)),
+                repo_seen: 0,
+                refresh_since: 0,
+                repo_watch: None,
+                repo_watch_path: None,
+                repo_wave_at: Instant::now(),
+                _window_subs: Vec::new(),
                 show_message: false,
                 input: None,
                 prompt: None,
@@ -9133,6 +9316,104 @@ mod tests {
                 shell.running.as_ref().map(|(label, _)| label.as_str()),
                 Some("running next write")
             );
+        });
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    /// The watcher's half of auto-refresh: a settled stamp raises the same
+    /// wave a finished write does, and the three silences — a burst still
+    /// landing, a write already re-reading, the rate floor — each hold it
+    /// off without losing it.
+    #[gpui::test]
+    fn a_repository_event_raises_one_wave_and_the_silences_hold(cx: &mut TestAppContext) {
+        let shell = shell(None, cx);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let path = PathBuf::from("/fake");
+        shell.update(cx, |shell, cx| {
+            let root = cx.new(|_| Commits::new(Vec::new(), Rc::new(Host::new())));
+            shell.panes = panes::Panes::new(
+                "commits",
+                Screen::commits(
+                    root,
+                    Source::Repo {
+                        path: path.clone(),
+                        arg: "1".into(),
+                    },
+                    Generation::default(),
+                    "stale",
+                ),
+            );
+            shell.repo = Some((
+                path.clone(),
+                Arc::new(RefreshRepo {
+                    calls: calls.clone(),
+                }),
+            ));
+            cx.set_global(config::Active(Rc::new(Host::new())));
+            // `/fake` cannot be watched — recording the path keeps the tick
+            // from asking notify again on every call.
+            shell.repo_watch_path = Some(path);
+            shell.repo_wave_at = Instant::now() - Duration::from_secs(10);
+
+            // A stamp newer than the debounce window is a burst in flight.
+            shell.repo_changed.store(epoch_ms(), Ordering::Relaxed);
+            shell.note_repo_event(cx);
+            assert_eq!(shell.refresh_pending, 0, "a fresh stamp fired the wave");
+
+            // A settled stamp during our own write is still owed, not spent.
+            shell
+                .repo_changed
+                .store(epoch_ms() - 1_000, Ordering::Relaxed);
+            shell.running = Some(("write".into(), Instant::now()));
+            shell.note_repo_event(cx);
+            assert_eq!(shell.refresh_pending, 0, "a running write fired the wave");
+            shell.running = None;
+
+            // Settled and unsuppressed: the wave leaves.
+            shell.note_repo_event(cx);
+            assert_eq!(shell.refresh_pending, 1, "the settled stamp held its wave");
+
+            // The same stamp is consumed — a second tick raises nothing.
+            shell.note_repo_event(cx);
+            assert_eq!(shell.refresh_pending, 1, "a consumed stamp fired again");
+
+            // And a stamp that lands inside the wave stays owed — stamping
+            // it here, before the wave is parked home.
+            shell.repo_changed.store(
+                (epoch_ms() - 1_000).max(shell.repo_seen + 1),
+                Ordering::Relaxed,
+            );
+        });
+        cx.run_until_parked();
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "one stamp, one load");
+
+        shell.update(cx, |shell, cx| {
+            assert_eq!(shell.refresh_pending, 0);
+            // The in-wave stamp was not covered by the wave that landed over
+            // it — floor willing, the next tick pays it. The wave carries
+            // two loads now: wave one's landing aimed the main diff at a
+            // repository source, so it rides every wave after.
+            shell.repo_wave_at = Instant::now() - Duration::from_secs(10);
+            shell.note_repo_event(cx);
+            assert!(
+                shell.refresh_pending >= 1,
+                "an event inside a wave was lost with it"
+            );
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            2,
+            "the owed stamp got its wave"
+        );
+
+        shell.update(cx, |shell, cx| {
+            // And that wave consumed the stamp that raised it: floor out of
+            // the way, a quiet tick still raises nothing — which is also why
+            // a write's own churn costs no second wave.
+            shell.repo_wave_at = Instant::now() - Duration::from_secs(10);
+            shell.note_repo_event(cx);
+            assert_eq!(shell.refresh_pending, 0, "a covered stamp fired again");
         });
         assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
