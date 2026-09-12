@@ -138,6 +138,21 @@ mod tests {
         0
     }
 
+    /// No new events for `quiet`, bounded: one write's events — the create,
+    /// the modify, the close — trail its first by however long a slow
+    /// machine feels like taking, so a phase is not over when the counter
+    /// moves; it is over when the counter holds still.
+    fn drain(counter: &Arc<AtomicUsize>, quiet: Duration) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let n = counter.load(Ordering::Relaxed);
+            std::thread::sleep(quiet);
+            if counter.load(Ordering::Relaxed) == n || Instant::now() > deadline {
+                return;
+            }
+        }
+    }
+
     #[test]
     fn a_save_and_an_index_write_speak_but_churn_does_not() {
         let root = scratch("filter");
@@ -149,7 +164,7 @@ mod tests {
         .expect("a repository watches");
         // Settle the watcher's own birth before measuring: setup can report
         // the files `git init` wrote moments ago.
-        std::thread::sleep(Duration::from_millis(400));
+        drain(&calls, Duration::from_millis(300));
 
         calls.store(0, Ordering::Relaxed);
         std::fs::write(root.join("new.txt"), b"saved in an editor\n").expect("a save");
@@ -157,6 +172,7 @@ mod tests {
             fired(&calls, Duration::from_secs(5)) > 0,
             "a worktree save fired nothing"
         );
+        drain(&calls, Duration::from_millis(300));
 
         calls.store(0, Ordering::Relaxed);
         std::fs::write(root.join(".git").join("index"), b"staged\n").expect("an index write");
@@ -164,6 +180,7 @@ mod tests {
             fired(&calls, Duration::from_secs(5)) > 0,
             "an index write fired nothing"
         );
+        drain(&calls, Duration::from_millis(300));
 
         // The two silences: a loose object is churn whose answer is a ref,
         // and a lock is a write in flight whose answer is the rename.
@@ -172,7 +189,7 @@ mod tests {
         std::fs::create_dir_all(&objects).expect("an objects dir");
         std::fs::write(objects.join("c".repeat(38)), b"x").expect("a loose object");
         std::fs::write(root.join(".git").join("index.lock"), b"x").expect("a lock");
-        std::thread::sleep(Duration::from_millis(600));
+        drain(&calls, Duration::from_millis(300));
         assert_eq!(
             calls.load(Ordering::Relaxed),
             0,
