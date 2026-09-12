@@ -577,14 +577,19 @@ pub(crate) fn render_sidebar(deps: &SidebarDeps, cx: &mut App) -> AnyElement {
                 div()
                     // The bar overlays the list, so its box has to be the one
                     // the list is painted in — the same shape every pane's
-                    // strip container has.
+                    // strip container has. Which is why the rail's 10px gutter
+                    // is the *list's* padding and not this box's: a scrollbar
+                    // is drawn on the handle's own bounds, so a gutter here is
+                    // a gutter between the thumb and the pane's edge, ten
+                    // pixels of nothing beside the divider. The list takes the
+                    // full box, rows are laid out inside the padding, and the
+                    // bar lands on the edge it belongs on.
                     .relative()
                     .flex_grow(1.0)
                     .min_h_0()
                     .overflow_hidden()
                     .pt(px(5.0))
-                    .px(px(10.0))
-                    .child(list)
+                    .child(list.px(px(10.0)))
                     .when(host.view.scrollbar, |d| {
                         // `direct`: the rail's wheel writes the handle's own
                         // offset in the platform's pixels, so there are no

@@ -9696,38 +9696,6 @@ mod tests {
         });
     }
 
-    /// A 1200x800 window over a shell on `tree`, which is what the blob-pane
-    /// tests need: a drawn centre and the handle its files are addressed on.
-    fn window_with_tree(
-        cx: &mut TestAppContext,
-        tree: Status,
-    ) -> (
-        gpui::Entity<DevShell>,
-        Arc<RecordingRepo>,
-        gpui::VisualTestContext,
-    ) {
-        let (shell, repo, _handle) = tree_shell(cx, tree);
-        let observed = shell.clone();
-        let window = cx.update(|cx| {
-            gpui_component::init(cx);
-            cx.set_global(config::Active(Rc::new(Host::new())));
-            cx.open_window(
-                gpui::WindowOptions {
-                    window_bounds: Some(gpui::WindowBounds::Windowed(gpui::Bounds {
-                        origin: Default::default(),
-                        size: gpui::size(gpui::px(1200.0), gpui::px(800.0)),
-                    })),
-                    ..Default::default()
-                },
-                move |_, _| observed,
-            )
-            .unwrap()
-        });
-        let cx = gpui::VisualTestContext::from_window(window.into(), cx);
-        cx.run_until_parked();
-        (shell, repo, cx)
-    }
-
     /// A binary file in the rail gives the centre the blob pane, through the
     /// real wiring: the preview lane's own job, the shell's own choice of
     /// body, and the pane's own store. A text file keeps the rows.
@@ -9749,7 +9717,7 @@ mod tests {
         });
         // A real window, because half of this test is what the *centre* draws:
         // the shell's choice of body, not the pane's own state.
-        let (shell, repo, mut cx) = window_with_tree(cx, tree);
+        let (shell, repo, mut cx) = rail_window(cx, tree);
         // The read the preview makes — one binary file, which is the shape a
         // diff cannot draw.
         *repo.unstaged.lock().unwrap() = vec![Pair {
@@ -9859,7 +9827,7 @@ A paragraph with **bolder** and [a link](https://example.com/y).
             kind: gitten_core::status::Kind::File,
             submodule: Default::default(),
         });
-        let (shell, repo, mut cx) = window_with_tree(cx, tree);
+        let (shell, repo, mut cx) = rail_window(cx, tree);
         *repo.unstaged.lock().unwrap() = vec![Pair {
             path: "README.md".into(),
             old_path: None,
@@ -9928,25 +9896,7 @@ A paragraph with **bolder** and [a link](https://example.com/y).
                 submodule: Default::default(),
             });
         }
-        let (shell, _repo, _handle) = tree_shell(cx, tree);
-        let observed = shell.clone();
-        let window = cx.update(|cx| {
-            gpui_component::init(cx);
-            cx.set_global(config::Active(Rc::new(Host::new())));
-            cx.open_window(
-                gpui::WindowOptions {
-                    window_bounds: Some(gpui::WindowBounds::Windowed(gpui::Bounds {
-                        origin: Default::default(),
-                        size: gpui::size(gpui::px(1200.0), gpui::px(800.0)),
-                    })),
-                    ..Default::default()
-                },
-                move |_, _| observed,
-            )
-            .unwrap()
-        });
-        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
-        cx.run_until_parked();
+        let (shell, _repo, mut cx) = rail_window(cx, tree);
 
         let rail = cx.debug_bounds("workspace-sidebar").expect("no rail drawn");
         let at = rail.center();
@@ -9980,6 +9930,77 @@ A paragraph with **bolder** and [a link](https://example.com/y).
             offset(&cx),
             -50.0,
             "the rail's sign came from somewhere else"
+        );
+    }
+
+    /// A 1200x800 window over a shell on `tree`, which is what both rail
+    /// tests need: a drawn rail and the handle its rows are addressed on.
+    fn rail_window(
+        cx: &mut TestAppContext,
+        tree: Status,
+    ) -> (
+        gpui::Entity<DevShell>,
+        Arc<RecordingRepo>,
+        gpui::VisualTestContext,
+    ) {
+        let (shell, repo, _handle) = tree_shell(cx, tree);
+        let observed = shell.clone();
+        let window = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.set_global(config::Active(Rc::new(Host::new())));
+            cx.open_window(
+                gpui::WindowOptions {
+                    window_bounds: Some(gpui::WindowBounds::Windowed(gpui::Bounds {
+                        origin: Default::default(),
+                        size: gpui::size(gpui::px(1200.0), gpui::px(800.0)),
+                    })),
+                    ..Default::default()
+                },
+                move |_, _| observed,
+            )
+            .unwrap()
+        });
+        let cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+        (shell, repo, cx)
+    }
+
+    /// The rail's bar is drawn on the *list's* bounds — the widget paints its
+    /// track over the handle's viewport, not over its own box — so every pixel
+    /// the list leaves at the pane's right edge is a pixel of gap between the
+    /// thumb and the divider. Ten of them, once: the rail's gutter was the
+    /// container's padding and the bar rode the padding in with it. The
+    /// invariant is a width and not a screenshot — the list spans the pane, and
+    /// the rows keep the gutter it no longer spends.
+    #[gpui::test]
+    fn the_rails_bar_sits_on_the_panes_edge(cx: &mut TestAppContext) {
+        let mut tree = Status::default();
+        tree.unstaged.push(gitten_core::status::UnstagedEntry {
+            path: gitten_core::status::PathBytes::from("a.txt"),
+            change: gitten_core::status::Change::Modified,
+            kind: gitten_core::status::Kind::File,
+            submodule: Default::default(),
+        });
+        let (shell, _repo, mut cx) = rail_window(cx, tree);
+
+        let rail = cx.debug_bounds("workspace-sidebar").expect("no rail drawn");
+        let (list, item) = shell.read_with(&cx, |shell, _| {
+            let state = shell.workspace.sidebar_scroll.0.borrow();
+            (
+                state.base_handle.bounds(),
+                state.last_item_size.expect("no row measured").item,
+            )
+        });
+        assert_eq!(
+            (list.left(), list.right()),
+            (rail.left(), rail.right() - gpui::px(1.0)),
+            "the rail's list stops short of the pane: the bar rides the list's \
+             own bounds, so what it stops short by is a gap beside the divider"
+        );
+        assert_eq!(
+            item.width,
+            rail.size.width - gpui::px(21.0),
+            "the rail's gutter is the rows' — the list is full width, not padded"
         );
     }
 
