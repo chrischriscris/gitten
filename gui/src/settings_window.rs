@@ -59,6 +59,13 @@ pub(crate) fn open(main: Entity<crate::DevShell>, cx: &mut App) {
         // main window's, not this one's.
         crate::window_options("gitten — Settings".into(), None);
         options.window_bounds = Some(WindowBounds::centered(size(px(740.0), px(560.0)), cx));
+        // The shared options centre the lights on the main strip's TITLE_H;
+        // this window's header is HEADER_H, so they get recentred or they
+        // hang below the band they belong to.
+        if let Some(titlebar) = options.titlebar.as_mut() {
+            titlebar.traffic_light_position =
+                Some(point(px(crate::LIGHTS_X), px((HEADER_H - 12.0) / 2.0)));
+        }
         if let Ok(handle) = cx.open_window(options, |window, cx| {
             let win = cx.new(|cx| SettingsWindow::new(main.clone(), window, cx));
             window.focus(&win.read(cx).search_focus(cx), cx);
@@ -79,6 +86,11 @@ fn activate(cx: &mut App) -> bool {
             .is_ok()
     })
 }
+
+/// The window's own title band — shorter than the main strip's `TITLE_H`,
+/// which is why `open` recentres the traffic lights on it rather than
+/// inheriting the strip's inset.
+const HEADER_H: f32 = 44.0;
 
 /// What the flat selection names: a registry row, or the file fallback.
 /// The fallback is last, past every row — a stale index lands on it rather
@@ -585,15 +597,17 @@ impl Render for SettingsWindow {
             .font_family(host.font.family.clone())
             .text_color(rgb(c.dim))
             // The header clears the platform traffic lights the way the main
-            // strip does: inset from the left, centred in the band.
+            // strip does — the same reservation, LIGHTS_X + LIGHTS_W: the
+            // three buttons end inside it, and a narrower inset leaves the
+            // title's first letter under the green one.
             .child(
                 div()
                     .flex_none()
                     .flex()
                     .items_center()
                     .justify_between()
-                    .h(px(44.0))
-                    .pl(px(64.0))
+                    .h(px(HEADER_H))
+                    .pl(px(crate::LIGHTS_X + crate::LIGHTS_W))
                     .pr(px(16.0))
                     .child(div().text_color(rgb(c.accent)).child("settings"))
                     .child(

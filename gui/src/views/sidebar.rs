@@ -73,6 +73,11 @@ pub(crate) struct SidebarDeps {
     /// grouped space has its own addresses, so the stack list's handle
     /// cannot serve it.
     pub scroll: UniformListScrollHandle,
+    /// The narrowest rail rung: labels come off the nav and utility rows —
+    /// the glyphs carry them, the commands they dispatch do not change —
+    /// and the heading drops `Stage all`, which stays a key and a command
+    /// either way.
+    pub compact: bool,
 }
 
 /// The whole rail, sized by its parent. Reads the files entity once per
@@ -353,12 +358,9 @@ pub(crate) fn render_sidebar(deps: &SidebarDeps, cx: &mut App) -> AnyElement {
             .text_color(rgb(ink))
             .hover(|s| s.text_color(rgb(host.theme.chrome.fg)))
             .child(chrome::icon(glyph, 13.0, ink))
-            .child(label)
+            .when(!deps.compact, |d| d.child(label))
             .on_click(move |_, _, cx| {
                 dispatch(command, cx);
-                if let Some(next) = and_then {
-                    dispatch(next, cx);
-                }
             })
     };
 
@@ -500,6 +502,7 @@ pub(crate) fn render_sidebar(deps: &SidebarDeps, cx: &mut App) -> AnyElement {
                     .pb(px(12.0))
                     .child(
                         div()
+                            .min_w_0()
                             .flex()
                             .items_center()
                             .gap(px(5.0))
@@ -507,11 +510,13 @@ pub(crate) fn render_sidebar(deps: &SidebarDeps, cx: &mut App) -> AnyElement {
                             .text_color(rgb(host.theme.chrome.fg))
                             .child(
                                 div()
+                                    .flex_none()
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .child("Changed files"),
                             )
                             .child(
                                 div()
+                                    .flex_none()
                                     .text_color(rgb(host.theme.dim_on(Surface::Context)))
                                     .child(SharedString::from(deps.changed.to_string())),
                             )
@@ -520,21 +525,26 @@ pub(crate) fn render_sidebar(deps: &SidebarDeps, cx: &mut App) -> AnyElement {
                             // rail never looks like a repository that shrank.
                             .children(deps.filter_note.clone().map(|note| {
                                 div()
+                                    .min_w_0()
+                                    .truncate()
                                     .text_color(rgb(host.theme.dim_on(Surface::Context)))
                                     .child(note)
                             })),
                     )
-                    .child(
-                        div()
-                            .id("ws-stage-all")
-                            .cursor_pointer()
-                            // The reference's text button: the one accent word
-                            // in the heading, not furniture.
-                            .text_color(rgb(host.theme.chrome.accent))
-                            .hover(|s| s.text_color(rgb(host.theme.chrome.fg)))
-                            .child("Stage all")
-                            .on_click(move |_, _, cx| stage_all("files.stage-all", cx)),
-                    ),
+                    .when(!deps.compact, |d| {
+                        d.child(
+                            div()
+                                .id("ws-stage-all")
+                                .flex_none()
+                                .cursor_pointer()
+                                // The reference's text button: the one accent word
+                                // in the heading, not furniture.
+                                .text_color(rgb(host.theme.chrome.accent))
+                                .hover(|s| s.text_color(rgb(host.theme.chrome.fg)))
+                                .child("Stage all")
+                                .on_click(move |_, _, cx| stage_all("files.stage-all", cx)),
+                        )
+                    }),
             )
         })
         .when(deps.history_note.is_none(), |d| {

@@ -18,6 +18,14 @@ use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use std::rc::Rc;
 
+/// The column's floor in the window's middle band: the Commit header, the
+/// staged list's label and padding, then the form — summary, description,
+/// note, button. Below it the button leaves the window and a commit cannot
+/// be asked for at all, so the window's minimum height is this plus the
+/// title and status strips. Measured, not summed — the fields' heights are
+/// `Input`'s own metrics and a sum of guesses lies.
+pub(crate) const MIN_H: f32 = 560.0;
+
 /// The shell's named dispatch, as the inspector's controls call it: one
 /// command name at a time, through the same path the keyboard resolves to.
 pub(crate) type Dispatch = Rc<dyn Fn(&str, &mut App)>;

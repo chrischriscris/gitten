@@ -30,11 +30,6 @@ pub fn icon(path: &'static str, size: f32, color: u32) -> AnyElement {
         .into_any_element()
 }
 
-/// Height of a pane's header strip. The guide's 28px band is deliberately
-/// taller than a 22px data row: enough separation to read as chrome without
-/// turning each stacked pane into a card.
-pub const HEADER_H: f32 = 28.0;
-
 /// Height of the bottom bar. Twenty-nine pixels per the workspace spec — a
 /// readout strip, not a second pane: sync state, the staging count, and the
 /// Commands door.

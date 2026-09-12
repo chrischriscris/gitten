@@ -368,10 +368,23 @@ fn head_info(head: Option<&HeadState>, local: &[Branch]) -> Option<HeadInfo> {
                 label,
                 ahead,
                 behind,
-                base: b
-                    .upstream
-                    .as_ref()
-                    .map(|u| SharedString::from(u.branch.to_string_lossy().into_owned())),
+                base: b.upstream.as_ref().and_then(|u| {
+                    let up = u.branch.to_string_lossy();
+                    let remote = u.remote.to_string_lossy();
+                    // `main from main` spells nothing: a branch tracking its
+                    // same-named origin counterpart is the ordinary case, and
+                    // the strip stays at the name alone. The upstream earns
+                    // the `from` only when it says something — a differently
+                    // named branch, a local upstream, or a remote that is not
+                    // origin, which then has to name itself to be honest.
+                    if remote == "origin" {
+                        (up != b.display()).then(|| SharedString::from(up.into_owned()))
+                    } else if remote == "." {
+                        Some(SharedString::from(up.into_owned()))
+                    } else {
+                        Some(SharedString::from(format!("{remote}/{up}")))
+                    }
+                }),
                 remote: b
                     .upstream
                     .as_ref()
@@ -1615,7 +1628,10 @@ mod tests {
                     up: "↑1".into(),
                     down: "↓2".into(),
                 }),
-                base: Some("main".into()),
+                // Tracking the same-named origin branch is the ordinary
+                // case — `from main` under `main` spells nothing, so the
+                // chip is the name alone.
+                base: None,
                 remote: Some("origin".into()),
             }),
             "the numbers core measured, verbatim — and the chip spelled once"
@@ -1636,8 +1652,40 @@ mod tests {
             "a vanished ref measures to nothing"
         );
         assert_eq!(hi.drift, None, "and the chip invents no zeros for it");
-        assert_eq!(hi.base.as_deref(), Some("main"));
+        assert_eq!(hi.base, None, "nor a same-named origin upstream");
         assert_eq!(hi.remote.as_deref(), Some("origin"));
+    }
+
+    #[test]
+    fn head_info_spells_the_upstream_only_when_it_says_something() {
+        let attached = HeadState::Branch {
+            name: RefName::from("fix"),
+            commit: None,
+        };
+        // A differently named origin branch: `fix` tracking `origin/main`
+        // reads "from main".
+        let mut b = tracked("fix", true, None, None);
+        b.upstream.as_mut().unwrap().branch = RefName::from("main");
+        let hi = head_info(Some(&attached), &[b]).unwrap();
+        assert_eq!(hi.base.as_deref(), Some("main"));
+
+        // Another remote's `main` is the same word twice unless the remote
+        // is named — `from upstream/main`, not `from main`.
+        let mut b = tracked("fix", true, None, None);
+        let up = b.upstream.as_mut().unwrap();
+        up.remote = RefName::from("upstream");
+        up.branch = RefName::from("fix");
+        let hi = head_info(Some(&attached), &[b]).unwrap();
+        assert_eq!(hi.base.as_deref(), Some("upstream/fix"));
+
+        // A local upstream (`remote = "."`) is a branch in this repository:
+        // `from main`, no remote to spell.
+        let mut b = tracked("fix", true, None, None);
+        let up = b.upstream.as_mut().unwrap();
+        up.remote = RefName::from(".");
+        up.branch = RefName::from("main");
+        let hi = head_info(Some(&attached), &[b]).unwrap();
+        assert_eq!(hi.base.as_deref(), Some("main"));
     }
 
     #[test]

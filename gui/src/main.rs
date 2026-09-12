@@ -116,15 +116,11 @@ const LIGHTS_X: f32 = 10.0;
 const LIGHTS_W: f32 = 78.0;
 /// The branch chip follows the title-bar controls' larger target height.
 const CHIP_H: f32 = 28.0;
-/// The shortest a list may be squeezed to: a header and two rows — the
-/// selected one and a neighbour, which is the least a list can show and
-/// still be seen to scroll.
-const SECTION_MIN_H: f32 = chrome::HEADER_H + 2.0 * graph::ROW_H;
-
-/// Four such floors, bracketed by the title and status strips. Below this
-/// height one of the lists would silently lose its promised two visible
-/// rows.
-const WINDOW_MIN_H: f32 = 4.0 * SECTION_MIN_H + TITLE_H + chrome::STATUS_H;
+/// The workspace's shortest honest height: the inspector's floor — the
+/// shortest the rail can be and still offer a commit — bracketed by the
+/// title and status strips. The stacked panes this used to measure are
+/// gone; the rail is what sets it now.
+const WINDOW_MIN_H: f32 = views::inspector::MIN_H + TITLE_H + chrome::STATUS_H;
 
 /// The repository as the title strip spells it: `(parent, name)` with the
 /// parent under `~` when it is under home and ending in `/`, so the two halves
@@ -6039,6 +6035,9 @@ impl DevShell {
                         .unwrap_or_else(|| SharedString::from("detached HEAD"))
                 }),
             scroll: self.workspace.sidebar_scroll.clone(),
+            // The smallest rung drops labels and the heading's verb — the
+            // rail is sized here, so the flag is spelled here too.
+            compact: side_w <= views::workspace::SIDEBAR_SMALLEST_W,
         };
         let sidebar = div()
             .id("workspace-sidebar")
@@ -6798,8 +6797,12 @@ impl Render for DevShell {
                             // resolves its secondary text in. Hidden on
                             // narrow windows per the reference's 1150px tier.
                             .children(info.base.filter(|_| !narrow).map(|base| {
+                                // A row, not a stack: without `.flex` the two
+                                // halves lay out as blocks and `from` sits on
+                                // its own line under nothing.
                                 div()
                                     .flex_none()
+                                    .flex()
                                     .text_color(dim)
                                     .child(" from ")
                                     .child(base)
@@ -13067,12 +13070,12 @@ mod title_tests {
     }
 
     #[test]
-    fn the_minimum_window_holds_every_sections_floor() {
-        let floors = 4.0 * SECTION_MIN_H + super::TITLE_H + crate::chrome::STATUS_H;
+    fn the_minimum_window_holds_the_inspectors_floor() {
+        let floor = crate::views::inspector::MIN_H + super::TITLE_H + crate::chrome::STATUS_H;
         let options = super::window_options("test".into(), None);
         let Some(min) = options.window_min_size else {
             panic!("the window declares no minimum size");
         };
-        assert!(min.height >= gpui::px(floors));
+        assert!(min.height >= gpui::px(floor));
     }
 }
