@@ -43,12 +43,14 @@
 //! The OIDs are the reason to want it this way round anyway: a blob's content
 //! never changes, so a diff keyed on the pair of them is cacheable forever.
 
+use gitten_core::blob::{Blob, Pair as BlobPair, Side as BlobSide};
 use gitten_core::differ::{Differs, Overrides};
 use gitten_core::operation::{Operation, Side};
 use gitten_core::refs::{
     Branch, HeadState, ReflogEntry, Remote, RemoteBranch, ResetMode, Stash, StashId, StashScope,
     Tag, Upstream,
 };
+use gitten_core::source::DiffSource;
 use gitten_core::status::{
     Change, ConflictEntry, ConflictKind, Kind, PathBytes, StagedEntry, Status, Submodule,
     UnstagedEntry, UntrackedEntry,
@@ -408,6 +410,26 @@ pub trait Repo: Send + Sync {
     /// stash without one answers empty, which is the ordinary case.
     fn pairs_stash_untracked(&self, _commit: &str) -> Result<Vec<Pair>> {
         Err(unserved("a stash's untracked files"))
+    }
+
+    /// Both sides' bytes for one path — the read a viewer that draws content
+    /// rather than lines asks for.
+    ///
+    /// The same sources [`Self::pairs_staged`] and its neighbours name, and
+    /// the same raw reads underneath: a PNG's diff is a pair with no lines on
+    /// either side, so the viewer that wants to *show* one has to ask for the
+    /// bytes by name. `path` is raw bytes and it is required — the sources that
+    /// name a whole tree (`Commit`, `Stash`, `Revspec`) answer for the one path
+    /// asked about and not for an arbitrary first record.
+    ///
+    /// `cap` is the caller's limit in bytes, and it is enforced **before any
+    /// body is read**: `cat-file --batch` reports each object's size in its
+    /// header, so a file over the limit costs a stat-sized drain rather than a
+    /// gigabyte in this process. A side over it comes back
+    /// [`gitten_core::blob::Side::TooBig`] with the size, which is a different
+    /// sentence from [`gitten_core::blob::Side::Absent`] and has to stay one.
+    fn blob_pair(&self, _source: &DiffSource, _path: &[u8], _cap: u64) -> Result<BlobPair> {
+        Err(unserved("a blob"))
     }
 
     /// Commit history from a ref other than HEAD, newest first — a branch
@@ -1715,6 +1737,88 @@ impl Repo for Binary {
             path: PathBytes::from_bytes(path),
         };
         Ok(loose_pair(&entry, top))
+    }
+
+    fn blob_pair(&self, source: &DiffSource, path: &[u8], cap: u64) -> Result<BlobPair> {
+        let top = self.top.get_or_init(|| top_level(&self.root));
+        // The sources whose content is on disk and nowhere else, plus the two
+        // with no repository behind them. A conflict is here for the same
+        // reason as an untracked file: the *working tree* is what a merging
+        // view shows, markers and all.
+        match source {
+            DiffSource::Untracked { .. } | DiffSource::Conflict { .. } => {
+                return Ok(BlobPair {
+                    old: BlobSide::Absent,
+                    new: worktree_side(top, path, cap),
+                })
+            }
+            DiffSource::Fixture | DiffSource::Patch => return Ok(BlobPair::default()),
+            _ => {}
+        }
+        // The same reads the line-shaped pairs make (`raw_for`), aimed at one
+        // path — and they matter here for the reason they matter there: a bare
+        // revision is `git show` so a merge answers instead of silently giving
+        // nothing, and a commit's sides are parent → commit, never the
+        // worktree the file may have moved on to. `--end-of-options` stands in
+        // front of anything a caller could have typed, exactly as it does
+        // there.
+        let (verb, tail): (&[u8], Vec<&[u8]>) = match source {
+            // `HEAD`'s tree against the index. An unborn branch costs this
+            // read nothing: `git diff --cached` against no HEAD answers the
+            // index against the empty tree, and the old side arrives as the
+            // null OID, which is the absent side.
+            DiffSource::Staged { .. } => (b"diff", vec![b"--cached"]),
+            DiffSource::Commit { sha } | DiffSource::Stash { commit: sha, .. } => (
+                b"show",
+                vec![
+                    b"--format=",
+                    b"--diff-merges=first-parent",
+                    b"--end-of-options",
+                    sha.as_bytes(),
+                ],
+            ),
+            // The aggregate read is `HEAD` → worktree; an empty revspec is
+            // that read and no other.
+            DiffSource::Revspec { arg } if arg.is_empty() => (b"diff", vec![b"HEAD"]),
+            DiffSource::Revspec { arg } if arg.contains("..") => {
+                (b"diff", vec![b"--end-of-options", arg.as_bytes()])
+            }
+            DiffSource::Revspec { arg } => (
+                b"show",
+                vec![
+                    b"--format=",
+                    b"--diff-merges=first-parent",
+                    b"--end-of-options",
+                    arg.as_bytes(),
+                ],
+            ),
+            // Index → worktree names no revision.
+            DiffSource::Unstaged { .. } => (b"diff", Vec::new()),
+            // Answered above. A match that cannot be reached is a match.
+            DiffSource::Untracked { .. }
+            | DiffSource::Conflict { .. }
+            | DiffSource::Fixture
+            | DiffSource::Patch => unreachable!("answered above"),
+        };
+        // The new side is on disk only for the two sources whose right half
+        // the working tree is: index → worktree, and HEAD → worktree. Every
+        // revision-named read's new side is an object.
+        let worktree = match source {
+            DiffSource::Unstaged { .. } => true,
+            DiffSource::Revspec { arg } => arg.is_empty(),
+            _ => false,
+        };
+        let mut args: Vec<&[u8]> = vec![verb];
+        args.extend(RAW_B);
+        args.extend(tail);
+        let raw = self.side_raw(args, Some(path))?;
+        let Some(change) = parse_raw(&raw).pop() else {
+            // Nothing changed for that path in that range, so there is no side
+            // to draw — an honest empty pair rather than an error, the same
+            // answer the text read gives by returning no pairs at all.
+            return Ok(BlobPair::default());
+        };
+        self.blob_pair_of(&change, top, worktree, cap)
     }
 
     fn pairs_stash_untracked(&self, commit: &str) -> Result<Vec<Pair>> {
@@ -3478,6 +3582,50 @@ impl Binary {
         Ok(out)
     }
 
+    /// One record's two sides, through one `cat-file --batch` — the same
+    /// single-process shape [`Self::assemble`] has, for the same reason.
+    ///
+    /// A gitlink is absent rather than synthesised: a submodule is a commit in
+    /// another repository, and the one thing a viewer of *bytes* can honestly
+    /// say about it is that there are none here.
+    fn blob_pair_of(
+        &self,
+        c: &RawChange,
+        top: &std::path::Path,
+        worktree: bool,
+        cap: u64,
+    ) -> Result<BlobPair> {
+        let mut wanted: Vec<&str> = Vec::with_capacity(2);
+        for (mode, oid) in [(&c.old_mode, &c.old_oid), (&c.new_mode, &c.new_oid)] {
+            if fetchable(mode, oid) {
+                wanted.push(oid);
+            }
+        }
+        let mut blobs = BlobStream::start(&self.root, &wanted)?;
+        // Both sides pull in request order — old, then new — which is what
+        // keeps this loop aligned with the stream.
+        let old = if fetchable(&c.old_mode, &c.old_oid) {
+            side_of(blobs.answer_within(cap)?, &c.old_oid)
+        } else {
+            // No fallback on the old side, the same trap `assemble` documents:
+            // a null OID there means the file did not exist, and reading the
+            // tree for it would put today's bytes into a revision where the
+            // file was not.
+            BlobSide::Absent
+        };
+        let new = if fetchable(&c.new_mode, &c.new_oid) {
+            side_of(blobs.answer_within(cap)?, &c.new_oid)
+        } else if worktree {
+            // A null new OID is the ordinary case of a working-tree diff: what
+            // the file says now is on disk and nowhere else.
+            worktree_side(top, c.path.as_bytes(), cap)
+        } else {
+            BlobSide::Absent
+        };
+        blobs.finish()?;
+        Ok(BlobPair { old, new })
+    }
+
     /// One `git diff` read for a side: the arguments above, plus the
     /// pathspec when one was asked for. The path travels as raw bytes —
     /// [`run_bytes`], never a lossy spelling — and git does the matching,
@@ -4940,8 +5088,30 @@ impl BlobStream {
     /// a blob is not text and the header's size is authoritative, so this
     /// never has to guess where a record ends.
     fn answer(&mut self) -> Result<Option<Vec<u8>>> {
+        match self.answer_within(u64::MAX)? {
+            Fetched::Body(bytes) => Ok(Some(bytes)),
+            // Unreachable by construction: every object is within `u64::MAX`,
+            // so a refusal here would mean this file grew a limit it never
+            // passed in.
+            Fetched::TooBig(_) => unreachable!("no limit was asked for"),
+            Fetched::Missing => Ok(None),
+        }
+    }
+
+    /// The next answer in request order, refused when the object is over
+    /// `cap` bytes.
+    ///
+    /// The size is in the header, which is the whole point: a viewer that may
+    /// not hold a two-gigabyte blob learns that from twelve bytes of answer
+    /// and never allocates the body. What it does cost is the *drain* — git is
+    /// already writing those bytes into the pipe, and closing this end mid-body
+    /// is a git killed by `SIGPIPE` reported as a failure for a file that is
+    /// merely large. So the body is read and thrown away, in fixed-size chunks,
+    /// and only on the path where somebody asked for a file they were warned
+    /// about.
+    fn answer_within(&mut self, cap: u64) -> Result<Fetched> {
         let Some(stream) = self.reader.as_mut() else {
-            return Ok(None);
+            return Ok(Fetched::Missing);
         };
         let mut header = Vec::new();
         let read = stream
@@ -4957,10 +5127,26 @@ impl BlobStream {
         // "<oid> missing" — treated as absent rather than as an error: a
         // blobless clone of git/git is a supported fixture, and one unreachable
         // side is still a diff worth showing.
-        let Some(size) = parts.get(2).and_then(|s| s.parse::<usize>().ok()) else {
-            return Ok(None);
+        let Some(size) = parts.get(2).and_then(|s| s.parse::<u64>().ok()) else {
+            return Ok(Fetched::Missing);
         };
-        let mut content = vec![0; size];
+        if size > cap {
+            let mut left = size;
+            let mut sink = [0u8; 64 * 1024];
+            while left > 0 {
+                let want = (left as usize).min(sink.len());
+                stream
+                    .read_exact(&mut sink[..want])
+                    .map_err(|e| format!("git cat-file: {e}"))?;
+                left -= want as u64;
+            }
+            let mut terminator = [0; 1];
+            stream
+                .read_exact(&mut terminator)
+                .map_err(|e| format!("git cat-file: {e}"))?;
+            return Ok(Fetched::TooBig(size));
+        }
+        let mut content = vec![0; size as usize];
         stream
             .read_exact(&mut content)
             .map_err(|e| format!("git cat-file: {e}"))?;
@@ -4968,7 +5154,7 @@ impl BlobStream {
         stream
             .read_exact(&mut terminator)
             .map_err(|e| format!("git cat-file: {e}"))?;
-        Ok(Some(content))
+        Ok(Fetched::Body(content))
     }
 
     /// Waits for git to exit and reports failure the way a slurped run did:
@@ -5029,7 +5215,99 @@ fn new_side(oid: &str, repo: &Path, path: &[u8]) -> Option<Vec<u8>> {
     // the working tree for it would diff an added file against itself and
     // report that nothing changed.
     let _ = oid;
-    std::fs::read(join_raw(repo, path)).ok()
+    let full = join_raw(repo, path);
+    // The same door `worktree_side` holds: a path that is not a regular file
+    // (a symlink to a device, a fifo) is a read that can never end, so it is
+    // refused before it can hang the read.
+    if !std::fs::metadata(&full).is_ok_and(|m| m.is_file()) {
+        return None;
+    }
+    let mut file = worktree_file(&full)?;
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut bytes).ok()?;
+    Some(bytes)
+}
+
+/// What one `cat-file --batch` answer was.
+///
+/// Three answers and not two, because "too big to hold" and "not in the object
+/// database" are different sentences — the first has an object id and a size
+/// the reader can print, the second has nothing at all.
+#[derive(Debug)]
+enum Fetched {
+    Body(Vec<u8>),
+    TooBig(u64),
+    Missing,
+}
+
+/// A fetched answer as a side of a blob pair, keeping the object id the fetch
+/// was addressed with — which is what a cache keys on, and the same string the
+/// answer's own header carried.
+fn side_of(fetched: Fetched, oid: &str) -> BlobSide {
+    match fetched {
+        Fetched::Body(bytes) => BlobSide::Held(Blob::new(Some(oid.to_string()), bytes.into())),
+        Fetched::TooBig(size) => BlobSide::TooBig {
+            oid: Some(oid.to_string()),
+            size,
+        },
+        Fetched::Missing => BlobSide::Absent,
+    }
+}
+
+/// A working-tree side: the file on disk, under the same cap the object
+/// database's answer is bounded by.
+///
+/// Stat first, read after — a file over the limit is refused by its size rather
+/// than read into memory to find out, and the read is capped too: one that
+/// grows past the limit between the two is refused, not loaded whole. A file
+/// that shrinks mid-read is simply the smaller file, which is what it is.
+fn worktree_side(root: &Path, path: &[u8], cap: u64) -> BlobSide {
+    let full = join_raw(root, path);
+    let Ok(meta) = std::fs::metadata(&full) else {
+        // Unreadable — a broken symlink, a file deleted between the list and
+        // this read — is nothing to show, not an error.
+        return BlobSide::Absent;
+    };
+    // Only a regular file is a side. `metadata` follows links, so this is
+    // also the door a symlink is held to: one to a device reports a length
+    // of 0 and a read that never ends, one to a fifo a read that never
+    // starts — and either hangs the one job thread every later write shares.
+    if !meta.is_file() {
+        return BlobSide::Absent;
+    }
+    if meta.len() > cap {
+        return BlobSide::TooBig {
+            oid: None,
+            size: meta.len(),
+        };
+    }
+    let Some(mut file) = worktree_file(&full) else {
+        return BlobSide::Absent;
+    };
+    // The read itself is capped, not just the stat: a file that grows past
+    // the limit between the two is refused, not loaded whole. The size in the
+    // refusal is re-stat'ed on the descriptor, so the number reported is the
+    // file that is, not the file that was.
+    let mut bytes = Vec::with_capacity((meta.len()).min(cap) as usize);
+    match std::io::Read::take(&mut file, cap + 1).read_to_end(&mut bytes) {
+        Err(_) => BlobSide::Absent,
+        Ok(_) if bytes.len() as u64 > cap => BlobSide::TooBig {
+            oid: None,
+            size: file.metadata().map(|m| m.len()).unwrap_or(cap + 1),
+        },
+        Ok(_) => BlobSide::Held(Blob::new(None, bytes.into())),
+    }
+}
+
+/// A worktree file opened and re-verified on its descriptor: a regular file,
+/// or nothing.
+///
+/// The pre-open `metadata` check is what refuses the link targets that cannot
+/// be read (devices, fifos); this re-check is the swap race — the file that
+/// was statted is the file that was opened only when the descriptor says so.
+fn worktree_file(full: &Path) -> Option<std::fs::File> {
+    let file = std::fs::File::open(full).ok()?;
+    file.metadata().ok()?.is_file().then_some(file)
 }
 
 /// A NUL byte in the first 8 KB, which is git's own test. A real text file does
@@ -9073,6 +9351,302 @@ mod tests {
             porcelain_of(&r),
             "MM f.txt\n",
             "staged work survives, and the worktree differs from the index again"
+        );
+    }
+
+    #[test]
+    fn a_blob_pair_reads_both_sides_of_a_binary_file_under_a_cap() {
+        use gitten_core::blob::{Kind, Side};
+        // A real PNG header and a payload with a NUL in it, so the pair is a
+        // binary one to every other read in this file too.
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend_from_slice(&[0u8; 64]);
+        png.extend_from_slice(b"IDAT");
+
+        let r = Scratch::new("blob-pair");
+        r.write("pic.png", &png);
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+        let g = r.open();
+
+        // Nothing has moved, so there is nothing to draw — and that is an
+        // empty pair rather than an error: the same answer the line-shaped
+        // read gives by returning no pairs at all.
+        let unchanged = g
+            .blob_pair(
+                &DiffSource::Unstaged {
+                    path: "pic.png".into(),
+                },
+                b"pic.png",
+                1 << 20,
+            )
+            .expect("an unchanged file is not a failure");
+        assert!(unchanged.is_empty(), "nothing changed, nothing to show");
+
+        // An edit on disk: the old side is the index's blob, under its own
+        // object id, and the new side is the working tree's, which has no OID
+        // to be keyed by and is keyed by what it holds instead.
+        let mut edited = png.clone();
+        edited.extend_from_slice(b"more");
+        r.write("pic.png", &edited);
+        let pair = g
+            .blob_pair(
+                &DiffSource::Unstaged {
+                    path: "pic.png".into(),
+                },
+                b"pic.png",
+                1 << 20,
+            )
+            .expect("an unstaged pair");
+        let old = pair.old.blob().expect("the index's bytes");
+        let new = pair.new.blob().expect("the working tree's bytes");
+        assert_eq!(old.bytes.as_ref(), png.as_slice());
+        assert_eq!(new.bytes.as_ref(), edited.as_slice());
+        assert_eq!(old.kind, Kind::Png);
+        assert_eq!(new.kind, Kind::Png);
+        assert!(old.oid.is_some(), "git named the index's blob");
+        assert_eq!(new.oid, None, "the working tree has no object id");
+        assert_eq!(
+            old.key(),
+            format!("blob-{}", old.oid.clone().unwrap()),
+            "an object-database side is keyed by its own identity"
+        );
+        assert!(
+            new.key().starts_with("content-"),
+            "and a disk side by its content: {}",
+            new.key()
+        );
+
+        // Staged: `HEAD`'s blob against the index's, and this time both sides
+        // are names git gave.
+        r.git(&["add", "pic.png"]);
+        let pair = g
+            .blob_pair(
+                &DiffSource::Staged {
+                    path: "pic.png".into(),
+                },
+                b"pic.png",
+                1 << 20,
+            )
+            .expect("a staged pair");
+        assert_eq!(
+            pair.old.blob().expect("HEAD's bytes").bytes.as_ref(),
+            png.as_slice()
+        );
+        assert_eq!(
+            pair.new.blob().expect("the index's bytes").bytes.as_ref(),
+            edited.as_slice()
+        );
+        assert!(pair.new.blob().expect("bytes").oid.is_some());
+
+        // The cap is spent before any body is read: the side comes back with
+        // the size git reported, and *not* as a missing side — and the other
+        // side of the same pair still arrives, because a refusal is per side.
+        let mut grown = edited.clone();
+        grown.extend_from_slice(&[b'x'; 200]);
+        r.write("pic.png", &grown);
+        let pair = g
+            .blob_pair(
+                &DiffSource::Unstaged {
+                    path: "pic.png".into(),
+                },
+                b"pic.png",
+                128,
+            )
+            .expect("a refused side is still an answer");
+        match &pair.new {
+            Side::TooBig { size, .. } => assert_eq!(*size, grown.len() as u64),
+            other => panic!("expected a refusal with a size, got {other:?}"),
+        }
+        assert!(
+            pair.old.blob().is_some(),
+            "one side over the limit does not refuse the other"
+        );
+
+        // An untracked file is a new side with nothing opposite it, read off
+        // disk — and a file that is not there is absent, not an error.
+        r.write("loose.png", &png);
+        let pair = g
+            .blob_pair(
+                &DiffSource::Untracked {
+                    path: "loose.png".into(),
+                },
+                b"loose.png",
+                1 << 20,
+            )
+            .expect("an untracked read");
+        assert!(pair.old.is_absent());
+        assert_eq!(
+            pair.new.blob().expect("bytes").bytes.as_ref(),
+            png.as_slice()
+        );
+        let gone = g
+            .blob_pair(
+                &DiffSource::Untracked {
+                    path: "nope.png".into(),
+                },
+                b"nope.png",
+                1 << 20,
+            )
+            .expect("a missing file is not an error");
+        assert!(gone.is_empty(), "nothing to show is nothing to show");
+    }
+
+    /// A revision-named source's sides are that revision's — the same read
+    /// the line-shaped pairs make — and never the worktree the file may have
+    /// moved on to. A commit, a bare revspec, a range and a stash each get
+    /// their own two ends; the empty revspec is `HEAD` → worktree and is the
+    /// only one of them whose new side lives on disk.
+    #[test]
+    fn a_blob_pair_names_the_sides_its_source_names() {
+        let mut v1 = b"\x89PNG\r\n\x1a\n".to_vec();
+        v1.extend_from_slice(b"one");
+        let mut v2 = b"\x89PNG\r\n\x1a\n".to_vec();
+        v2.extend_from_slice(b"two");
+        let mut v3 = b"\x89PNG\r\n\x1a\n".to_vec();
+        v3.extend_from_slice(b"three");
+
+        let r = Scratch::new("blob-revs");
+        r.write("pic.png", &v1);
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "one"]);
+        r.write("pic.png", &v2);
+        r.git(&["commit", "-qam", "two"]);
+        let sha = r.rev_parse("HEAD");
+        // And then the worktree moves on — which is the whole point: a
+        // commit's new side is the commit's, not whatever is on disk now.
+        r.write("pic.png", &v3);
+        let g = r.open();
+
+        for source in [
+            DiffSource::Commit { sha: sha.clone() },
+            DiffSource::Revspec { arg: sha.clone() },
+            DiffSource::Revspec {
+                arg: "HEAD~1..HEAD".to_string(),
+            },
+        ] {
+            let pair = g
+                .blob_pair(&source, b"pic.png", 1 << 20)
+                .expect("a revision pair");
+            assert_eq!(
+                pair.old.blob().expect("the parent's bytes").bytes.as_ref(),
+                v1.as_slice(),
+                "{source:?}: the old side is the commit's parent"
+            );
+            assert_eq!(
+                pair.new.blob().expect("the commit's bytes").bytes.as_ref(),
+                v2.as_slice(),
+                "{source:?}: the new side is the commit, not the worktree"
+            );
+        }
+
+        // The empty revspec — the aggregate "uncommitted work" read — is
+        // HEAD → worktree: v2 against the v3 that is on disk now.
+        let pair = g
+            .blob_pair(
+                &DiffSource::Revspec { arg: String::new() },
+                b"pic.png",
+                1 << 20,
+            )
+            .expect("the aggregate read");
+        assert_eq!(
+            pair.old.blob().expect("HEAD's bytes").bytes.as_ref(),
+            v2.as_slice()
+        );
+        assert_eq!(
+            pair.new
+                .blob()
+                .expect("the worktree's bytes")
+                .bytes
+                .as_ref(),
+            v3.as_slice()
+        );
+
+        // A stash is a commit like any other to this read: its sides are
+        // first-parent → stash, the same way the line-shaped `pairs` answers
+        // it.
+        r.git(&["add", "pic.png"]);
+        r.git(&["stash", "push", "-qm", "parked"]);
+        let commit = r.rev_parse("refs/stash");
+        let pair = g
+            .blob_pair(
+                &DiffSource::Stash {
+                    index: 0,
+                    commit: commit.clone(),
+                },
+                b"pic.png",
+                1 << 20,
+            )
+            .expect("a stash pair");
+        assert_eq!(
+            pair.old.blob().expect("the base's bytes").bytes.as_ref(),
+            v2.as_slice(),
+            "the stash's old side is the commit it was taken on"
+        );
+        assert_eq!(
+            pair.new.blob().expect("the stash's bytes").bytes.as_ref(),
+            v3.as_slice(),
+            "the stash's new side is what it parked"
+        );
+    }
+
+    /// A worktree side is a regular file or it is nothing: a symlink to a
+    /// device reports a length of 0 and a read that never ends, a fifo's read
+    /// never starts — either hangs the one job thread every later write
+    /// shares. A link to an ordinary file still reads the file it names.
+    #[test]
+    fn a_worktree_side_is_a_file_or_nothing() {
+        let r = Scratch::new("blob-device");
+        let g = r.open();
+
+        std::os::unix::fs::symlink("/dev/null", r.0.join("hole")).expect("a symlink");
+        let pair = g
+            .blob_pair(
+                &DiffSource::Untracked {
+                    path: "hole".into(),
+                },
+                b"hole",
+                1 << 20,
+            )
+            .expect("a refused side is still an answer");
+        assert!(pair.new.is_absent(), "a device is not a blob to read");
+
+        let mut fifo = Command::new("mkfifo");
+        assert!(
+            fifo.arg(r.0.join("pipe"))
+                .status()
+                .expect("mkfifo runs")
+                .success(),
+            "mkfifo"
+        );
+        let pair = g
+            .blob_pair(
+                &DiffSource::Untracked {
+                    path: "pipe".into(),
+                },
+                b"pipe",
+                1 << 20,
+            )
+            .expect("a refused side is still an answer");
+        assert!(pair.new.is_absent(), "a fifo is not a blob to read");
+
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend_from_slice(b"real");
+        r.write("real.png", &png);
+        std::os::unix::fs::symlink("real.png", r.0.join("link.png")).expect("a symlink");
+        let pair = g
+            .blob_pair(
+                &DiffSource::Untracked {
+                    path: "link.png".into(),
+                },
+                b"link.png",
+                1 << 20,
+            )
+            .expect("a link to a file is the file");
+        assert_eq!(
+            pair.new.blob().expect("the file's bytes").bytes.as_ref(),
+            png.as_slice(),
+            "a symlink to a file still shows the file"
         );
     }
 

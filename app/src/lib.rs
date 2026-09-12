@@ -54,6 +54,7 @@
 
 pub mod acquire;
 pub mod act;
+pub mod blobs;
 pub mod cli;
 pub mod config;
 pub mod env;

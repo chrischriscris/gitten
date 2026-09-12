@@ -641,6 +641,12 @@ impl Keymap {
 
         bind("diff", "s", "diff.cycle-layout");
         bind("diff", "w", "diff.cycle-wrap");
+        // `b`, for the blob: between what the file *is* and what it was. It is
+        // a no-op on a text diff — there is nothing else to show — and on a
+        // blob that was only added, because the side that does not exist is
+        // not a side. The pane's own strip carries the same two words as
+        // buttons, so the mouse half is a click and not a keypress.
+        bind("diff", "b", "blob.flip");
         bind("diff", "]", "diff.next-file");
         bind("diff", "[", "diff.prev-file");
         bind("diff", "tab", "diff.next-file");
@@ -1507,6 +1513,11 @@ impl Commands {
             ),
             ("diff.cycle-layout", "the next presentation", None),
             ("diff.cycle-wrap", "the next wrap", None),
+            (
+                "blob.flip",
+                "the other side of a picture or a document — before, or after",
+                None,
+            ),
             (
                 "diff.stage-hunk",
                 "stage the hunk under the keyboard into the index",
