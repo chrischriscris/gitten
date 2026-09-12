@@ -130,6 +130,11 @@ impl crate::DevShell {
         match doors.view.as_deref() {
             Some("history") => self.enter_history(cx),
             Some("changes") => self.enter_workspace(cx),
+            // The sidebar's own pair: the focus command is the row's whole
+            // click now, and the panel it opens rides over whichever
+            // destination was standing.
+            Some("branches") => self.run_command("branches.focus", cx),
+            Some("stashes") => self.run_command("stashes.focus", cx),
             _ => {}
         }
         if let Some(name) = doors.theme.as_deref() {

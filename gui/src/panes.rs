@@ -49,9 +49,9 @@ impl<T> Panes<T> {
         &self.entries[self.focused].name
     }
 
-    /// A tenant by its stable registration name. The sidebar renders three
-    /// named residents at once — files, branches, stashes — so drawing reads
-    /// through here instead of assuming any index is those panes'.
+    /// A tenant by its stable registration name. The Changes rail reads
+    /// `files`, the History timeline `commits`, and the panel whatever pane
+    /// the keyboard is on — drawing goes by name, never by assuming an index.
     pub fn get(&self, name: &str) -> Option<&T> {
         self.position(name).map(|at| &self.entries[at].value)
     }

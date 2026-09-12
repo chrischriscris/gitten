@@ -4464,6 +4464,18 @@ impl DevShell {
             self.close_input(false, cx);
             return;
         }
+        // The pane panel — branches, stashes, any tenant this destination
+        // does not draw — stands exactly while the keyboard sits on it, so
+        // `esc` hands the keyboard to the destination's own list, which is
+        // the close. It goes here, after the finer-grained dismissals, so a
+        // prompt or question standing *over* the panel is answered first.
+        if self.spot == Spot::List
+            && self.panes.len() > 0
+            && !self.pane_drawn(self.panes.focused_name())
+        {
+            self.close_panel(cx);
+            return;
+        }
         if self.spot == Spot::Main {
             self.set_spot(Spot::List, cx);
             cx.notify();
@@ -4619,12 +4631,136 @@ impl DevShell {
     /// Said, not swallowed, when nothing is registered under the name: a
     /// fixture has no working tree to show, and the honest answer to the key
     /// is the same sentence an unbound one gets.
+    ///
+    /// "Wherever it draws" is load-bearing: `files` draws in the Changes rail
+    /// and `commits` in the History timeline, so asking for one from the other
+    /// destination crosses to it — the focus lands on the list the key named
+    /// rather than on a tenant this frame cannot show. A pane no destination
+    /// draws — `branches`, `stashes`, an extension's — takes the keyboard
+    /// here, and the frame derives the panel that draws it
+    /// ([`DevShell::panel`]). Either way the answer is a list on screen, never
+    /// an invisible one eating keys.
     fn focus_named(&mut self, name: &str, cx: &mut Context<Self>) {
         self.reclaim_focus();
-        match self.panes.position(name) {
-            Some(at) => self.focus_pane(at, cx),
-            None => self.set_notice(format!("no {name} pane")),
+        let Some(at) = self.panes.position(name) else {
+            self.set_notice(format!("no {name} pane"));
+            return;
+        };
+        if !self.pane_drawn(name) {
+            match name {
+                "files" => self.enter_workspace(cx),
+                "commits" => self.enter_history(cx),
+                _ => {}
+            }
         }
+        self.focus_pane(at, cx);
+    }
+
+    /// Whether the workspace's current destination draws the named pane —
+    /// `files` in the Changes rail, `commits` on the History timeline. The
+    /// registry holds panes no destination draws; [`DevShell::panel`] is how
+    /// one of them shows.
+    fn pane_drawn(&self, name: &str) -> bool {
+        match self.workspace.destination {
+            views::workspace::Destination::Changes => name == "files",
+            views::workspace::Destination::History => name == "commits",
+        }
+    }
+
+    /// The focused pane's modal — the draw slot for a pane the destination
+    /// does not have one for. `3` focuses branches and `5` stashes, the walk
+    /// and the rail's utility rows cross both, and the reference's sidebar
+    /// utilities answer with exactly this kind of dialog: the pane's own
+    /// view — cursor, commands and all — in a centered panel. Derived from
+    /// focus rather than stored, so it cannot be left open over a pane the
+    /// destination now draws; `esc` or the close button hands the keyboard
+    /// back to the destination's list, which is also what un-derives it.
+    fn panel(&self, host: &Host, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.spot != Spot::List || self.panes.len() == 0 {
+            return None;
+        }
+        let name = self.panes.focused_name();
+        if self.pane_drawn(name) {
+            return None;
+        }
+        let (title, body, empty): (SharedString, AnyElement, bool) = match self.panes.focused() {
+            Screen::Branches { view, .. } => (
+                "Branches".into(),
+                view.clone().into_any_element(),
+                view.read(cx).is_empty(),
+            ),
+            Screen::Stashes { view, .. } => (
+                "Stashes".into(),
+                view.clone().into_any_element(),
+                view.read(cx).is_empty(),
+            ),
+            Screen::Files { view, .. } => ("Files".into(), view.clone().into_any_element(), false),
+            Screen::Commits { view, .. } => {
+                ("Commits".into(), view.clone().into_any_element(), false)
+            }
+            Screen::Diff { .. } => return None,
+            // `Pane` is a command-and-label seam with no draw half, so an
+            // extension tenant gets the honest sentence rather than a view.
+            Screen::Custom(pane) => (
+                pane.label(cx).into(),
+                chrome::empty_line(
+                    host,
+                    format!("the {} pane has no view in this window", pane.label(cx)).into(),
+                )
+                .into_any_element(),
+                true,
+            ),
+        };
+        let close = modal::close_button(host, "ws-panel-close")
+            .on_click({
+                let me = cx.entity().downgrade();
+                move |_, _, cx| {
+                    _ = me.update(cx, |this, cx| this.close_panel(cx));
+                }
+            })
+            .into_any_element();
+        // Sized off the window, not a constant: the list inside wants height
+        // and the scrim owes it the air between the title strip and the
+        // status bar, minus the dialog's own heading and padding.
+        // An empty pane is a sentence, not a list: it gets a sentence's
+        // height rather than the tall box a list would fill.
+        let h = if empty {
+            72.0
+        } else {
+            (f32::from(window.viewport_size().height) - 320.0).max(200.0)
+        };
+        Some(modal::centered(
+            host,
+            modal::Width::Exact(560.0),
+            vec![
+                modal::heading(host, title, Some(close)).into_any_element(),
+                div()
+                    .mt(px(8.0))
+                    .h(px(h))
+                    .overflow_hidden()
+                    .child(body)
+                    .into_any_element(),
+            ],
+        ))
+    }
+
+    /// The panel's way out, run by `esc` and the close button alike: the
+    /// keyboard goes back to the list this destination draws — which is also
+    /// the only thing that un-derives the panel, since it stands exactly
+    /// while focus sits on an undrawn pane.
+    fn close_panel(&mut self, cx: &mut Context<Self>) {
+        let home = match self.workspace.destination {
+            views::workspace::Destination::Changes => ["files", "commits"],
+            views::workspace::Destination::History => ["commits", "files"],
+        };
+        for name in home {
+            if self.panes.position(name).is_some() {
+                self.focus_named(name, cx);
+                return;
+            }
+        }
+        self.set_spot(Spot::Main, cx);
+        cx.notify();
     }
 
     /// Forget which element holds the keyboard, so the next frame takes it
@@ -6860,6 +6996,10 @@ impl Render for DevShell {
             .children(
                 (self.open == Some(Open::Project)).then(|| self.project_menu(&host, window, cx)),
             )
+            // The focused pane's panel: derived, so it is up exactly while
+            // the keyboard sits on a pane this destination cannot draw —
+            // `3` for branches, `5` for stashes — carrying its own scrim.
+            .children(self.panel(&host, window, cx))
             // The status bar: where the keyboard is, and what the nearest
             // keys do. A sentence owed to the user — an error, a job's own
             // finish, an armed question — takes the hints' place rather than

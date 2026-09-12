@@ -339,14 +339,10 @@ pub(crate) fn render_sidebar(deps: &SidebarDeps, cx: &mut App) -> AnyElement {
             }))
             .text_color(rgb(ink))
             .child(chrome::icon(glyph, 15.0, ink))
-            .child(label)
+            .when(!deps.compact, |d| d.child(label))
             .on_click(move |_, _, cx| dispatch(command, cx))
     };
-    let util = |n: usize,
-                glyph: &'static str,
-                label: &'static str,
-                command: &'static str,
-                and_then: Option<&'static str>| {
+    let util = |n: usize, glyph: &'static str, label: &'static str, command: &'static str| {
         let dispatch = deps.dispatch.clone();
         let ink = host.theme.dim_on(Surface::Context);
         div()
@@ -464,7 +460,10 @@ pub(crate) fn render_sidebar(deps: &SidebarDeps, cx: &mut App) -> AnyElement {
         )
         .child(
             // Branches / Stashes: dim utilities spread edge to edge under
-            // their own hairline, per the reference's sidebar-utilities.
+            // their own hairline, per the reference's sidebar-utilities. The
+            // panes they focus have no slot in this rail, so the focus is
+            // what opens their panel — the reference's read-only preview
+            // dialog, here the pane's live view.
             div()
                 .flex_none()
                 .flex()
@@ -475,20 +474,8 @@ pub(crate) fn render_sidebar(deps: &SidebarDeps, cx: &mut App) -> AnyElement {
                 .pb(px(19.0))
                 .border_b_1()
                 .border_color(rgb(host.theme.chrome.border))
-                .child(util(
-                    0,
-                    "gitten/branch.svg",
-                    "Branches",
-                    "workspace.history",
-                    Some("branches.focus"),
-                ))
-                .child(util(
-                    1,
-                    "gitten/stash.svg",
-                    "Stashes",
-                    "workspace.history",
-                    Some("stashes.focus"),
-                )),
+                .child(util(0, "gitten/branch.svg", "Branches", "branches.focus"))
+                .child(util(1, "gitten/stash.svg", "Stashes", "stashes.focus")),
         )
         .when(deps.history_note.is_none(), |d| {
             d.child(
