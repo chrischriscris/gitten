@@ -4406,6 +4406,11 @@ impl DevShell {
                 self.workspace.launch = views::workspace::LaunchHold::Off;
                 self.sync_workspace_preview(cx);
             }
+            // The other side of what the centre is showing, when what it is
+            // showing is a blob: the diff has its own halves and does not
+            // answer this, which is the honest silence of a command that does
+            // not apply.
+            "blob.flip" => self.flip_blob(cx),
             "files.stage" => self.stage_or_unstage(cx),
             "files.commit" => self.begin_commit_message(cx),
             "files.amend" => self.begin_amend_message(cx),
@@ -5239,6 +5244,22 @@ impl DevShell {
         center
     }
 
+    /// `blob.flip`: the other side of the picture the centre is showing.
+    ///
+    /// A no-op with nothing to flip — a text diff, or a file that was only
+    /// added — because a pane that swapped to an empty side would be a key
+    /// that made the window worse.
+    fn flip_blob(&mut self, cx: &mut Context<Self>) {
+        let Some(blob) = self.workspace.blob.clone() else {
+            return;
+        };
+        blob.update(cx, |blob, cx| {
+            if blob.flip() {
+                cx.notify();
+            }
+        });
+    }
+
     /// `workspace.preview`: re-aim the center at the files cursor — the
     /// workspace's answer to [`DevShell::sync_main_diff`], called from the
     /// same two places: the tail of every command and the landing of every
@@ -5317,6 +5338,10 @@ impl DevShell {
             }
             views::workspace::LaunchHold::Off => {}
         }
+        // The path as raw bytes, for the blob read's `--raw` pathspec: the
+        // bytes every other read of this file addresses it with, because a
+        // display-decoded path names a file nobody has.
+        let path_bytes = path.clone();
         let key = (section, path.clone(), gen);
         if self.workspace.last.as_ref() == Some(&key) {
             return;
@@ -5384,7 +5409,35 @@ impl DevShell {
                             return Err("preview returned no diff".to_string());
                         };
                         let prepared = views::diff::prepare_files(&files, &host);
-                        Ok((files, prepared))
+                        // One file with no hunks is the one shape a diff
+                        // cannot draw and a viewer might: a *binary* side has
+                        // no lines to compare. The blob read runs on this
+                        // thread — the same one the diff just ran on — and
+                        // only for that shape, so a text diff pays nothing for
+                        // this door being open. A no-hunks diff that is really
+                        // text — a mode-only change, a pure rename — keeps the
+                        // rows: hex of a shell script is not a picture of it.
+                        // (Git's binary test and `Kind::Text` are the same NUL
+                        // byte, so nothing git called binary is lost this way.)
+                        let blob = (files.len() == 1 && files[0].hunks.is_empty())
+                            .then(|| {
+                                gitten_app::blobs::load(
+                                    &source,
+                                    path_bytes.as_bytes(),
+                                    repo.as_ref(),
+                                    views::blob::BUDGET as u64,
+                                )
+                                .ok()
+                                .filter(|loaded| {
+                                    !loaded.pair.is_empty()
+                                        && loaded
+                                            .pair
+                                            .blobs()
+                                            .any(|b| b.kind != gitten_core::blob::Kind::Text)
+                                })
+                            })
+                            .flatten();
+                        Ok((files, prepared, blob))
                     }));
                     true
                 })
@@ -5400,12 +5453,38 @@ impl DevShell {
                     return;
                 }
                 match outcome {
-                    Ok((files, prepared)) => {
+                    Ok((files, prepared, blob)) => {
                         if let Some(center) = shell.workspace.center.clone() {
                             let host = config::host(cx);
                             center
                                 .update(cx, |d, cx| d.replace_prepared(files, prepared, &host, cx));
                         }
+                        // The blob is the centre's other body. The pane is
+                        // built once and kept — a second picture must not cost
+                        // a second view — and an empty pair is how the body
+                        // goes back to the rows.
+                        match blob {
+                            Some(loaded) => {
+                                let blob = shell
+                                    .workspace
+                                    .blob
+                                    .get_or_insert_with(|| cx.new(|_| views::blob::Blob::new()))
+                                    .clone();
+                                blob.update(cx, |b, cx| {
+                                    b.show(&loaded);
+                                    cx.notify();
+                                });
+                            }
+                            None => {
+                                if let Some(blob) = shell.workspace.blob.clone() {
+                                    blob.update(cx, |b, cx| {
+                                        b.clear();
+                                        cx.notify();
+                                    });
+                                }
+                            }
+                        }
+                        cx.notify();
                     }
                     // A side that vanished under the selection — staged the
                     // last hunk, deleted the file — is not a crash: one
@@ -5418,6 +5497,15 @@ impl DevShell {
                         if let Some(center) = shell.workspace.center.clone() {
                             let host = config::host(cx);
                             center.update(cx, |d, cx| d.replace(Vec::new(), &host, cx));
+                        }
+                        // The centre's other body goes too: a stale picture
+                        // under the new file's header is the same lie the
+                        // emptied rows just stopped telling.
+                        if let Some(blob) = shell.workspace.blob.clone() {
+                            blob.update(cx, |b, cx| {
+                                b.clear();
+                                cx.notify();
+                            });
                         }
                         shell.set_notice(e);
                     }
@@ -6445,6 +6533,17 @@ impl DevShell {
             &host,
             theme::Surface::Title,
         );
+        // A blob has no layouts to cycle — a picture is drawn one way — so the
+        // picker steps aside for the pane's own strip, which is where the
+        // controls that do apply (which side, and what kind) live. The header
+        // is otherwise the same one: a picture still sits under the path it
+        // belongs to.
+        let showing_blob = self
+            .workspace
+            .blob
+            .clone()
+            .is_some_and(|blob| blob.read(cx).is_showing());
+        let toggle = (!showing_blob).then_some(toggle);
         // The center header: breadcrumb left, status + totals + the
         // Unified/Split segmented control right — the reference's 48px
         // diff-toolbar, chosen segment on the surface over the rail tint.
@@ -6465,7 +6564,7 @@ impl DevShell {
                     .border_b_1()
                     .border_color(rgb(c.border))
                     .child(div().min_w_0().flex_shrink(1.0).child(breadcrumb))
-                    .child(toggle),
+                    .children(toggle),
             )
             .child(
                 div()
@@ -6515,7 +6614,22 @@ impl DevShell {
                     .min_h_0()
                     .flex_grow(1.0)
                     .overflow_hidden()
-                    .child(center.clone()),
+                    // One slot, two bodies: the diff's rows, or the blob pane
+                    // when the selection is a file with no lines to show. The
+                    // choice is made here rather than inside the diff view,
+                    // because it is the *selection* that decides and the shell
+                    // is what owns the selection.
+                    .child(
+                        match self
+                            .workspace
+                            .blob
+                            .clone()
+                            .filter(|blob| blob.read(cx).is_showing())
+                        {
+                            Some(blob) => blob.into_any_element(),
+                            None => center.clone().into_any_element(),
+                        },
+                    ),
             );
 
         // The inspector's rail: staged summary, drafts and commit, drawn
@@ -7402,13 +7516,13 @@ fn main() {
         {
             let recents = gitten_app::projects::load();
             if let Some(started) = open_recent(view, &recents) {
-                let app = gpui_platform::application().with_assets(assets::Assets);
+                let app = gpui_platform::application().with_assets(assets::Assets::default());
                 start::mark("gpui application up; entering run");
                 app.run(move |cx| open_main_window(Launch::Ready(started), cx));
                 return;
             }
             eprintln!("gitten: no repository here; choose one to open");
-            let app = gpui_platform::application().with_assets(assets::Assets);
+            let app = gpui_platform::application().with_assets(assets::Assets::default());
             app.run(move |cx| offer_repo_then_open(view, cx));
             return;
         }
@@ -7420,7 +7534,7 @@ fn main() {
     };
     match launch {
         Ok(launch) => {
-            let app = gpui_platform::application().with_assets(assets::Assets);
+            let app = gpui_platform::application().with_assets(assets::Assets::default());
             start::mark("gpui application up; entering run");
             app.run(move |cx| open_main_window(launch, cx));
         }
@@ -9582,6 +9696,220 @@ mod tests {
         });
     }
 
+    /// A 1200x800 window over a shell on `tree`, which is what the blob-pane
+    /// tests need: a drawn centre and the handle its files are addressed on.
+    fn window_with_tree(
+        cx: &mut TestAppContext,
+        tree: Status,
+    ) -> (
+        gpui::Entity<DevShell>,
+        Arc<RecordingRepo>,
+        gpui::VisualTestContext,
+    ) {
+        let (shell, repo, _handle) = tree_shell(cx, tree);
+        let observed = shell.clone();
+        let window = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.set_global(config::Active(Rc::new(Host::new())));
+            cx.open_window(
+                gpui::WindowOptions {
+                    window_bounds: Some(gpui::WindowBounds::Windowed(gpui::Bounds {
+                        origin: Default::default(),
+                        size: gpui::size(gpui::px(1200.0), gpui::px(800.0)),
+                    })),
+                    ..Default::default()
+                },
+                move |_, _| observed,
+            )
+            .unwrap()
+        });
+        let cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+        (shell, repo, cx)
+    }
+
+    /// A binary file in the rail gives the centre the blob pane, through the
+    /// real wiring: the preview lane's own job, the shell's own choice of
+    /// body, and the pane's own store. A text file keeps the rows.
+    #[gpui::test]
+    fn a_binary_file_gives_the_centre_a_blob_pane(cx: &mut TestAppContext) {
+        use gitten_core::blob::{Blob, Pair as BlobPair, Side};
+
+        // A PNG's opening bytes: binary to every read in acquisition, and a
+        // kind the pane can draw.
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend_from_slice(&[0u8; 64]);
+
+        let mut tree = Status::default();
+        tree.unstaged.push(gitten_core::status::UnstagedEntry {
+            path: gitten_core::status::PathBytes::from("pic.png"),
+            change: gitten_core::status::Change::Modified,
+            kind: gitten_core::status::Kind::File,
+            submodule: Default::default(),
+        });
+        // A real window, because half of this test is what the *centre* draws:
+        // the shell's choice of body, not the pane's own state.
+        let (shell, repo, mut cx) = window_with_tree(cx, tree);
+        // The read the preview makes — one binary file, which is the shape a
+        // diff cannot draw.
+        *repo.unstaged.lock().unwrap() = vec![Pair {
+            path: "pic.png".into(),
+            old_path: None,
+            status: 'M',
+            old: Vec::new(),
+            new: Vec::new(),
+            old_oid: None,
+            new_oid: Some("beef".into()),
+            old_final_newline: true,
+            new_final_newline: true,
+            binary: true,
+        }];
+        // And the bytes behind it.
+        *repo.blob.lock().unwrap() = BlobPair {
+            old: Side::Absent,
+            new: Side::Held(Blob::new(None, png.clone().into())),
+        };
+
+        shell.update(&mut cx, |shell, cx| shell.sync_workspace_preview(cx));
+        cx.run_until_parked();
+
+        assert!(
+            shell.read_with(&cx, |shell, cx| shell
+                .workspace
+                .blob
+                .as_ref()
+                .is_some_and(|blob| blob.read(cx).is_showing())),
+            "a binary file's preview did not reach the blob pane"
+        );
+        assert!(
+            cx.debug_bounds("blob-pane").is_some(),
+            "the pane was built and never drawn in the centre"
+        );
+
+        // A text file is a diff, and the blob pane steps out of the way.
+        *repo.unstaged.lock().unwrap() = vec![Pair {
+            path: "pic.png".into(),
+            old_path: None,
+            status: 'M',
+            old: vec!["one".into()],
+            new: vec!["two".into()],
+            old_oid: None,
+            new_oid: None,
+            old_final_newline: true,
+            new_final_newline: true,
+            binary: false,
+        }];
+        shell.update(&mut cx, |shell, cx| {
+            // A new key, so the preview schedules rather than comparing equal.
+            shell.workspace.last = None;
+            shell.sync_workspace_preview(cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            shell.read_with(&cx, |shell, cx| shell
+                .workspace
+                .blob
+                .as_ref()
+                .is_none_or(|blob| !blob.read(cx).is_showing())),
+            "a text diff still drew the blob pane"
+        );
+        assert!(
+            cx.debug_bounds("blob-pane").is_none(),
+            "the blob pane is still in the centre over a text diff"
+        );
+    }
+
+    /// A `.md` file reaching the workspace centre goes through the *rendered*
+    /// presentation and not the built-in: the markers are off the text the rows
+    /// copy, a link is down to its text, and a table is a grid. The one thing a
+    /// screenshot cannot answer — a diff that is the source with the prose
+    /// colours on looks like a rendered one at a glance, and the two are told
+    /// apart by the bytes and not by the picture.
+    #[gpui::test]
+    fn a_markdown_file_reaches_the_centre_as_a_rendered_document(cx: &mut TestAppContext) {
+        const OLD: &str = "\
+# gitten
+
+A paragraph with **bold** and [a link](https://example.com/x).
+
+- a bullet
+- second bullet
+
+| stage | cost |
+|---|---|
+| parse | 466 ms |
+";
+        const NEW: &str = "\
+# gitten
+
+A paragraph with **bolder** and [a link](https://example.com/y).
+
+- a bullet
+- second bullet, edited
+
+| stage | cost |
+|---|---|
+| parse | 466 ms |
+";
+
+        let mut tree = Status::default();
+        tree.unstaged.push(gitten_core::status::UnstagedEntry {
+            path: gitten_core::status::PathBytes::from("README.md"),
+            change: gitten_core::status::Change::Modified,
+            kind: gitten_core::status::Kind::File,
+            submodule: Default::default(),
+        });
+        let (shell, repo, mut cx) = window_with_tree(cx, tree);
+        *repo.unstaged.lock().unwrap() = vec![Pair {
+            path: "README.md".into(),
+            old_path: None,
+            status: 'M',
+            old: OLD.lines().map(Arc::<str>::from).collect(),
+            new: NEW.lines().map(Arc::<str>::from).collect(),
+            old_oid: None,
+            new_oid: None,
+            old_final_newline: true,
+            new_final_newline: true,
+            binary: false,
+        }];
+
+        shell.update(&mut cx, |shell, cx| shell.sync_workspace_preview(cx));
+        cx.run_until_parked();
+
+        let (load, text) = shell.update(&mut cx, |shell, cx| {
+            let center = shell.workspace.center.clone().expect("the centre exists");
+            let load = center.read(cx).load.clone();
+            let text = center.update(cx, |d, cx| {
+                d.select_all(cx);
+                d.selection()
+            });
+            (load, text)
+        });
+
+        assert!(
+            load.contains("markdown"),
+            "the centre did not lay the file out as markdown: {load:?}"
+        );
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(
+            lines.contains(&"gitten"),
+            "the heading's hashes were not removed: {lines:?}"
+        );
+        assert!(
+            !text.contains("## ") && !text.contains("# "),
+            "a heading marker survived: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.trim_start().starts_with("a bullet")),
+            "the bullet's marker was not removed: {lines:?}"
+        );
+        assert!(!text.contains("https://"), "a link kept its url: {lines:?}");
+        assert!(
+            text.contains('│'),
+            "the table is still pipes and dashes: {lines:?}"
+        );
+    }
+
     /// The rail's wheel is the rail's: the platform's own pixels on the
     /// grouped list's own handle, and the platform's own direction — a flick
     /// away from you is negative and scrolls down.
@@ -10264,6 +10592,14 @@ diff --git a/one.txt b/one.txt
         /// main-view load test reads. Separate from [`Self::calls`] so
         /// write assertions never see a read.
         diffs: std::sync::Mutex<Vec<String>>,
+        /// What the unstaged side answers for one path — the read the file
+        /// preview makes. Empty by default, which is "nothing unstaged" and
+        /// therefore no preview at all.
+        unstaged: std::sync::Mutex<Vec<Pair>>,
+        /// What `blob_pair` answers. Empty by default: a repository whose
+        /// files have no bytes to show, which is every test that is not about
+        /// one.
+        blob: std::sync::Mutex<gitten_core::blob::Pair>,
     }
 
     impl RecordingRepo {
@@ -10279,6 +10615,8 @@ diff --git a/one.txt b/one.txt
                 untracked: std::sync::Mutex::new(Vec::new()),
                 log_answer: std::sync::Mutex::new(Vec::new()),
                 diffs: std::sync::Mutex::new(Vec::new()),
+                unstaged: std::sync::Mutex::new(Vec::new()),
+                blob: std::sync::Mutex::new(gitten_core::blob::Pair::default()),
             }
         }
 
@@ -10350,6 +10688,19 @@ diff --git a/one.txt b/one.txt
         fn pairs(&self, revspec: &str) -> gitten_git::Result<Vec<Pair>> {
             self.diffs.lock().unwrap().push(revspec.to_string());
             Ok(Vec::new())
+        }
+
+        fn pairs_unstaged(&self, _: Option<&[u8]>) -> gitten_git::Result<Vec<Pair>> {
+            Ok(self.unstaged.lock().unwrap().clone())
+        }
+
+        fn blob_pair(
+            &self,
+            _: &gitten_core::source::DiffSource,
+            _: &[u8],
+            _: u64,
+        ) -> gitten_git::Result<gitten_core::blob::Pair> {
+            Ok(self.blob.lock().unwrap().clone())
         }
 
         fn status(&self) -> gitten_git::Result<Status> {
@@ -10815,6 +11166,8 @@ diff --git a/one.txt b/one.txt
             untracked: std::sync::Mutex::new(Vec::new()),
             log_answer: std::sync::Mutex::new(Vec::new()),
             diffs: std::sync::Mutex::new(Vec::new()),
+            unstaged: std::sync::Mutex::new(Vec::new()),
+            blob: std::sync::Mutex::new(gitten_core::blob::Pair::default()),
         });
         let handle: gitten_git::Handle = repo.clone();
         let shell = shell(None, cx);

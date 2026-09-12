@@ -133,6 +133,12 @@ pub struct Workspace {
     /// never rebuilt, which is what keeps its scroll state and presentation
     /// across files, the same promise the main view keeps across commits.
     pub center: Option<Entity<Diff>>,
+    /// The centre's other body: the pane a file with no lines to show gets.
+    /// `Some` while the selection is a blob — a picture, a document, anything
+    /// git calls binary — and `None` the rest of the time, which is what makes
+    /// the centre's body a choice between two views rather than a mode flag
+    /// inside one of them.
+    pub blob: Option<Entity<crate::views::blob::Blob>>,
     /// Newest file-preview request. A schedule bumps it; a load applies only
     /// if it still equals the value it left with, so a fast cursor run
     /// collapses to exactly one load — the latest row's. Same guard shape
@@ -181,6 +187,7 @@ impl Default for Workspace {
         Self {
             destination: Destination::Changes,
             center: None,
+            blob: None,
             request: 0,
             last: None,
             launch: LaunchHold::Off,

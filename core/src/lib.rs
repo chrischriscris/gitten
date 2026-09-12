@@ -12,6 +12,7 @@ pub use crate::source::DiffSource;
 
 pub mod align;
 pub mod bisect;
+pub mod blob;
 pub mod clipboard;
 pub mod command;
 pub mod conflict;
