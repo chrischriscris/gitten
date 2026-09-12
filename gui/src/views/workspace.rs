@@ -91,6 +91,38 @@ pub enum Destination {
     History,
 }
 
+/// Whether the launch's own diff is what the centre is showing.
+///
+/// A `diff <repo> <revspec>` launch asks for rows by name, so the command
+/// line — not the files cursor — is what picked them, and the preview must
+/// not re-aim the centre at a file nobody chose yet. The hold is armed at
+/// launch and captures its baseline the first time a file sits under the
+/// cursor — a skeleton's tree arrives with its wave, so there is no position
+/// to read at launch. While the cursor still names that file the launch rows
+/// stand; naming another — or the deliberate `workspace.preview` a row click
+/// dispatches — spends it. The baseline is section and path only, never the
+/// preview key's generation: a refresh wave re-lands the same selection under
+/// a newer one, and a wave is not a pick.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum LaunchHold {
+    /// A `commits` launch, `diff` of the working tree, or a hold the pick
+    /// already spent.
+    #[default]
+    Off,
+    /// Set at launch; the first preview pass that finds a file under the
+    /// cursor captures it as the baseline.
+    Armed,
+    /// The file the cursor launched on, while it still is.
+    Holding(Section, PathBytes),
+}
+
+impl LaunchHold {
+    /// True while the centre is the launch's rows rather than a preview.
+    pub fn held(&self) -> bool {
+        !matches!(self, Self::Off)
+    }
+}
+
 /// The workspace's shell-side state: destination, center view and preview
 /// guard. The sidebar holds no state of its own — it draws the files pane's
 /// grouped projection under the files pane's cursor.
@@ -111,6 +143,10 @@ pub struct Workspace {
     /// selection with a newer generation, which is a new key — staging a
     /// hunk re-aims the preview at the side that just moved.
     pub last: Option<(Section, PathBytes, u64)>,
+    /// The launch's own hold on the centre — see [`LaunchHold`]. `Off`
+    /// everywhere a `diff <repo> <revspec>` launch did not ask for rows by
+    /// name.
+    pub launch: LaunchHold,
     /// The sidebar list's own scroll handle. The sidebar shares the files
     /// pane's *cursor* but pans its own rows: grouped space has its own
     /// addresses, so the stack list's handle cannot serve it.
@@ -147,6 +183,7 @@ impl Default for Workspace {
             center: None,
             request: 0,
             last: None,
+            launch: LaunchHold::Off,
             sidebar_scroll: UniformListScrollHandle::new(),
             history_scroll: UniformListScrollHandle::new(),
             history_cursor: Cell::new(usize::MAX),

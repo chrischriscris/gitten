@@ -1218,6 +1218,11 @@ struct DevShell {
     refresh_id: u64,
     refresh_pending: usize,
     refresh_error: Option<String>,
+    /// QA doors that need the first wave's rows — `commit`'s confirmation
+    /// only stands with staged content, which frame one does not have yet.
+    /// Drained where the wave lands; a launch with no wave never fires
+    /// them, which is the same refusal a person's key would get.
+    qa_deferred: Vec<&'static str>,
     running: Option<(String, std::time::Instant)>,
     /// The files-pane generation a queued write was sent against — set by
     /// [`DevShell::queue_write`], the one door the shell's sends leave
@@ -1614,7 +1619,19 @@ impl DevShell {
     /// screen.
     fn main_diff(&self) -> Option<Entity<views::diff::Diff>> {
         match self.workspace.destination {
-            views::workspace::Destination::Changes => self.workspace.center.clone(),
+            views::workspace::Destination::Changes => {
+                // The launch's own diff is the centre while its hold
+                // stands — `diff <repo> <revspec>` named those rows on the
+                // command line, and a launch with no working tree has
+                // nothing else to show — so it is the view the keyboard
+                // and the wheel name.
+                if self.workspace.launch.held() {
+                    if let Screen::Diff { view, .. } = &self.main {
+                        return Some(view.clone());
+                    }
+                }
+                self.workspace.center.clone()
+            }
             views::workspace::Destination::History => match &self.main {
                 Screen::Diff { view, .. } => Some(view.clone()),
                 _ => None,
@@ -1677,8 +1694,10 @@ impl DevShell {
         }
         // The workspace center is not a pane, so it is not in the loop:
         // its bar is accent exactly when the keyboard sits in the diff
-        // region.
-        if let Some(center) = self.workspace.center.clone() {
+        // region. `main_diff` names the centre that is *drawn* — the
+        // launch's own view while its hold stands — so a diff launch's
+        // bar lights too.
+        if let Some(center) = self.main_diff() {
             let focused = self.spot == Spot::Main;
             center.update(cx, |v, _| v.set_focused(focused));
         }
@@ -3358,6 +3377,12 @@ impl DevShell {
                     stats.total_rows.set(total);
                 }
             }
+            // A QA door that needed the wave's rows fires now that it has
+            // them — the same named command it would have run on frame one,
+            // run where the rows it reads actually exist.
+            for command in std::mem::take(&mut self.qa_deferred) {
+                self.run_command(command, cx);
+            }
         }
         // A refresh may have re-anchored the commits cursor — the list it was
         // on changed under it — which is a selection change as far as the
@@ -4267,7 +4292,13 @@ impl DevShell {
             // same honest sentence an unknown command gets.
             "workspace.changes" => self.enter_workspace(cx),
             "workspace.history" => self.enter_history(cx),
-            "workspace.preview" => self.sync_workspace_preview(cx),
+            // A pick, not a poll: a row click dispatches this after moving
+            // the cursor, and choosing a file spends the launch hold even
+            // when it names the file the cursor already sat on.
+            "workspace.preview" => {
+                self.workspace.launch = views::workspace::LaunchHold::Off;
+                self.sync_workspace_preview(cx);
+            }
             "files.stage" => self.stage_or_unstage(cx),
             "files.commit" => self.begin_commit_message(cx),
             "files.amend" => self.begin_amend_message(cx),
@@ -4912,7 +4943,10 @@ impl DevShell {
     fn enter_workspace(&mut self, cx: &mut Context<Self>) {
         self.workspace.destination = views::workspace::Destination::Changes;
         self.workspace_center(cx);
-        if self.panes.position("files").is_some() {
+        // A launch whose centre is its own diff keeps the keyboard on it:
+        // `diff <repo> <revspec>` made its pick on the command line, so the
+        // files pane has not chosen what the centre shows.
+        if self.panes.position("files").is_some() && !self.workspace.launch.held() {
             self.focus_named("files", cx);
         }
         self.sync_workspace_preview(cx);
@@ -5015,6 +5049,31 @@ impl DevShell {
             self.workspace.last = None;
             return;
         };
+        // The launch's own diff stands in the centre while its hold does —
+        // `diff <repo> <revspec>` asked for those rows by name, so the files
+        // cursor did not put them there. `Armed` captures the baseline the
+        // first time a file sits under the cursor (a skeleton's tree arrives
+        // with its wave, so there is no position to read at launch); while
+        // the cursor still names that file the launch rows stand, and naming
+        // another spends it. Section and path only, never the preview key's
+        // generation: a wave re-lands the same selection under a newer one,
+        // and a wave is not a pick.
+        match &self.workspace.launch {
+            views::workspace::LaunchHold::Armed => {
+                self.workspace.launch =
+                    views::workspace::LaunchHold::Holding(section, path.clone());
+                return;
+            }
+            views::workspace::LaunchHold::Holding(held_section, held_path)
+                if *held_section == section && *held_path == path =>
+            {
+                return;
+            }
+            views::workspace::LaunchHold::Holding(..) => {
+                self.workspace.launch = views::workspace::LaunchHold::Off;
+            }
+            views::workspace::LaunchHold::Off => {}
+        }
         let key = (section, path.clone(), gen);
         if self.workspace.last.as_ref() == Some(&key) {
             return;
@@ -5882,6 +5941,29 @@ impl DevShell {
         let insp_w = views::workspace::inspector_width(viewport_w);
 
         let Some(files_screen) = self.panes.get("files").cloned() else {
+            // A launch with no working tree still owns its diff:
+            // `--fixtures` and `--patch` loaded rows into the launch view,
+            // and the middle is where the window shows them. The sentence
+            // stands only for a launch view that is genuinely empty —
+            // `commits --fixtures` — where there is nothing to draw at all.
+            if let Screen::Diff { view, .. } = &self.main {
+                if view.read(cx).total.get() > 0 {
+                    let view = view.clone();
+                    return div()
+                        .id("workspace-center")
+                        .debug_selector(|| "workspace-center".to_string())
+                        .size_full()
+                        .min_h_0()
+                        .overflow_hidden()
+                        // Pointing at the diff is the keyboard coming to it —
+                        // the same capture the real centre pane runs.
+                        .capture_any_mouse_down(
+                            cx.listener(|this, _, _, cx| this.set_spot(Spot::Main, cx)),
+                        )
+                        .child(view)
+                        .into_any_element();
+                }
+            }
             // A fixture has no working tree and therefore no sidebar to
             // group: the workspace is a repository layout, said plainly.
             return div()
@@ -5992,6 +6074,14 @@ impl DevShell {
         // The center: breadcrumb, Unified/Split toggle, status and totals
         // over the shared diff view, fed one file's rows per selection.
         let center = self.workspace_center(cx);
+        // While the launch hold stands the centre is the launch screen's own
+        // view — the parked preview entity is not what is drawn, so nothing
+        // the header or the body reads may come off it.
+        let holding = self.workspace.launch.held();
+        let center = match (holding, &self.main) {
+            (true, Screen::Diff { view, .. }) => view.clone(),
+            _ => center,
+        };
         let summary = center.read(cx).file_summary();
         // What the registry holds and which entry is loaded: the toggle is a
         // pure function of the two, and the same one History draws over the
@@ -6000,14 +6090,61 @@ impl DevShell {
             let v = center.read(cx);
             (v.layout_names(), v.layout_index())
         };
-        let status_word = match cursor_file.as_ref().map(|(s, _, _, _)| s) {
-            Some(views::files::Section::Staged) => "Staged",
-            Some(views::files::Section::Untracked) => "New file",
-            Some(views::files::Section::Conflicts) => "Conflict",
-            _ => "Modified",
+        // The launch's own name for what is on screen — the revspec the
+        // command line gave, or the acquisition's label for anything else
+        // that can hold the centre — because the header must not borrow the
+        // files cursor's file for rows it never picked.
+        let launch_name: Option<SharedString> = holding.then(|| match &self.main {
+            Screen::Diff { source, label, .. } => match source.borrow().as_ref() {
+                Some(Source::Repo { arg, .. }) if !arg.is_empty() => {
+                    SharedString::from(arg.clone())
+                }
+                _ => SharedString::from(label.borrow().clone()),
+            },
+            _ => SharedString::default(),
+        });
+        let status_word: SharedString = match &launch_name {
+            Some(name) => name.clone(),
+            None => match cursor_file.as_ref().map(|(s, _, _, _)| s) {
+                Some(views::files::Section::Staged) => "Staged".into(),
+                Some(views::files::Section::Untracked) => "New file".into(),
+                Some(views::files::Section::Conflicts) => "Conflict".into(),
+                _ => "Modified".into(),
+            },
         };
-        let breadcrumb: AnyElement = match &cursor_file {
-            Some((_, _, dir, name)) => div()
+        let breadcrumb: AnyElement = match (&launch_name, &cursor_file, &summary) {
+            // The launch diff's breadcrumb names the file under *its*
+            // keyboard — `]`/`[` move it between files — and falls back to
+            // the launch's label before the first rows land.
+            (Some(_), _, Some(s)) => {
+                let (dir, name) = gitten_core::path::split_dir_name(&s.path);
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .min_w_0()
+                    .child(chrome::icon(
+                        "gitten/file.svg",
+                        14.0,
+                        host.theme.dim_on(theme::Surface::Title),
+                    ))
+                    .child(chrome::path_spans(
+                        &host,
+                        SharedString::from(dir.to_string()),
+                        SharedString::from(name.to_string()),
+                        c.fg,
+                        theme::Surface::Title,
+                        false,
+                    ))
+                    .into_any_element()
+            }
+            (Some(name), _, None) => div()
+                .text_color(rgb(host.theme.dim_on(theme::Surface::Title)))
+                .min_w_0()
+                .overflow_hidden()
+                .child(name.clone())
+                .into_any_element(),
+            (None, Some((_, _, dir, name)), _) => div()
                 .flex()
                 .items_center()
                 .gap(px(6.0))
@@ -6026,7 +6163,7 @@ impl DevShell {
                     false,
                 ))
                 .into_any_element(),
-            None => div()
+            (None, None, _) => div()
                 .text_color(rgb(host.theme.dim_on(theme::Surface::Title)))
                 .child("No file selected")
                 .into_any_element(),
@@ -6093,13 +6230,16 @@ impl DevShell {
                     .h(px(38.0))
                     .border_b_1()
                     .border_color(rgb(c.border))
-                    .child(
-                        div().flex().gap(px(8.0)).child(status_word).child(
+                    .child(div().flex().gap(px(8.0)).child(status_word).children(
+                        // "in working tree" names where *working-tree*
+                        // rows live; a held launch diff is a revspec's
+                        // rows, and the tail would be a lie beside it.
+                        (launch_name.is_none()).then(|| {
                             div()
                                 .text_color(rgb(host.theme.dim_on(theme::Surface::Title)))
-                                .child("in working tree"),
-                        ),
-                    )
+                                .child("in working tree")
+                        }),
+                    ))
                     .children(totals),
             );
         let staged_side = matches!(
@@ -7620,6 +7760,7 @@ fn open_main_window(launch: Launch, cx: &mut App) {
                 refresh_id: 0,
                 refresh_pending: 0,
                 refresh_error: None,
+                qa_deferred: Vec::new(),
                 running: None,
                 queued_write: None,
                 show_message: false,
@@ -7635,7 +7776,20 @@ fn open_main_window(launch: Launch, cx: &mut App) {
                 first_render: Cell::new(false),
                 title_memo: RefCell::new(None),
                 os_title: RefCell::new(None),
-                workspace: views::workspace::Workspace::default(),
+                workspace: views::workspace::Workspace {
+                    // A `diff <repo> <revspec>` launch asked for its rows by
+                    // name: the centre is the launch view until the files
+                    // cursor picks another file — [`LaunchHold`] walks the
+                    // spend. A bare `diff` is the working tree and holds
+                    // nothing; a fixture has no files pane to compete with.
+                    launch: match &source {
+                        Source::Repo { arg, .. } if which_name == "diff" && !arg.is_empty() => {
+                            views::workspace::LaunchHold::Armed
+                        }
+                        _ => views::workspace::LaunchHold::Off,
+                    },
+                    ..Default::default()
+                },
                 drafts: std::collections::HashMap::new(),
                 commit_confirm: false,
                 pending_commit_key: None,
@@ -8381,6 +8535,7 @@ mod tests {
                 refresh_id: 0,
                 refresh_pending: 0,
                 refresh_error: None,
+                qa_deferred: Vec::new(),
                 running: None,
                 queued_write: None,
                 show_message: false,
@@ -12819,7 +12974,7 @@ diff --git a/added.txt b/added.txt
 
 #[cfg(test)]
 mod title_tests {
-    use super::{expand_project_path, repo_title, same_project_path, SECTION_MIN_H};
+    use super::{expand_project_path, repo_title, same_project_path};
     use std::path::{Path, PathBuf};
 
     #[test]

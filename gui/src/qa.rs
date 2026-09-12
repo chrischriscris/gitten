@@ -11,7 +11,7 @@
 //!
 //! ```sh
 //! GITTEN_QA_GEOM=1280x800 ./dev gui diff .
-//! GITTEN_QA_VIEW=history  ./dev gui diff .
+//! GITTEN_QA_VIEW=branches ./dev gui diff .
 //! GITTEN_QA_DIALOG=commands ./dev gui diff .
 //! GITTEN_QA_THEME=github-dark ./dev gui diff .
 //! ```
@@ -38,9 +38,11 @@ use gpui::Context;
 pub(crate) struct Doors {
     /// `GITTEN_QA_GEOM`, as `WxH` in logical pixels.
     pub geom: Option<(f32, f32)>,
-    /// `GITTEN_QA_VIEW`: `changes` or `history`.
+    /// `GITTEN_QA_VIEW`: `changes`, `history`, `branches` or `stashes` —
+    /// the last two the sidebar's utility rows reach through `*.focus`.
     pub view: Option<String>,
-    /// `GITTEN_QA_DIALOG`: `commands`, `themes`, `settings` or `commit`.
+    /// `GITTEN_QA_DIALOG`: `commands`, `themes`, `settings`, `commit` or
+    /// `project` (the repository switcher the title's click opens).
     pub dialog: Option<String>,
     /// `GITTEN_QA_THEME`: a palette by the name the picker shows.
     pub theme: Option<String>,
@@ -59,12 +61,12 @@ impl Doors {
             geom: geom(get("GITTEN_QA_GEOM").as_deref()),
             view: named(
                 get("GITTEN_QA_VIEW").as_deref(),
-                &["changes", "history"],
+                &["changes", "history", "branches", "stashes"],
                 "view",
             ),
             dialog: named(
                 get("GITTEN_QA_DIALOG").as_deref(),
-                &["commands", "themes", "settings", "commit"],
+                &["commands", "themes", "settings", "commit", "project"],
                 "dialog",
             ),
             theme: get("GITTEN_QA_THEME").filter(|t| !t.is_empty()),
@@ -149,11 +151,12 @@ impl crate::DevShell {
             Some("commands") => self.open_palette(cx),
             Some("themes") => self.open_theme_picker(cx),
             Some("settings") => self.run_command("settings", cx),
-            // The confirmation stands only with staged content, which is the
-            // operation's own rule; a door that insisted would be a second
-            // one, so this opens the same door a person's key does and takes
-            // the same refusal.
-            Some("commit") => self.run_command("workspace.commit", cx),
+            // The confirmation stands only with staged content, which the
+            // first frame does not have yet — acquisition lands it with the
+            // wave, so the door waits there rather than photographing the
+            // refusal a person pressing the key early would also get.
+            Some("commit") => self.qa_deferred.push("workspace.commit"),
+            Some("project") => self.run_command("project.switch", cx),
             _ => {}
         }
     }
