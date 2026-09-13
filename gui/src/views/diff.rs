@@ -66,12 +66,13 @@ use crate::chrome::gap_l;
 pub(crate) use crate::chrome::ROW_BAR;
 use gitten_core::font::Font;
 use gitten_core::host::Host;
+use gitten_core::list::Armed;
 use gitten_core::prepared::{prepare, Prepared};
-use gitten_core::rows::{Ordered, RowRef};
+use gitten_core::rows::{expand, Ordered, Present, RowRef};
 use gitten_core::runs::{self, surfaces, Run};
 use gitten_core::select::{self, Caret, RowId, Selected, Selection, Text as _};
 use gitten_core::syntax::Token;
-use gitten_core::theme::{DiffPalette, Rgb, Surface, Theme};
+use gitten_core::theme::{Rgb, Surface, Theme};
 use gitten_core::view::Viewport;
 use gitten_core::wrap::{Wrap, Wrapped};
 use gitten_core::{FileDiff, LineKind, Span};
@@ -465,72 +466,37 @@ impl Layouts {
     }
 }
 
-// The order table's row reference and the table itself are
-// `gitten_core::rows`': 8 bytes a row, `logical()` for what survives a reflow,
-// and the same `widest`/`anchor` a walk of it computes. Only `expand` below is
-// this client's, and only because a `Rows` returns an `AnyElement` — see the
-// note there.
+// The order table's row reference, the table itself and the pass that builds
+// it are `gitten_core::rows`': 8 bytes a row, `logical()` for what survives a
+// reflow, and the `widest`/`anchor`/`headers` a walk of it computes. What is
+// this client's is the `Rows` trait — `expand` only needs the half of it that
+// is not drawing, which is what this impl hands the shared pass.
 
-/// Expands one entry per *logical* row into one per *visual* row.
-///
-/// `logical` may already be expanded — consecutive entries with the same owner
-/// and index are one logical row, and an index is unique within an owner, so the
-/// previous table is its own source of truth. That is the whole reason a reflow
-/// needs no second table to remember the unwrapped shape: 8 bytes a row, once,
-/// however many times the window is dragged.
-///
-/// Returns the table plus where the file headers landed in it — what `]` and
-/// `[` jump between. Core's [`gitten_core::rows::Ordered`] stays as it is because
-/// the terminal indexes headers off its own presentations; this client collects
-/// them during the same walk rather than search the table per keypress.
-fn expand(
-    logical: &[RowRef],
-    renderers: &[Box<dyn Rows>],
-    anchor: Option<RowRef>,
-) -> (Ordered, Vec<usize>) {
-    let mut order: Vec<RowRef> = Vec::with_capacity(logical.len());
-    let mut headers: Vec<usize> = Vec::new();
-    let (mut widest, mut widest_at) = (0usize, 0usize);
-    let mut found = 0usize;
-    let mut i = 0;
-    while i < logical.len() {
-        let r = logical[i];
-        while i < logical.len() && logical[i].logical() == r.logical() {
-            i += 1;
-        }
-        let Some(rows) = renderers.get(r.owner as usize) else {
-            continue;
-        };
-        if anchor.map(RowRef::logical) == Some(r.logical()) {
-            found = order.len();
-        }
-        // One branch per visual row, once per rebuild: where the file headers
-        // are is what `]` and `[` jump between, and no presentation has to know
-        // a jump list exists.
-        if rows.is_header(r.index as usize) {
-            headers.push(order.len());
-        }
-        let n = rows.rows(r.index as usize).clamp(1, u16::MAX as usize);
-        for seg in 0..n {
-            let w = rows.width(r.index as usize, seg);
-            if w > widest {
-                (widest, widest_at) = (w, order.len());
-            }
-            order.push(RowRef {
-                owner: r.owner,
-                seg: seg as u16,
-                index: r.index,
-            });
-        }
+/// [`Present`] for the trait object, so [`gitten_core::rows::expand`] walks
+/// this client's renderers directly. Everything the order table's walk asks —
+/// claims, row counts, widths, where the file headers are — is a method
+/// `Rows` already has; the rest of `Present` is UI-free answers this trait
+/// does not keep (its `hunk_at` speaks in paths, not `files` indices, and the
+/// default file list is none).
+impl Present for dyn Rows {
+    fn claims(&self, path: &str) -> bool {
+        Rows::claims(self, path)
     }
-    (
-        Ordered {
-            order,
-            widest: widest_at,
-            anchor: found,
-        },
-        headers,
-    )
+    fn len(&self) -> usize {
+        Rows::len(self)
+    }
+    fn build(&mut self, file: gitten_core::prepared::File) {
+        Rows::build(self, file)
+    }
+    fn rows(&self, index: usize) -> usize {
+        Rows::rows(self, index)
+    }
+    fn width(&self, index: usize, seg: usize) -> usize {
+        Rows::width(self, index, seg)
+    }
+    fn is_header(&self, index: usize) -> bool {
+        Rows::is_header(self, index)
+    }
 }
 
 /// This wheel event's delta with the gesture's axis lock applied: what is left on
@@ -749,15 +715,16 @@ pub struct Diff {
     /// standing. Any move of the keyboard, wheel or refresh of the diff
     /// clears it — see [`Diff::confirm_or_arm_discard_hunk`] — so a press
     /// can never spend an arm on a hunk it was not asked about.
-    armed_hunk: Option<(u16, u32)>,
+    armed_hunk: Armed<(u16, u32)>,
     /// Whether this pane holds the keyboard, as the shell last told it. A
     /// row's cursor bar is accent only when its pane is focused, and the view
     /// cannot ask the shell during render — so the shell writes it here when
     /// focus moves, and render reads a flag.
     focused: bool,
     /// Where every file header is, in visual rows — what `]` and `[` jump
-    /// between. Collected by [`expand`] while it builds the order table, so it
-    /// costs one branch per row at rebuild and nothing per frame.
+    /// between. Collected by [`gitten_core::rows::expand`] while it builds the
+    /// order table, so it costs one branch per row at rebuild and nothing per
+    /// frame.
     headers: Rc<Vec<usize>>,
     scroll: UniformListScrollHandle,
     /// The horizontal axis, which is this view's and not the list's — see the
@@ -892,7 +859,7 @@ impl Diff {
             // and the one being read is the cursor's. A layout change has no
             // such correspondence, which is why it uses a fraction instead.
             let anchor = self.order.get(self.view.get().cursor()).copied();
-            let (built, headers) = expand(&self.order, &self.renderers.borrow(), anchor);
+            let built = expand(&self.order, &self.renderers.borrow(), anchor);
             let logical = self
                 .renderers
                 .borrow()
@@ -901,7 +868,7 @@ impl Diff {
                 .sum::<usize>();
             self.order = Rc::new(built.order);
             self.widest = built.widest;
-            self.headers = Rc::new(headers);
+            self.headers = Rc::new(built.headers);
             self.marks = Rc::new(hunk_marks(&self.order, &self.renderers.borrow()));
             self.total.set(self.order.len());
             // The line you were reading is wherever the cursor now is — its row
@@ -1015,7 +982,7 @@ impl Diff {
                 self.view.set(v);
                 self.top.set(v.top());
                 // The wheel is also a move of attention.
-                self.armed_hunk = None;
+                self.armed_hunk.disarm();
                 return true;
             }
             // Selection autoscroll parks its own non-strict request. A newer
@@ -1042,7 +1009,7 @@ impl Diff {
         self.view.set(v);
         self.synced.set(y);
         // The wheel is also a move of attention — same rule the arrow keys keep.
-        self.armed_hunk = None;
+        self.armed_hunk.disarm();
         true
     }
 
@@ -1121,7 +1088,7 @@ impl Diff {
                 }
                 // The rows are about to be re-arranged; whatever the question
                 // was armed against may land somewhere else in them.
-                self.armed_hunk = None;
+                self.armed_hunk.disarm();
                 return true;
             }
             "diff.cycle-wrap" => {
@@ -1131,14 +1098,14 @@ impl Diff {
                 }
                 // The rows are about to re-expand; whatever the question was
                 // armed against may land somewhere else in them.
-                self.armed_hunk = None;
+                self.armed_hunk.disarm();
                 return true;
             }
             _ => return false,
         }
         // The keyboard moved. Whatever an armed discard was asked about was
         // where the keyboard used to be — same rule as the working-tree pane.
-        self.armed_hunk = None;
+        self.armed_hunk.disarm();
         self.view.set(v);
         self.show(v);
         true
@@ -1210,7 +1177,7 @@ impl Diff {
             v.go_to(t);
             self.view.set(v);
             // A file jump is a move of the keyboard; see `run_view`'s tail.
-            self.armed_hunk = None;
+            self.armed_hunk.disarm();
             self.show(v);
         }
     }
@@ -1246,7 +1213,9 @@ impl Diff {
     pub fn current_hunk(&self) -> Option<(String, gitten_core::Hunk)> {
         let r = *self.order.get(self.view.get().cursor())?;
         let renderers = self.renderers.borrow();
-        let (path, hunk_no) = renderers.get(r.owner as usize)?.hunk_at(r.index as usize)?;
+        // `Rows::`, spelled out: `Box<dyn Rows>` also answers
+        // `Present::hunk_at`, which names a file by index rather than path.
+        let (path, hunk_no) = Rows::hunk_at(&**renderers.get(r.owner as usize)?, r.index as usize)?;
         let file = self.files.iter().find(|f| f.path == path)?;
         Some((path.to_string(), file.hunks.get(hunk_no)?.clone()))
     }
@@ -1263,7 +1232,7 @@ impl Diff {
     pub fn hunk_for_row(&self, visual: usize) -> Option<(String, usize)> {
         let r = *self.order.get(visual)?;
         let renderers = self.renderers.borrow();
-        let (path, hunk_no) = renderers.get(r.owner as usize)?.hunk_at(r.index as usize)?;
+        let (path, hunk_no) = Rows::hunk_at(&**renderers.get(r.owner as usize)?, r.index as usize)?;
         Some((path.to_string(), hunk_no))
     }
 
@@ -1304,7 +1273,7 @@ impl Diff {
         // Which file the keyboard is over, and which of its hunks is under it.
         // The latter stays absent when no hunk is under it: whether such a
         // file has any first hunk to name is the file's own fact, read below.
-        let located = match rows.hunk_at(index) {
+        let located = match Rows::hunk_at(&**rows, index) {
             Some((path, n)) => Some((path, Some(n))),
             None if rows.is_header(index) => {
                 // Wrapping adds visual rows and never changes the logical one
@@ -1333,16 +1302,7 @@ impl Diff {
     /// carrying the same id has the keyboard still sitting where the question
     /// was asked, and spends the arm.
     pub(crate) fn confirm_or_arm_discard_hunk(&mut self, id: (u16, u32)) -> bool {
-        match self.armed_hunk {
-            Some(armed) if armed == id => {
-                self.armed_hunk = None;
-                true
-            }
-            _ => {
-                self.armed_hunk = Some(id);
-                false
-            }
-        }
+        self.armed_hunk.confirm_or_arm(id)
     }
 
     /// Told by the shell whenever the keyboard moves — never decided here.
@@ -1453,7 +1413,7 @@ impl Diff {
         self.dragging = false;
         // A refresh is the repository saying things moved; an armed discard
         // was a promise about how they were, so it dies here first.
-        self.armed_hunk = None;
+        self.armed_hunk.disarm();
         self.prepared = Rc::new(prepared);
         let built = arrange(&self.prepared, host, &self.layouts, self.current);
         self.order = Rc::new(built.order);
@@ -1605,7 +1565,7 @@ impl Diff {
             sel: None,
             dragging: false,
             widest: built.widest,
-            armed_hunk: None,
+            armed_hunk: Armed::new(),
             hunk_action: None,
             hunk_action_label: "+ Stage hunk",
             focused: false,
@@ -1639,7 +1599,7 @@ impl Diff {
         self.sel = None;
         // An armed discard rides the same logic: the row it was asked about
         // is about to have a different meaning.
-        self.armed_hunk = None;
+        self.armed_hunk.disarm();
         let built = arrange(&self.prepared, host, &self.layouts, index);
         // Resolve-or-drop: a carried end that names no row in the new order
         // — a hole, a single-text presentation asked for a second column —
@@ -1717,7 +1677,7 @@ fn snapshot_selection(sel: &Selection, renderers: &[Box<dyn Rows>]) -> Option<Ca
         let (owner, index) = at.row;
         let rows = renderers.get(owner as usize)?;
         let index = index as usize;
-        let kind = match rows.hunk_at(index) {
+        let kind = match Rows::hunk_at(&**rows, index) {
             Some((path, hunk)) => CarriedRow::Hunk {
                 path: path.to_string(),
                 hunk,
@@ -1766,9 +1726,9 @@ fn restore_selection(
             let rows = renderers.get(owner as usize)?;
             let index = index as usize;
             let matches = match &target.kind {
-                CarriedRow::Hunk { path, hunk, .. } => rows
-                    .hunk_at(index)
-                    .is_some_and(|(p, n)| p == path && n == *hunk),
+                CarriedRow::Hunk { path, hunk, .. } => {
+                    Rows::hunk_at(&**rows, index).is_some_and(|(p, n)| p == path && n == *hunk)
+                }
                 CarriedRow::Header { path } => {
                     rows.is_header(index) && rows.selectable(index, 0) == Some(path.as_str())
                 }
@@ -1845,12 +1805,13 @@ struct Built {
     order: Vec<RowRef>,
     widest: usize,
     /// Where each file header landed in visual rows — what jump-to-file and
-    /// the widest-row search read. Produced by the same [`expand`] that built
-    /// `order`, so it can never disagree with it.
+    /// the widest-row search read. Produced by the same
+    /// [`gitten_core::rows::expand`] that built `order`, so it can never
+    /// disagree with it.
     headers: Vec<usize>,
     /// Where each hunk starts, as a fraction of the order — [`Diff::marks`]'s
-    /// source. Produced beside the order it indexes, by the same [`expand`]
-    /// pass, so the two can never disagree.
+    /// source. Produced beside the order it indexes, by the same
+    /// [`gitten_core::rows::expand`] pass, so the two can never disagree.
     marks: Vec<f32>,
     load: String,
 }
@@ -1910,7 +1871,12 @@ fn arrange(prepared: &Prepared, host: &Host, layouts: &Layouts, current: usize) 
     // wraps yet — no implementation has been given a width — so this pass only
     // finds the widest row and the file headers; the first frame reflows and
     // runs it again.
-    let (Ordered { order, widest, .. }, headers) = expand(&order, &renderers, None);
+    let Ordered {
+        order,
+        widest,
+        headers,
+        ..
+    } = expand(&order, &renderers, None);
 
     // `cpu across N` when the pass fanned out, because these are summed across
     // workers and `build` beside them is wall clock — without the note the two
@@ -2314,7 +2280,7 @@ impl Render for Diff {
         let focused = self.focused;
         // The question the shell is holding, if any, copied so the rows of one
         // frame all answer it at the same state of the arm.
-        let armed = self.armed_hunk;
+        let armed = self.armed_hunk.get().copied();
         // The hunk ticks' two per-frame reads, taken here like every other
         // setting the frame is drawn from: the offsets, computed at load and
         // rebuilt where the order was, and the ink they are drawn in. A
@@ -2797,7 +2763,7 @@ impl Rows for TextRows {
                 spans,
                 tokens,
             } => {
-                let (bg, fg, sign) = line_colors(*kind, *moved, p);
+                let (bg, fg, sign) = p.line_colors(*kind, *moved);
                 // The keyboard's row is a bar across the whole line, whatever
                 // kind of line it is — the same background the terminal draws,
                 // so the cursor reads as one thing in both.
@@ -3321,29 +3287,9 @@ fn hunk_runs(
     out
 }
 
-/// Which background a line is drawn on, and the foreground and sign that go with
-/// it. Shared by all three presentations so they cannot drift on what "added"
-/// looks like.
-///
-/// `moved` swaps the background and nothing else. The `+` and `-` stay, so a
-/// column of signs is still scannable, and the foreground stays so a moved block
-/// reads as ordinary text — which it is. Only the hue says "you may skip this",
-/// which is how git's `--color-moved` does it too.
-pub(crate) fn line_colors(
-    kind: LineKind,
-    moved: bool,
-    p: &DiffPalette,
-) -> (Rgb, Rgb, &'static str) {
-    match (kind, moved) {
-        (LineKind::Added, false) => (p.added_bg, p.added_fg, "+"),
-        (LineKind::Added, true) => (p.moved_added_bg, p.added_fg, "+"),
-        (LineKind::Removed, false) => (p.removed_bg, p.removed_fg, "-"),
-        (LineKind::Removed, true) => (p.moved_removed_bg, p.removed_fg, "-"),
-        // Context is never moved: a line that did not change did not go
-        // anywhere, and `mark_moved` says so.
-        (LineKind::Context, _) => (p.context_bg, p.context_fg, " "),
-    }
-}
+// Which background a line is drawn on, and the foreground and sign that go with
+// it, is [`DiffPalette::line_colors`]'s answer — the palette owns the policy so
+// no presentation or client can drift on what "added" looks like.
 
 /// The background a row paints: its own kind's, unless the keyboard is on it —
 /// then the one bar every presentation shares. Every `render` in this crate
@@ -3639,9 +3585,8 @@ mod tests {
     // By name, not a glob: `use gpui::*` in the parent shadows `#[test]` with
     // GPUI's own attribute macro and every test in here fails to expand.
     use super::{
-        extent_ink, extent_of, file_header, hunk_header, line_colors, locked, row_background,
-        row_bar, Diff, FileSummary, Layouts, Pan, Row, RowState, Rows, TextRows, PAD, ROW_H,
-        TEXT_CHROME,
+        extent_ink, extent_of, file_header, hunk_header, locked, row_background, row_bar, Diff,
+        FileSummary, Layouts, Pan, Row, RowState, Rows, TextRows, PAD, ROW_H, TEXT_CHROME,
     };
     use gitten_core::font::Font;
     use gitten_core::host::Host;
@@ -3815,8 +3760,8 @@ mod tests {
         let theme = Theme::dark();
         let p = &theme.diff;
         for kind in [LineKind::Added, LineKind::Removed] {
-            let (plain, _, sign) = line_colors(kind, false, p);
-            let (moved, _, moved_sign) = line_colors(kind, true, p);
+            let (plain, _, sign) = p.line_colors(kind, false);
+            let (moved, _, moved_sign) = p.line_colors(kind, true);
             assert_ne!(
                 plain, moved,
                 "{kind:?} moved and unmoved share a background"
@@ -3825,8 +3770,8 @@ mod tests {
         }
         // Context is never moved, and asking must not change what it looks like.
         assert_eq!(
-            line_colors(LineKind::Context, true, p),
-            line_colors(LineKind::Context, false, p)
+            p.line_colors(LineKind::Context, true),
+            p.line_colors(LineKind::Context, false)
         );
     }
 
@@ -3848,7 +3793,7 @@ mod tests {
             (LineKind::Removed, true),
         ];
         for (kind, moved) in kinds {
-            let (base, _, _) = line_colors(kind, moved, p);
+            let (base, _, _) = p.line_colors(kind, moved);
             assert_eq!(
                 row_background(true, base, &theme),
                 theme.chrome.selection_bg,
@@ -3955,7 +3900,7 @@ mod tests {
         }
         let id = d.cursor_row_id();
         assert!(!d.confirm_or_arm_discard_hunk(id), "first press asks");
-        let armed = d.armed_hunk.expect("armed, and waiting");
+        let armed = d.armed_hunk.get().copied().expect("armed, and waiting");
         let e = extent_of(&d.renderers.borrow(), armed.0, armed.1)
             .expect("the armed row is a hunk row");
         let rows: Vec<usize> = (0..d.order.len())
@@ -3970,7 +3915,7 @@ mod tests {
             "the armed hunk's rows, and only them"
         );
         d.run_view("view.down", &host);
-        assert!(d.armed_hunk.is_none(), "a cursor move disarms");
+        assert!(!d.armed_hunk.is_armed(), "a cursor move disarms");
     }
 
     #[test]
@@ -4046,10 +3991,10 @@ mod tests {
         let mut d = Diff::with_layouts(parse_unified_diff(THREE_HUNKS), &host, Layouts::builtin());
         let id = d.cursor_row_id();
         assert!(!d.confirm_or_arm_discard_hunk(id), "first press asks");
-        assert!(d.armed_hunk.is_some(), "armed, and waiting");
+        assert!(d.armed_hunk.is_armed(), "armed, and waiting");
         d.apply_layout(1, &host);
         assert!(
-            d.armed_hunk.is_none(),
+            !d.armed_hunk.is_armed(),
             "the cycle spent nothing: it cleared"
         );
     }
@@ -6047,7 +5992,7 @@ diff --git a/two.txt b/two.txt
     fn hunk_at_row(d: &Diff, index: usize) -> Option<String> {
         let r = *d.order.get(index)?;
         let renderers = d.renderers.borrow();
-        let (path, n) = renderers.get(r.owner as usize)?.hunk_at(r.index as usize)?;
+        let (path, n) = Rows::hunk_at(&**renderers.get(r.owner as usize)?, r.index as usize)?;
         Some(format!("{path}#{}", n))
     }
 
@@ -6388,7 +6333,7 @@ diff --git a/two.txt b/two.txt
         assert!(!d.confirm_or_arm_discard_hunk(armed), "first press asks");
 
         d.apply_layout(1, &host);
-        assert!(d.armed_hunk.is_none(), "the arm died with the rows");
+        assert!(!d.armed_hunk.is_armed(), "the arm died with the rows");
         let sel = d.sel.clone().expect("the selection crossed to split");
         assert_eq!(sel.part(), 0);
         assert_eq!(d.selection(), "lp", "the same bytes of the shared line");

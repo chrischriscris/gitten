@@ -26,14 +26,11 @@ impl<T> Panes<T> {
         }
     }
 
-    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
-    /// The focused tenant's index. Part of the registry API an extension
-    /// client sees; the window itself no longer reads it.
-    #[allow(dead_code)]
+    /// The focused tenant's index.
     pub fn focused_index(&self) -> usize {
         self.focused
     }
@@ -101,38 +98,6 @@ impl<T> Panes<T> {
         self.focused = at;
         true
     }
-
-    /// Cycles focus by an offset through the registration order. The window
-    /// cycles in the *design's* order now — [`crate::DevShell::list_order`],
-    /// sidebar first — so this is the registry's own verb and no longer the
-    /// window's; kept because it *is* the registry's cycle, which an
-    /// extension host with its own pane order would reach for.
-    #[allow(dead_code)]
-    pub fn cycle(&mut self, by: isize) -> bool {
-        if self.entries.len() < 2 {
-            return false;
-        }
-        let len = self.entries.len() as isize;
-        let next = (self.focused as isize + by).rem_euclid(len) as usize;
-        self.focus(next)
-    }
-
-    /// Closes the focused secondary tenant. The first pane is the workspace's
-    /// root and, like the old screen stack's first entry, is never removed.
-    ///
-    /// The stacked window's `esc` was this method's only caller; in the
-    /// two-region window a list is never closed. Kept because it *is* the
-    /// registry's close verb — an extension pane that can be dismissed will
-    /// be dismissed through here and not through a new seam.
-    #[allow(dead_code)]
-    pub fn close_focused(&mut self) -> Option<T> {
-        if self.focused == 0 || self.entries.len() == 1 {
-            return None;
-        }
-        let removed = self.entries.remove(self.focused).value;
-        self.focused = self.focused.min(self.entries.len() - 1);
-        Some(removed)
-    }
 }
 
 #[cfg(test)]
@@ -155,15 +120,15 @@ mod tests {
     }
 
     #[test]
-    fn focus_cycles_both_ways_and_refuses_indices_that_do_not_exist() {
+    fn focus_moves_to_a_registered_index_and_refuses_indices_that_do_not_exist() {
         let mut panes = Panes::new("one", 1);
         panes.register("two", 2);
         panes.register("three", 3);
-        assert!(panes.cycle(1));
-        assert_eq!(*panes.focused(), 1, "next did not wrap");
-        assert!(panes.cycle(-1));
-        assert_eq!(*panes.focused(), 3, "previous did not wrap");
+        assert!(panes.focus(0));
+        assert_eq!(*panes.focused(), 1);
+        assert!(!panes.focus(0), "focusing the focused pane is not a move");
         assert!(!panes.focus(99));
+        assert_eq!(panes.focused_index(), 0);
     }
 
     #[test]
@@ -178,20 +143,5 @@ mod tests {
         panes.register("files", 4);
         assert_eq!(panes.position("files"), Some(1));
         assert_eq!(panes.position("branches"), None);
-    }
-
-    #[test]
-    fn only_secondary_panes_close_and_focus_stays_valid() {
-        let mut panes = Panes::new("root", 1);
-        assert_eq!(panes.close_focused(), None);
-        panes.register("middle", 2);
-        panes.register("last", 3);
-        assert_eq!(panes.close_focused(), Some(3));
-        assert_eq!(
-            (panes.len(), panes.focused_index(), *panes.focused()),
-            (2, 1, 2)
-        );
-        assert!(panes.focus(0));
-        assert_eq!(panes.close_focused(), None);
     }
 }

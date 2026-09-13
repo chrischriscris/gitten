@@ -417,6 +417,18 @@ pub trait Present {
         &[]
     }
 
+    /// Whether logical row `index` is a file header — what a jump between
+    /// files lands on, and what [`expand`] indexes for it.
+    ///
+    /// Derived from [`files`](Self::files) rather than asked separately,
+    /// because an entry's `row` is already the claim "my header sits here":
+    /// a presentation that reports files has headers to find, and one that
+    /// reports none has none. A presentation that *draws* its headers without
+    /// answering `files` overrides this to say where they are.
+    fn is_header(&self, index: usize) -> bool {
+        self.files().binary_search_by_key(&index, |e| e.row).is_ok()
+    }
+
     /// The hunk under logical row `index`, as `(file, hunk)` — the file
     /// numbered as this presentation's own [`Present::files`] order spells it.
     ///
@@ -468,8 +480,14 @@ impl<T: Present + ?Sized> Present for Box<T> {
     fn files(&self) -> &[Entry] {
         (**self).files()
     }
+    fn is_header(&self, index: usize) -> bool {
+        (**self).is_header(index)
+    }
     fn hunk_at(&self, index: usize) -> Option<(usize, usize)> {
         (**self).hunk_at(index)
+    }
+    fn line_at(&self, index: usize) -> Option<(usize, usize, usize)> {
+        (**self).line_at(index)
     }
 }
 
@@ -499,7 +517,7 @@ impl RowRef {
     }
 }
 
-/// An order table, and the two things worth computing while walking it.
+/// An order table, and the three things worth computing while walking it.
 #[derive(Debug, Default)]
 pub struct Ordered {
     pub order: Vec<RowRef>,
@@ -509,6 +527,12 @@ pub struct Ordered {
     pub widest: usize,
     /// Where the anchor's logical row landed, so a reflow keeps your place.
     pub anchor: usize,
+    /// Where each file header landed in `order`, ascending — what a jump
+    /// between files walks. Collected during the same walk that builds the
+    /// table, because finding them after is a scan of `order` per file: 5,953
+    /// files against a million rows is six billion comparisons for a
+    /// keypress, and one branch per row here is nothing.
+    pub headers: Vec<usize>,
 }
 
 impl Ordered {
@@ -538,6 +562,7 @@ impl Ordered {
 /// however many times the window is dragged.
 pub fn expand<P: Present>(logical: &[RowRef], owners: &[P], anchor: Option<RowRef>) -> Ordered {
     let mut order: Vec<RowRef> = Vec::with_capacity(logical.len());
+    let mut headers: Vec<usize> = Vec::new();
     let (mut widest, mut widest_at) = (0usize, 0usize);
     let mut found = 0usize;
     let mut i = 0;
@@ -551,6 +576,12 @@ pub fn expand<P: Present>(logical: &[RowRef], owners: &[P], anchor: Option<RowRe
         };
         if anchor.map(RowRef::logical) == Some(r.logical()) {
             found = order.len();
+        }
+        // One branch per logical row, once per rebuild: where the file
+        // headers are is what `]` and `[` jump between, and no presentation
+        // has to know a jump list exists.
+        if rows.is_header(r.index as usize) {
+            headers.push(order.len());
         }
         // Clamped at both ends: zero rows would drop a line out of the diff
         // silently, and `seg` is a `u16`.
@@ -571,6 +602,7 @@ pub fn expand<P: Present>(logical: &[RowRef], owners: &[P], anchor: Option<RowRe
         order,
         widest: widest_at,
         anchor: found,
+        headers,
     }
 }
 

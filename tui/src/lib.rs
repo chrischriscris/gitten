@@ -46,6 +46,7 @@
 //! | [`branches`] | the repository's branches: sections, marks, and the armed delete |
 //! | [`stashes`] | the stash stack, one flat address-and-message list |
 //! | [`files`] | the working tree: sections, files, and the armed discard |
+//! | [`pane`] | the `Pane` seam: what every tenant of the registry answers |
 //! | [`scrollbar`] | where you are in a list, drawn over its right-hand column |
 //! | [`help`] | what the keys do, as a function of the keymap |
 //! | [`todo`] | the rebase plan: one editable list, over `core`'s model |
@@ -58,6 +59,7 @@ pub mod files;
 pub mod help;
 pub mod markdown;
 pub mod merging;
+pub mod pane;
 pub mod patch;
 pub mod reflog;
 pub mod remotes;

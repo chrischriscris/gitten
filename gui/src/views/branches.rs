@@ -18,6 +18,7 @@ use super::{accept_deferred_scroll, vertical_scrollbar, DeferredScrollbar, Pendi
 use crate::chrome;
 use crate::graph::ROW_H;
 use gitten_core::host::Host;
+use gitten_core::list::{self, Armed};
 use gitten_core::refs::{Branch, HeadState, RemoteBranch, Upstream};
 use gitten_core::status::PathBytes;
 use gitten_core::theme::{Rgb, Surface, Theme};
@@ -416,7 +417,12 @@ pub(crate) fn prepare(
     if crate::stats::enabled() {
         eprintln!("branches: {label} · flatten {:.0?}", t.elapsed());
     }
-    Prepared { rows, label, head }
+    Prepared {
+        rows,
+        label,
+        head,
+        warning: None,
+    }
 }
 
 /// The whole branches panel flattened to rows, plus the title-strip line and
@@ -427,6 +433,11 @@ pub(crate) struct Prepared {
     pub(crate) label: String,
     /// Who HEAD is, read by the window's title strip.
     pub(crate) head: Option<HeadInfo>,
+    /// The first decorating read that failed, in the repository's own words —
+    /// the loader's [`gitten_app::acquire::LoadedBranches::warning`], carried
+    /// so the pane can hand it to the shell's notice band. `None` is a clean
+    /// load, and `prepare` fills `None`: only a refresh knows what degraded.
+    pub(crate) warning: Option<String>,
 }
 
 /// The branches pane. Holds flattened rows behind an `Rc`, so a refresh swaps
@@ -457,11 +468,16 @@ pub struct Branches {
     rendered: Rc<Cell<usize>>,
     /// The delete awaiting its second press. One slot — arming a different
     /// row moves the question, it does not queue two.
-    armed: Option<Target>,
+    armed: Armed<Target>,
     /// Who HEAD is as of the last refresh, for the window's title strip:
     /// the attached branch and its tracking distance, or the abbreviated
     /// commit while detached.
     head: Option<HeadInfo>,
+    /// What a decorating read lost on the last load, in the repository's own
+    /// words — a failed `head` read leaves the rows true and this carrying
+    /// the why. Behind a cell because the shell reads it off `&Branches`
+    /// once a refresh wave lands, where [`Branches::take_warning`] empties it.
+    warning: Cell<Option<String>>,
     /// Whether this pane holds the keyboard, as the shell last told it. A
     /// row's bar is accent only when its pane is focused, and the view cannot
     /// ask the shell during render — so the shell writes it here when focus
@@ -469,88 +485,37 @@ pub struct Branches {
     focused: bool,
 }
 
-/// Where the cursor comes to rest after a move that landed it on `at`.
-///
-/// A heading is a fact about the grouping and not a thing a verb can aim
-/// at, so the keyboard never stops on one: it steps on in the direction it
-/// was going, and only when the heading is the list's edge in that direction
-/// — `k` from the first branch onto `LOCAL` — does it settle the other way,
-/// which keeps `k` on row zero's heading from reading as "nothing happened"
-/// and `G` from resting on a `REMOTE` heading with an empty group under it.
-/// `dir` is the sign of the move; zero counts as forward.
-fn settle(rows: &[Row], at: usize, dir: isize) -> usize {
-    settle_by(
-        rows.len(),
-        |i| matches!(rows.get(i), Some(Row::Heading { .. })),
-        at,
-        dir,
-    )
+/// Which rows are furniture: a heading is a fact about the grouping and not
+/// a thing a verb can aim at or the cursor can rest on. The one judgment
+/// [`gitten_core::list`]'s helpers cannot make — which row is which is this
+/// pane's to say.
+fn is_heading(row: &Row) -> bool {
+    matches!(row, Row::Heading { .. })
 }
 
-/// [`settle`] with the heading test lifted out, so the shown-space walk
-/// below can run the same rule in the space the cursor addresses.
-fn settle_by(len: usize, heading: impl Fn(usize) -> bool, at: usize, dir: isize) -> usize {
-    if !heading(at) {
-        return at;
+/// What a query can match: a local's display name, a remote's `origin/main`.
+/// A detached HEAD is a place, not a branch name — it shows unfiltered and a
+/// branch query says nothing about it, which `None` spells here.
+fn row_text(row: &Row) -> Option<&str> {
+    match row {
+        Row::Local(l) => Some(&l.name_text),
+        Row::Remote(r) => Some(&r.label),
+        Row::Detached { .. } | Row::Heading { .. } => None,
     }
-    let forward = (at + 1..len).find(|&i| !heading(i));
-    let back = (0..at).rev().find(|&i| !heading(i));
-    match dir.is_negative() {
-        false => forward.or(back),
-        true => back.or(forward),
-    }
-    .unwrap_or(at)
+}
+
+/// Where the cursor comes to rest after a move that landed it on `at` —
+/// [`list::settle_at`] with this pane's furniture. `dir` is the sign of the
+/// move; zero counts as forward.
+fn settle(rows: &[Row], at: usize, dir: isize) -> usize {
+    list::settle_at(rows, is_heading, at, dir)
 }
 
 /// [`settle`] over the shown rows: the same walk, in the space the cursor
 /// addresses — a heading survives a filter only when its group under it
 /// does, and the keyboard never rests on one either way.
 fn settle_shown(rows: &[Row], visible: &[usize], at: usize, dir: isize) -> usize {
-    settle_by(
-        visible.len(),
-        |i| {
-            visible
-                .get(i)
-                .is_some_and(|&d| matches!(rows.get(d), Some(Row::Heading { .. })))
-        },
-        at,
-        dir,
-    )
-}
-
-/// The one matcher, where the rows live: a query matches when the row's
-/// text contains it, folded — exactly what the commit list's search does.
-fn matches(haystack: &str, needle: &str) -> bool {
-    haystack.to_lowercase().contains(&needle.to_lowercase())
-}
-
-/// The rows a query keeps, as indices into `rows`: a branch whose name
-/// matches — a local's display name, a remote's `origin/main` — plus the
-/// heading of every group that still has a row under it, exactly the rows
-/// an empty group drops at flatten. A detached HEAD is a place, not a
-/// branch name; it shows unfiltered and a branch query says nothing
-/// about it.
-fn search_rows(rows: &[Row], query: &str) -> Vec<usize> {
-    let mut out = Vec::new();
-    let mut pending_heading = None;
-    for (i, row) in rows.iter().enumerate() {
-        let kept = match row {
-            Row::Heading { section, .. } => {
-                pending_heading = Some((i, *section));
-                continue;
-            }
-            Row::Local(l) => matches(l.name_text.as_ref(), query),
-            Row::Remote(r) => matches(r.label.as_ref(), query),
-            Row::Detached { .. } => false,
-        };
-        if kept {
-            if let Some((h, _)) = pending_heading.take() {
-                out.push(h);
-            }
-            out.push(i);
-        }
-    }
-    out
+    list::settle_shown(rows, visible, is_heading, at, dir)
 }
 
 impl Branches {
@@ -575,8 +540,13 @@ impl Branches {
     }
 
     pub(crate) fn from_prepared(prepared: Prepared) -> Self {
-        let Prepared { rows, head, .. } = prepared;
-        let visible = Rc::new(Vec::from_iter(0..rows.len()));
+        let Prepared {
+            rows,
+            head,
+            warning,
+            ..
+        } = prepared;
+        let visible = Rc::new(list::identity(&rows));
         // Row zero is usually the `LOCAL` heading; the keyboard starts on
         // the first branch under it instead.
         let mut view = Viewport::new();
@@ -591,9 +561,10 @@ impl Branches {
             synced: Rc::new(Cell::new(0.0)),
             pending_scroll: PendingScroll::default(),
             rendered: Rc::new(Cell::new(0)),
-            armed: None,
+            armed: Armed::new(),
             focused: false,
             head,
+            warning: Cell::new(warning),
         }
     }
 
@@ -615,7 +586,7 @@ impl Branches {
     pub(crate) fn replace_prepared(&mut self, prepared: Prepared, host: &Host) {
         // A refresh is the repository saying things moved; an armed delete
         // was a promise about how they were, so it dies here first.
-        self.armed = None;
+        self.armed.disarm();
         self.reconcile(host);
         let old = self.view.get();
         // Only a branch anchors, and on what a verb aims at — the bytes. A
@@ -627,15 +598,21 @@ impl Branches {
             .get(old.cursor())
             .and_then(|&d| self.data.get(d))
             .and_then(row_target);
-        let Prepared { rows, head, .. } = prepared;
+        let Prepared {
+            rows,
+            head,
+            warning,
+            ..
+        } = prepared;
         self.head = head;
+        self.warning.set(warning);
         self.data = Rc::new(rows);
         // The new rows under the *current* query — a refresh must not drop
         // the filter the user is looking through, and the anchor below is
         // found in this space, not in the full list's.
         self.visible = Rc::new(match &self.filter {
-            Some(q) => search_rows(&self.data, q),
-            None => Vec::from_iter(0..self.data.len()),
+            Some(q) => list::search_rows(&self.data, q, is_heading, row_text),
+            None => list::identity(&self.data),
         });
 
         let cursor = anchored
@@ -682,13 +659,13 @@ impl Branches {
     /// the next prepaint, and writing an offset against it would clamp in
     /// the wrong place.
     pub fn apply_query(&mut self, query: &str) {
-        let next = Some(query.trim()).filter(|q| !q.is_empty());
-        if self.filter.as_deref() == next {
+        let next = list::normalize_query(query);
+        if self.filter.as_deref() == next.as_deref() {
             return;
         }
         // A changed filter can move the cursor by clamping, and a question
         // aimed at yesterday's row is the thing the arm exists to prevent.
-        self.armed = None;
+        self.armed.disarm();
         // Anchor first, named by the verb target like every other re-anchor
         // in this file, because row numbers are about to stop meaning
         // anything.
@@ -698,10 +675,10 @@ impl Branches {
             .and_then(|&d| self.data.get(d))
             .and_then(row_target);
 
-        self.filter = next.map(str::to_string);
+        self.filter = next;
         self.visible = Rc::new(match &self.filter {
-            Some(q) => search_rows(&self.data, q),
-            None => Vec::from_iter(0..self.data.len()),
+            Some(q) => list::search_rows(&self.data, q, is_heading, row_text),
+            None => list::identity(&self.data),
         });
 
         let mut view = self.view.get();
@@ -739,20 +716,14 @@ impl Branches {
     /// only the files pane's note.
     #[cfg(test)]
     pub fn filter_note(&self) -> Option<String> {
-        let refs = |rows: &[Row]| {
-            rows.iter()
-                .filter(|r| !matches!(r, Row::Heading { .. }))
-                .count()
-        };
-        self.filter.is_some().then(|| {
-            let shown = self
-                .visible
-                .iter()
-                .filter_map(|&d| self.data.get(d))
-                .filter(|r| !matches!(r, Row::Heading { .. }))
-                .count();
-            format!("{shown}/{}", refs(&self.data))
-        })
+        let shown = self
+            .visible
+            .iter()
+            .filter_map(|&d| self.data.get(d))
+            .filter(|r| !is_heading(r))
+            .count();
+        let total = self.data.iter().filter(|r| !is_heading(r)).count();
+        list::filter_note(self.filter.as_deref(), shown, total)
     }
 
     /// Who HEAD is, for anything outside this pane: the window's title strip
@@ -760,6 +731,15 @@ impl Branches {
     /// readers sit across an entity boundary; it is one small struct.
     pub fn head_info(&self) -> Option<HeadInfo> {
         self.head.clone()
+    }
+
+    /// What a decorating read lost on the last applied load, taken once — the
+    /// shell's wave-end read, which turns a failed `head` into one sentence
+    /// in the notice band instead of a line on stderr. `None` is a clean
+    /// load, and an arm skipped by a newer generation keeps whatever the
+    /// last applied load said.
+    pub fn take_warning(&self) -> Option<String> {
+        self.warning.take()
     }
 
     /// Meets the list where it actually is after a scrollbar drag. Pans:
@@ -838,7 +818,7 @@ impl Branches {
         }
         // The keyboard moved; whatever was armed was armed to what it used
         // to be on.
-        self.armed = None;
+        self.armed.disarm();
         self.view.set(v);
         self.show(v);
         true
@@ -858,7 +838,7 @@ impl Branches {
         }
         // The mouse moved — whatever was armed was armed to what the mouse
         // used to be on.
-        self.armed = None;
+        self.armed.disarm();
         self.view.set(v);
         self.show(v);
     }
@@ -903,19 +883,14 @@ impl Branches {
     }
 
     fn arm(&mut self, target: &Target) -> bool {
-        let already = self.armed.as_ref() == Some(target);
-        self.armed = match already {
-            true => None,
-            false => Some(target.clone()),
-        };
-        already
+        self.armed.confirm_or_arm(target.clone())
     }
 
     /// Whether a delete is waiting for its second press — the render's tint
     /// of the row the question is about.
     #[cfg(test)]
     pub(crate) fn armed_row(&self) -> Option<Target> {
-        self.armed.clone()
+        self.armed.get().cloned()
     }
 
     /// What `copy.selection` copies here: the row the keyboard is on, as git
@@ -974,11 +949,11 @@ impl Render for Branches {
         // The row an armed delete is waiting on, found once per frame in the
         // *shown* rows — the cursor's space — the tint a property of the
         // question, not of the draw.
-        let armed = self.armed.as_ref().and_then(|target| {
-            visible
-                .iter()
-                .position(|&d| row_target(&data[d]).as_ref() == Some(target))
-        });
+        let armed = self
+            .armed
+            .position_in(visible.iter().map(|&d| &data[d]), |row, target| {
+                row_target(row).as_ref() == Some(target)
+            });
         let focused = self.focused;
         // A click on a row is the keyboard coming back — see [`Self::select_row`].
         // Built as a plain handle, not `cx.listener`: the rows are drawn in the

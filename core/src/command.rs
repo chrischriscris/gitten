@@ -33,9 +33,10 @@
 //! anyway.
 //!
 //! **Any command's behaviour.** [`Commands`] is a registry of names, one-line
-//! descriptions and — for some — the short label a footer draws beside a key:
-//! enough for a help screen, and enough for the config layer to say "no such
-//! command" instead of binding a key to nothing.
+//! descriptions, the short label a footer draws beside a key — and whether the
+//! command writes to the repository, which is all a client that must not write
+//! needs to refuse it. Enough for a help screen, and enough for the config
+//! layer to say "no such command" instead of binding a key to nothing.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -1428,6 +1429,17 @@ pub struct Command {
     /// One or two words a status bar draws beside the key, when there is one:
     /// [`doc`](Self::doc) is a help-screen sentence and will not fit a footer.
     pub hint: Option<String>,
+    /// Whether running it mutates the repository — index, worktree, refs,
+    /// remotes, a standing operation — or only the client's own state: the
+    /// cursor, a menu, a clipboard, which repository is being looked at.
+    ///
+    /// Read by clients that must not write: the headless dispatch harness
+    /// refuses these outright, because a command spelled by an agent must not
+    /// stage, discard or push. A verb that opens a prompt whose *answer*
+    /// writes is still a write — `files.commit` is the commit, not the field.
+    /// Prompts and menus whose answers are commands of their own are not
+    /// writes themselves; the answer's flag says what it is.
+    pub mutates: bool,
 }
 
 /// Every command name that exists.
@@ -1459,842 +1471,1012 @@ impl Commands {
     pub fn builtin() -> Self {
         let mut c = Self::empty();
         // The third column is the footer hint — `Some` where a status bar
-        // should draw a word or two beside the key. Everything after it is
-        // still [`Command::doc`], the help screen's sentence.
-        for (name, doc, hint) in [
-            ("quit", "leave", Some("quit")),
-            ("help", "show the keys", Some("keys")),
+        // should draw a word or two beside the key — and the fourth is
+        // [`Command::mutates`]: whether running it writes to the repository,
+        // which a headless client refuses on. Everything between the name and
+        // the hint is still [`Command::doc`], the help screen's sentence.
+        for (name, doc, hint, mutates) in [
+            ("quit", "leave", Some("quit"), false),
+            ("help", "show the keys", Some("keys"), false),
             (
                 "commands.palette",
                 "list every command, by mouse or by key",
                 Some("commands"),
+                false,
             ),
-            ("settings", "change the settings", Some("settings")),
-            ("settings.apply", "use the next value", None),
-            ("back", "leave the innermost mode", Some("back")),
-            ("view.down", "one row down", None),
-            ("view.up", "one row up", None),
-            ("view.page-down", "a screenful down", None),
-            ("view.page-up", "a screenful up", None),
-            ("view.scroll-down", "the view down, not the cursor", None),
-            ("view.scroll-up", "the view up, not the cursor", None),
-            ("view.top", "the first row", None),
-            ("view.bottom", "the last row", None),
-            ("view.left", "scroll the text left", None),
-            ("view.right", "scroll the text right", None),
-            ("search.next", "the next match", None),
-            ("search.prev", "the previous match", None),
-            ("search.clear", "clear the standing search", None),
+            ("settings", "change the settings", Some("settings"), false),
+            ("settings.apply", "use the next value", None, false),
+            ("back", "leave the innermost mode", Some("back"), false),
+            ("view.down", "one row down", None, false),
+            ("view.up", "one row up", None, false),
+            ("view.page-down", "a screenful down", None, false),
+            ("view.page-up", "a screenful up", None, false),
+            ("view.scroll-down", "the view down, not the cursor", None, false),
+            ("view.scroll-up", "the view up, not the cursor", None, false),
+            ("view.top", "the first row", None, false),
+            ("view.bottom", "the last row", None, false),
+            ("view.left", "scroll the text left", None, false),
+            ("view.right", "scroll the text right", None, false),
+            ("search.next", "the next match", None, false),
+            ("search.prev", "the previous match", None, false),
+            ("search.clear", "clear the standing search", None, false),
             (
                 "select.mark",
                 "mark or release a range of rows for the next action",
                 Some("mark"),
+                false,
             ),
-            ("input.newline", "a line break", None),
+            ("input.newline", "a line break", None, false),
             (
                 "diff.next-file",
                 "the next file's header",
                 Some("next file"),
+                false,
             ),
             (
                 "diff.prev-file",
                 "the previous file's header",
                 Some("prev file"),
+                false,
             ),
             (
                 "diff.next-hunk",
                 "the next hunk's first row",
                 Some("next hunk"),
+                false,
             ),
             (
                 "diff.prev-hunk",
                 "the previous hunk's first row",
                 Some("prev hunk"),
+                false,
             ),
-            ("diff.cycle-layout", "the next presentation", None),
-            ("diff.cycle-wrap", "the next wrap", None),
+            ("diff.cycle-layout", "the next presentation", None, false),
+            ("diff.cycle-wrap", "the next wrap", None, false),
             (
                 "blob.flip",
                 "the other side of a picture or a document — before, or after",
                 None,
+                false,
             ),
             (
                 "diff.stage-hunk",
                 "stage the hunk under the keyboard into the index",
                 Some("stage hunk"),
+                true,
             ),
             (
                 "diff.unstage-hunk",
                 "take the hunk under the keyboard back out of the index",
                 Some("unstage hunk"),
+                true,
             ),
             (
                 "diff.discard-hunk",
                 "discard the hunk under the keyboard from the working tree, asked twice",
                 Some("discard hunk"),
+                true,
             ),
             (
                 "diff.toggle-line-selection",
                 "act on marked lines instead of the whole hunk",
                 Some("line selection"),
+                false,
             ),
-            ("patch.menu", "the patch clipboard's targets and builder", Some("patch")),
+            ("patch.menu", "the patch clipboard's targets and builder", Some("patch"), false),
             (
                 "patch.pick",
                 "pick the hunk under the keyboard onto the patch clipboard",
                 Some("pick"),
+                false,
             ),
             (
                 "patch.remove-from-commit",
                 "lift the hunk under the keyboard out of its own commit, asked twice",
                 Some("remove"),
+                true,
             ),
             (
                 "patch.discard-file",
                 "lift the whole file under the keyboard out of its own commit, asked twice",
                 Some("discard file"),
+                true,
             ),
             (
                 "patch.checkout-file",
                 "check the file under the keyboard out of its commit, asked twice",
                 Some("checkout file"),
+                true,
             ),
             (
                 "patch.amend-commit",
                 "amend this commit with the patch clipboard, asked twice",
                 Some("amend"),
+                true,
             ),
             (
                 "patch.apply-worktree",
                 "apply the patch clipboard onto the working tree",
                 Some("apply"),
+                true,
             ),
             (
                 "patch.apply-index",
                 "apply the patch clipboard onto the index",
                 Some("apply indexed"),
+                true,
             ),
             (
                 "patch.reverse-worktree",
                 "reverse the patch clipboard off the working tree, asked twice",
                 Some("reverse"),
+                true,
             ),
             (
                 "patch.reverse-index",
                 "reverse the patch clipboard off the index",
                 Some("reverse indexed"),
+                true,
             ),
-            ("patch.show", "open the patch builder", Some("builder")),
+            ("patch.show", "open the patch builder", Some("builder"), false),
             (
                 "patch.toggle-hunk",
                 "include or exclude the hunk under the keyboard",
                 Some("toggle hunk"),
+                false,
             ),
             (
                 "patch.toggle-file",
                 "include or exclude the whole file under the keyboard",
                 Some("toggle file"),
+                false,
             ),
-            ("patch.drop-file", "drop the file under the keyboard off the patch", Some("drop")),
+            ("patch.drop-file", "drop the file under the keyboard off the patch", Some("drop"), false),
             (
                 "patch.move-to-branch",
                 "carry the patch clipboard onto a named branch, uncommitted",
                 Some("move"),
+                true,
             ),
-            ("patch.clear", "empty the patch clipboard", Some("clear patch")),
+            ("patch.clear", "empty the patch clipboard", Some("clear patch"), false),
             (
                 "theme.picker",
                 "choose a theme from every registered palette",
                 Some("themes"),
+                false,
             ),
-            ("theme.cycle", "the next theme", None),
+            ("theme.cycle", "the next theme", None, false),
             (
                 "commits.open-diff",
                 "show the diff pane, loaded with this commit",
                 Some("diff"),
+                false,
             ),
-            ("commits.search", "search the commits", Some("search")),
-            ("diff.search", "search the diff", Some("search")),
+            ("commits.search", "search the commits", Some("search"), false),
+            ("diff.search", "search the diff", Some("search"), false),
             (
                 "commits.reset-soft",
                 "move this branch here, keeping every change staged",
                 Some("reset soft"),
+                true,
             ),
             (
                 "commits.reset-mixed",
                 "move this branch here, unstaging what it holds",
                 Some("reset mixed"),
+                true,
             ),
             (
                 "commits.reset-hard",
                 "move this branch here and discard the changes, asked twice",
                 Some("reset hard"),
+                true,
             ),
             (
                 "commits.revert",
                 "undo this commit with a new inverse commit",
                 Some("revert"),
+                true,
             ),
             (
                 "commits.squash-up",
                 "fold this commit into the one beneath it, keeping both messages, asked twice",
                 Some("squash up"),
+                true,
             ),
             (
                 "commits.fixup-up",
                 "fold this commit into the one beneath it, discarding this message, asked twice",
                 Some("fixup up"),
+                true,
             ),
             (
                 "commits.drop-commit",
                 "remove this commit from the branch, asked twice",
                 Some("drop"),
+                true,
             ),
             (
                 "commits.create-fixup",
                 "commit the staged changes as a fixup for this commit",
                 Some("fixup"),
+                true,
             ),
             (
                 "commits.find-fixup-base",
                 "move to the commit the staged changes build on",
                 Some("find base"),
+                false,
             ),
             (
                 "commits.apply-fixups",
                 "fold every fixup into the commit it names (`U`), asked twice",
                 Some("fold fixups"),
+                true,
             ),
             (
                 "commits.fixup-message",
                 "choose what a fixup creation writes: fixup, amend, reword",
                 Some("fixup kind"),
+                false,
             ),
             (
                 "commits.interactive-rebase",
                 "open this branch's rebase plan, from this commit up",
                 Some("rebase"),
+                false,
             ),
             (
                 "commits.edit-commit",
                 "replay up to this commit and stop, so it can be amended",
                 Some("edit"),
+                true,
             ),
             (
                 "commits.reword",
                 "give this commit a new message",
                 Some("reword"),
+                true,
             ),
             (
                 "commits.mark-base",
                 "mark this commit as the base a rebase counts from",
                 Some("base"),
+                false,
             ),
             (
                 "commits.move-up",
                 "move this commit one closer to HEAD",
                 Some("move up"),
+                true,
             ),
             (
                 "commits.move-down",
                 "move this commit one further from HEAD",
                 Some("move down"),
+                true,
             ),
-            ("todo.pick", "replay this commit unchanged", Some("pick")),
+            ("todo.pick", "replay this commit unchanged", Some("pick"), false),
             (
                 "todo.reword",
                 "replay it under a message you type now",
                 Some("reword"),
+                false,
             ),
             (
                 "todo.edit",
                 "replay it, then stop so it can be amended",
                 Some("edit"),
+                false,
             ),
             (
                 "todo.squash",
                 "fold it into the commit below, keeping both messages",
                 Some("squash"),
+                false,
             ),
             (
                 "todo.fixup",
                 "fold it into the commit below, dropping its message",
                 Some("fixup"),
+                false,
             ),
             (
                 "todo.fixup-keep",
                 "fold it into the commit below, keeping this message instead",
                 Some("fixup -C"),
+                false,
             ),
             (
                 "todo.drop",
                 "leave this commit out of the branch",
                 Some("drop"),
+                false,
             ),
-            ("todo.move-up", "move this row one closer to HEAD", None),
-            ("todo.move-down", "move this row one further from HEAD", None),
+            ("todo.move-up", "move this row one closer to HEAD", None, false),
+            ("todo.move-down", "move this row one further from HEAD", None, false),
             (
                 "todo.autosquash",
                 "land every fixup! and squash! on the commit it names",
                 Some("autosquash"),
+                false,
             ),
-            ("todo.run", "rewrite history the way this plan says", Some("run")),
+            ("todo.run", "rewrite history the way this plan says", Some("run"), true),
             (
                 "files.reset-menu",
                 "choose a strength to reset toward the upstream",
                 Some("reset"),
+                false,
             ),
             (
                 "files.reset-upstream-soft",
                 "move this branch onto its upstream, keeping every change staged",
                 Some("reset soft"),
+                true,
             ),
             (
                 "files.reset-upstream-mixed",
                 "move this branch onto its upstream, unstaging what it holds",
                 Some("reset mixed"),
+                true,
             ),
             (
                 "files.reset-upstream-hard",
                 "move this branch onto its upstream and discard the changes, asked twice",
                 Some("reset hard"),
+                true,
             ),
             (
                 "files.nuke",
                 "throw every uncommitted change away, asked twice",
                 Some("nuke"),
+                true,
             ),
             (
                 "commits.rebase-onto",
                 "move the current branch onto the selected branch, asked twice",
                 Some("rebase onto"),
+                true,
             ),
             (
                 "rebase.abort",
                 "give up the rebase in progress and put everything back where it was",
                 None,
+                true,
             ),
             (
                 "rebase.continue",
                 "carry on the rebase in progress once conflicts are resolved",
                 None,
+                true,
             ),
             (
                 "operation.abort",
                 "give up whichever operation is standing — merge, rebase, cherry-pick or revert — and put everything back where it started",
                 Some("abort"),
+                true,
             ),
             (
                 "operation.continue",
                 "carry on whichever operation is standing once its conflicts are resolved",
                 Some("continue"),
+                true,
             ),
             (
                 "operation.skip",
                 "step over the commit the rebase stopped on — its changes leave the branch",
                 Some("skip"),
+                true,
             ),
             (
                 "commits.cherry-pick",
                 "apply this commit onto the current branch as a new commit",
                 Some("cherry-pick"),
+                true,
             ),
             (
                 "commits.copy",
                 "copy this commit — or the marked range — onto the cherry-pick clipboard",
                 Some("copy"),
+                false,
             ),
             (
                 "commits.paste",
                 "cherry-pick every copied commit, in the order copied",
                 Some("paste"),
+                true,
             ),
             (
                 "commits.clear-copies",
                 "empty the cherry-pick clipboard",
                 Some("clear copies"),
+                false,
             ),
             (
                 "commits.reset-author",
                 "reset HEAD's author to the current user, asked twice",
                 Some("reset author"),
+                true,
             ),
             (
                 "commits.new-tag",
                 "name this commit with a new tag",
                 Some("tag"),
+                true,
             ),
             (
                 "commits.reset-menu",
                 "choose a strength to reset to this commit",
                 Some("reset"),
+                false,
             ),
             (
                 "commits.new-branch",
                 "grow a new branch from this commit",
                 Some("new branch"),
+                true,
             ),
             (
                 "commits.checkout",
                 "check out this commit, detaching HEAD",
                 Some("checkout"),
+                true,
             ),
             (
                 "commits.cherry-pick-abort",
                 "give up the cherry-pick in progress and put everything back where it was",
                 None,
+                true,
             ),
             (
                 "commits.cherry-pick-continue",
                 "carry on the cherry-pick in progress once conflicts are resolved",
                 None,
+                true,
             ),
-            ("files.focus", "focus the working-tree pane", None),
+            ("files.focus", "focus the working-tree pane", None, false),
             (
                 "files.stage",
                 "stage or unstage the selected file",
                 Some("stage"),
+                true,
             ),
-            ("files.commit", "commit the staged changes", Some("commit")),
+            ("files.commit", "commit the staged changes", Some("commit"), true),
             (
                 "files.amend",
                 "rewrite HEAD to hold the staged changes under a new message",
                 Some("amend"),
+                true,
             ),
             (
                 "files.discard",
                 "discard the selected file's changes, asked twice",
                 Some("discard"),
+                true,
             ),
             (
                 "files.stage-all",
                 "stage everything unstaged, or unstage everything staged",
                 Some("stage all"),
+                true,
             ),
             (
                 "files.ignore",
                 "add the selected untracked file to .gitignore",
                 Some("ignore"),
+                true,
             ),
-            ("files.search", "search the working tree", Some("search")),
+            ("files.search", "search the working tree", Some("search"), false),
             (
                 "files.open-diff",
                 "show the diff pane, loaded with this file's side",
                 Some("diff"),
+                false,
             ),
             (
                 "files.toggle-side",
                 "switch the previewed file between its staged and unstaged side",
                 Some("toggle side"),
+                false,
             ),
-            ("branches.focus", "focus the branches pane", None),
+            ("branches.focus", "focus the branches pane", None, false),
             (
                 "branches.checkout",
                 "check out the selected branch",
                 Some("checkout"),
+                true,
             ),
-            ("branches.new", "create a branch", Some("new branch")),
+            ("branches.new", "create a branch", Some("new branch"), true),
             (
                 "branches.rename",
                 "rename the selected branch",
                 Some("rename"),
+                true,
             ),
             (
                 "branches.delete",
                 "delete the selected branch, asked twice",
                 Some("delete"),
+                true,
             ),
             (
                 "branches.new-tag",
                 "name the selected branch's commit with a new tag",
                 Some("tag"),
+                true,
             ),
             (
                 "branches.merge",
                 "merge the selected branch into the branch you are on",
                 Some("merge"),
+                true,
             ),
             (
                 "branches.merge-squash",
                 "squash the selected branch into the branch you are on, staged and uncommitted",
                 Some("squash merge"),
+                true,
             ),
             (
                 "files.resolve-ours",
                 "record the selected conflict as resolved, taking this side's version",
                 Some("ours"),
+                true,
             ),
             (
                 "files.resolve-theirs",
                 "record the selected conflict as resolved, taking the other side's version",
                 Some("theirs"),
+                true,
             ),
             (
                 "files.resolve-both",
                 "record the selected conflict as resolved with both versions, this side first",
                 Some("both"),
+                true,
             ),
             (
                 "files.resolve-keep",
                 "record the selected conflict as resolved with the file as it stands",
                 Some("keep"),
+                true,
             ),
             (
                 "merge.take-side",
                 "keep whichever half of the conflict the keyboard is on",
                 Some("pick"),
+                true,
             ),
             (
                 "merge.take-ours",
                 "keep this side's half of the conflict the keyboard is on",
                 Some("ours"),
+                true,
             ),
             (
                 "merge.take-theirs",
                 "keep the other side's half of the conflict the keyboard is on",
                 Some("theirs"),
+                true,
             ),
             (
                 "merge.take-both",
                 "keep both halves of the conflict the keyboard is on, this side first",
                 Some("both"),
+                true,
             ),
             (
                 "merge.undo",
                 "put the file back the way the last answer found it — this session only",
                 Some("undo"),
+                true,
             ),
             (
                 "merge.options",
                 "whole-file answers: hand the keyboard back to the conflict row",
                 Some("whole file"),
+                false,
             ),
             (
                 "merge.next-conflict",
                 "the next conflict in the file",
                 Some("next conflict"),
+                false,
             ),
             (
                 "merge.prev-conflict",
                 "the previous conflict in the file",
                 Some("prev conflict"),
+                false,
             ),
-            ("branches.search", "search the branches", Some("search")),
+            ("branches.search", "search the branches", Some("search"), false),
             (
                 "branches.checkout-name",
                 "check out a branch by typing its name",
                 Some("checkout"),
+                true,
             ),
             (
                 "branches.checkout-previous",
                 "check out the branch HEAD was on before this one",
                 Some("previous"),
+                true,
             ),
             (
                 "branches.force-checkout",
                 "check out the selected branch, discarding local changes, asked twice",
                 Some("force checkout"),
+                true,
             ),
             (
                 "branches.fast-forward",
                 "fast-forward the selected branch onto its upstream",
                 Some("fast-forward"),
+                true,
             ),
             (
                 "branches.set-upstream",
                 "make the selected branch track the remote branch of the same name",
                 Some("track"),
+                true,
             ),
             (
                 "branches.unset-upstream",
                 "stop the selected branch tracking its upstream",
                 Some("untrack"),
+                true,
             ),
-            ("remotes.focus", "focus the remotes pane", None),
+            ("remotes.focus", "focus the remotes pane", None, false),
             (
                 "remotes.fetch",
                 "update the selected remote's tracking branches",
                 Some("fetch"),
+                true,
             ),
-            ("remotes.new", "add a remote, by name and URL", Some("add")),
+            ("remotes.new", "add a remote, by name and URL", Some("add"), true),
             (
                 "remotes.edit",
                 "point the selected remote at a new URL",
                 Some("edit"),
+                true,
             ),
             (
                 "remotes.remove",
                 "forget the selected remote, asked twice",
                 Some("remove"),
+                true,
             ),
-            ("remotes.search", "search the remotes", Some("search")),
-            ("tags.focus", "focus the tags pane", None),
+            ("remotes.search", "search the remotes", Some("search"), false),
+            ("tags.focus", "focus the tags pane", None, false),
             (
                 "tags.checkout",
                 "check out the selected tag, detaching HEAD",
                 Some("checkout"),
+                true,
             ),
             (
                 "tags.new",
                 "name a commit with a new tag — annotated when the message field comes back nonempty",
                 Some("tag"),
+                true,
             ),
             (
                 "tags.delete",
                 "forget the selected tag, asked twice — the commits survive",
                 Some("remove"),
+                true,
             ),
             (
                 "tags.push",
                 "push the selected tag to the named remote",
                 Some("push"),
+                true,
             ),
-            ("tags.search", "search the tags", Some("search")),
-            ("worktrees.focus", "focus the worktrees pane", None),
+            ("tags.search", "search the tags", Some("search"), false),
+            ("worktrees.focus", "focus the worktrees pane", None, false),
             (
                 "worktrees.new",
                 "check a starting point out into a new worktree",
                 Some("new"),
+                true,
             ),
             (
                 "worktrees.remove",
                 "forget the selected checkout, asked twice — force on the third past dirt",
                 Some("remove"),
+                true,
             ),
             (
                 "worktrees.switch",
                 "open the selected checkout as a repository",
                 Some("switch"),
+                false,
             ),
-            ("worktrees.search", "search the worktrees", Some("search")),
+            ("worktrees.search", "search the worktrees", Some("search"), false),
             (
                 "commits.new-worktree",
                 "check the selected commit out into a new worktree",
                 Some("worktree"),
+                true,
             ),
             (
                 "branches.new-worktree",
                 "check the selected branch out into a new worktree",
                 Some("worktree"),
+                true,
             ),
             (
                 "stashes.new-worktree",
                 "check the selected entry's commit out into a new worktree",
                 Some("worktree"),
+                true,
             ),
             (
                 "tags.new-worktree",
                 "check the selected tag's commit out into a new worktree",
                 Some("worktree"),
+                true,
             ),
             (
                 "commits.bisect-menu",
                 "judge the bisect, or start one at the selected commit",
                 Some("bisect"),
+                false,
             ),
             (
                 "commits.bisect-good",
                 "mark the bisect checkout good",
                 Some("good"),
+                true,
             ),
             (
                 "commits.bisect-bad",
                 "mark the bisect checkout bad",
                 Some("bad"),
+                true,
             ),
             (
                 "commits.bisect-skip",
                 "skip the bisect checkout as untestable",
                 Some("skip"),
+                true,
             ),
             (
                 "commits.bisect-reset",
                 "end the bisect, back where it started",
                 Some("reset"),
+                true,
             ),
-            ("reflog.focus", "focus the reflog pane", None),
+            ("reflog.focus", "focus the reflog pane", None, false),
             (
                 "reflog.recover",
                 "put the current branch back onto the selected entry, asked twice",
                 Some("recover"),
+                true,
             ),
-            ("reflog.search", "search the reflog", Some("search")),
+            ("reflog.search", "search the reflog", Some("search"), false),
             (
                 "history.undo",
                 "walk the last HEAD move back, keeping index and worktree",
                 Some("undo"),
+                true,
             ),
             (
                 "history.redo",
                 "walk forward again, behind our own undo only",
                 Some("redo"),
+                true,
             ),
             (
                 "branches.delete-remote",
                 "delete the remote-tracking row's branch on its remote, asked twice",
                 Some("remove"),
+                true,
             ),
             (
                 "branches.open-log",
                 "show this branch's history in the main pane",
                 Some("log"),
+                false,
             ),
-            ("stashes.focus", "focus the stash list", None),
-            ("commits.focus", "focus the commit list", None),
+            ("stashes.focus", "focus the stash list", None, false),
+            ("commits.focus", "focus the commit list", None, false),
             (
                 "files.stash",
                 "park the working tree's changes on the stash stack",
                 Some("stash"),
+                true,
             ),
             (
                 "files.stash-menu",
                 "choose which part of the working tree to park",
                 Some("stash…"),
+                false,
             ),
             (
                 "files.stash-named",
                 "park the working tree's changes under a message you type",
                 Some("stash named"),
+                true,
             ),
             (
                 "files.stash-staged",
                 "park what the index holds, leaving the unstaged work standing",
                 Some("stash staged"),
+                true,
             ),
             (
                 "files.stash-unstaged",
                 "park the unstaged work, leaving the index as it is",
                 Some("stash unstaged"),
+                true,
             ),
             (
                 "files.stash-untracked",
                 "park the working tree's changes and its new files too",
                 Some("stash untracked"),
+                true,
             ),
             (
                 "files.stash-file",
                 "park the selected file alone, leaving every other path",
                 Some("stash file"),
+                true,
             ),
             (
                 "stashes.apply",
                 "apply this stash, keeping it",
                 Some("apply"),
+                true,
             ),
             (
                 "stashes.pop",
                 "apply this stash and drop it when the apply is clean",
                 Some("pop"),
+                true,
             ),
-            ("stashes.drop", "drop this stash, asked twice", Some("drop")),
-            ("stashes.search", "search the stash stack", Some("search")),
+            ("stashes.drop", "drop this stash, asked twice", Some("drop"), true),
+            ("stashes.search", "search the stash stack", Some("search"), false),
             (
                 "stashes.open-diff",
                 "show the diff pane, loaded with this stash's changes",
                 Some("diff"),
+                false,
             ),
             (
                 "stashes.rename",
                 "give this stash a new message — it moves to the top of the stack",
                 Some("rename"),
+                true,
             ),
             (
                 "stashes.new-branch",
                 "start a branch where this stash was made and apply it there",
                 Some("branch"),
+                true,
             ),
             (
                 "repo.push",
                 "send the current branch to its remote, setting the upstream if needed",
                 Some("push"),
+                true,
             ),
             (
                 "repo.pull",
                 "fast-forward the current branch onto its upstream",
                 Some("pull"),
+                true,
             ),
             (
                 "repo.fetch",
                 "update the remote-tracking branches",
                 Some("fetch"),
+                true,
             ),
             (
                 "repo.refresh",
                 "re-run every pane's reads from the repository",
                 Some("refresh"),
+                false,
             ),
             (
                 "project.switch",
                 "switch to another recent repository",
                 None,
+                false,
             ),
-            ("project.next", "switch to the next recent repository", None),
+            ("project.next", "switch to the next recent repository", None, false),
             (
                 "project.prev",
                 "switch to the previous recent repository",
                 None,
+                false,
             ),
-            ("project.open", "open a repository by typing its path", None),
+            ("project.open", "open a repository by typing its path", None, false),
             (
                 "project.browse",
                 "choose a repository in the file manager",
                 None,
+                false,
             ),
-            ("diff.focus", "focus the diff view", None),
+            ("diff.focus", "focus the diff view", None, false),
             (
                 "workspace.changes",
                 "enter the workspace's Changes destination",
                 Some("changes"),
+                false,
             ),
             (
                 "workspace.history",
                 "enter the workspace's History destination",
                 Some("history"),
+                false,
             ),
             (
                 "workspace.preview",
                 "re-aim the workspace diff at the selected file",
                 None,
+                false,
             ),
-            ("input.accept", "accept the text", None),
-            ("input.cancel", "discard the text", None),
-            ("pane.next", "the next list in the column", None),
-            ("pane.prev", "the previous list in the column", None),
-            ("tab.next", "the next tab in this section", None),
-            ("tab.prev", "the previous tab in this section", None),
-            ("pane.left", "the previous pane, wrapping", None),
-            ("pane.right", "the next pane, wrapping", None),
-            ("select.all", "select the whole view", None),
-            ("select.none", "drop the selection", None),
+            ("input.accept", "accept the text", None, false),
+            ("input.cancel", "discard the text", None, false),
+            ("pane.next", "the next list in the column", None, false),
+            ("pane.prev", "the previous list in the column", None, false),
+            ("tab.next", "the next tab in this section", None, false),
+            ("tab.prev", "the previous tab in this section", None, false),
+            ("pane.left", "the previous pane, wrapping", None, false),
+            ("pane.right", "the next pane, wrapping", None, false),
+            ("select.all", "select the whole view", None, false),
+            ("select.none", "drop the selection", None, false),
             (
                 "copy.selection",
                 "copy the selection, or the row the cursor is on",
                 None,
+                false,
             ),
             (
                 "message.show",
                 "show the full text of the last message",
                 None,
+                false,
             ),
         ] {
-            c.add(name, doc, hint);
+            c.add(name, doc, hint, mutates);
         }
         c
     }
 
     /// Adds one, replacing any with the same name — so a built-in's description
     /// can be corrected rather than only added to.
+    ///
+    /// `mutates` defaults to false: an extension that registers a verb without
+    /// saying it writes has it treated as one that does not, and a client that
+    /// refuses writes lets it run. [`register_mutating`](Self::register_mutating)
+    /// is the door for the other kind.
     pub fn register(&mut self, name: impl Into<String>, doc: impl Into<String>) {
-        self.add(name, doc, None);
+        self.add(name, doc, None, false);
+    }
+
+    /// [`register`](Self::register) for a command that writes to the
+    /// repository — the flag [`Command::mutates`] exists to carry.
+    pub fn register_mutating(&mut self, name: impl Into<String>, doc: impl Into<String>) {
+        self.add(name, doc, None, true);
     }
 
     /// [`register`](Self::register)'s engine; only the shipped table carries a
     /// hint to pass it.
-    fn add(&mut self, name: impl Into<String>, doc: impl Into<String>, hint: Option<&str>) {
+    fn add(
+        &mut self,
+        name: impl Into<String>,
+        doc: impl Into<String>,
+        hint: Option<&str>,
+        mutates: bool,
+    ) {
         let command = Command {
             name: name.into(),
             doc: doc.into(),
             hint: hint.map(Into::into),
+            mutates,
         };
         match self.0.iter().position(|c| c.name == command.name) {
             Some(i) => self.0[i] = command,

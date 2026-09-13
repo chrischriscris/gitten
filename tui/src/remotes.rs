@@ -22,7 +22,9 @@
 use crate::screen::{Ink, Screen};
 use crate::scrollbar::{self, Bar};
 use gitten_core::host::Host;
+use gitten_core::list::{self, Armed};
 use gitten_core::refs::{RefName, Remote};
+use gitten_core::runs::Run;
 use gitten_core::search::TextIndex;
 use gitten_core::view::Viewport;
 
@@ -74,10 +76,10 @@ pub struct Remotes {
     cols: usize,
     bar: Bar,
     /// The removal awaiting its second press: the name of the remote that
-    /// asked. One slot — arming a different row moves the question, never
-    /// queues two. Killed by any cursor move, any moving scroll, any mouse
-    /// row change and any refresh.
-    armed: Option<RefName>,
+    /// asked. One slot — the shared [`Armed`] — arming a different row moves
+    /// the question, never queues two. Killed by any cursor move, any moving
+    /// scroll, any mouse row change and any refresh.
+    armed: Armed<RefName>,
     dragging: bool,
 }
 
@@ -96,7 +98,7 @@ impl Remotes {
             view,
             cols: 0,
             bar: Bar::default(),
-            armed: None,
+            armed: Armed::new(),
             dragging: false,
         };
         this.reindex();
@@ -116,13 +118,13 @@ impl Remotes {
             view: Viewport::new(),
             cols: 0,
             bar: Bar::default(),
-            armed: None,
+            armed: Armed::new(),
             dragging: false,
         }
     }
 
     fn row_at(&self, visual: usize) -> Option<&Row> {
-        self.rows.get(*self.visible.get(visual)?)
+        list::shown(&self.rows, &self.visible, visual)
     }
 
     fn reindex(&mut self) {
@@ -133,7 +135,7 @@ impl Remotes {
     fn refilter(&mut self) {
         self.visible = match &self.query {
             Some(q) => self.search.indices(q),
-            None => Vec::from_iter(0..self.rows.len()),
+            None => list::identity(&self.rows),
         };
         self.view.set_len(self.visible.len());
     }
@@ -145,9 +147,7 @@ impl Remotes {
     }
 
     pub fn filter_note(&self) -> Option<String> {
-        self.query
-            .is_some()
-            .then(|| format!("{}/{}", self.visible.len(), self.rows.len()))
+        list::filter_note(self.query.as_deref(), self.visible.len(), self.rows.len())
     }
 
     /// Sets the filter — once per keystroke, never anywhere else. The
@@ -156,14 +156,14 @@ impl Remotes {
     /// clamped when it does not. An armed removal dies with a result set
     /// that changed, like any other refresh.
     pub fn apply_query(&mut self, query: &str) {
-        let next = Some(query.trim()).filter(|q| !q.is_empty());
-        if self.query.as_deref() == next {
+        let next = list::normalize_query(query);
+        if self.query == next {
             return;
         }
         let anchored = self.row_at(self.view.cursor()).map(|r| r.name.clone());
-        self.query = next.map(str::to_string);
+        self.query = next;
         self.refilter();
-        self.armed = None;
+        self.armed.disarm();
         let cursor = anchored
             .and_then(|n| {
                 self.visible
@@ -178,9 +178,8 @@ impl Remotes {
         if self.query.is_none() || self.visible.is_empty() {
             return;
         }
-        let len = self.visible.len() as isize;
-        let at = (self.view.cursor() as isize + by).rem_euclid(len) as usize;
-        self.armed = None;
+        let at = list::wrap_index(self.view.cursor(), by, self.visible.len());
+        self.armed.disarm();
         self.view.go_to(at);
     }
 
@@ -192,7 +191,7 @@ impl Remotes {
     /// name. A refresh is also the configuration saying things moved: an
     /// armed removal dies here first.
     pub fn replace(&mut self, remotes: Vec<Remote>) {
-        self.armed = None;
+        self.armed.disarm();
         self.dragging = false;
         self.available = true;
         let (cursor, top) = (self.view.cursor(), self.view.top());
@@ -245,7 +244,7 @@ impl Remotes {
     }
 
     pub fn move_by(&mut self, by: isize) {
-        self.armed = None;
+        self.armed.disarm();
         self.view.move_by(by);
     }
 
@@ -258,7 +257,7 @@ impl Remotes {
     }
 
     pub fn page(&mut self, pages: isize) {
-        self.armed = None;
+        self.armed.disarm();
         self.view.page(pages);
     }
 
@@ -266,17 +265,17 @@ impl Remotes {
         let before = self.view.top();
         self.view.pan_by(by);
         if self.view.top() != before {
-            self.armed = None;
+            self.armed.disarm();
         }
     }
 
     pub fn to_top(&mut self) {
-        self.armed = None;
+        self.armed.disarm();
         self.view.to_top();
     }
 
     pub fn to_bottom(&mut self) {
-        self.armed = None;
+        self.armed.disarm();
         self.view.to_bottom();
     }
 
@@ -318,20 +317,14 @@ impl Remotes {
     }
 
     fn disarm_if_row_moved(&mut self, index: usize) {
-        let at = self
-            .visible
-            .get(index)
-            .and_then(|&r| self.rows.get(r))
-            .map(|r| r.name.clone());
-        if self.armed.is_some() && self.armed != at {
-            self.armed = None;
-        }
+        let at = self.row_at(index).map(|r| r.name.clone());
+        self.armed.disarm_unless(at.as_ref());
     }
 
     /// The question standing, if one is — what the tests read to prove an
     /// arm moved, died, or stayed exactly where it was asked.
     pub fn armed(&self) -> Option<RefName> {
-        self.armed.clone()
+        self.armed.get().cloned()
     }
 
     /// Arms — or confirms — a removal of this exact remote name. First call
@@ -340,12 +333,7 @@ impl Remotes {
     /// disarms unconditionally — the question was about a configuration
     /// that has since moved.
     pub fn confirm_or_arm_remove(&mut self, name: &RefName) -> bool {
-        let already = self.armed.as_ref() == Some(name);
-        self.armed = match already {
-            true => None,
-            false => Some(name.clone()),
-        };
-        already
+        self.armed.confirm_or_arm(name.clone())
     }
 
     // ------------------------------------------------------- copy and selection
@@ -408,7 +396,7 @@ impl Remotes {
                     false => theme.chrome.bg,
                 };
                 let name = Ink::new(theme.chrome.fg, bg);
-                let armed = self.armed.as_ref() == Some(&r.name);
+                let armed = self.armed.is(&r.name);
                 let urls = Ink::new(
                     match armed {
                         true => theme.chrome.error,
@@ -453,6 +441,31 @@ impl Remotes {
     }
 }
 
+/// The `view.*` vocabulary — the verbs themselves are the inherent methods
+/// above; this impl is what [`run_view_commands`] routes them by name.
+///
+/// [`run_view_commands`]: gitten_core::view::run_view_commands
+impl gitten_core::view::Scrollable for Remotes {
+    fn down(&mut self) {
+        Remotes::down(self);
+    }
+    fn up(&mut self) {
+        Remotes::up(self);
+    }
+    fn page(&mut self, pages: isize) {
+        Remotes::page(self, pages);
+    }
+    fn scroll_y(&mut self, rows: isize) {
+        Remotes::scroll_y(self, rows);
+    }
+    fn to_top(&mut self) {
+        Remotes::to_top(self);
+    }
+    fn to_bottom(&mut self) {
+        Remotes::to_bottom(self);
+    }
+}
+
 fn flatten(remotes: Vec<Remote>) -> Vec<Row> {
     remotes
         .into_iter()
@@ -461,6 +474,101 @@ fn flatten(remotes: Vec<Remote>) -> Vec<Row> {
             urls: r.urls,
         })
         .collect()
+}
+/// The [`Pane`] half of the remotes pane — the tenant contract over the inherent
+/// methods above. `view.*` and `search.*` come from the provided `run`;
+/// this pane has no verbs of its own to add.
+impl crate::pane::Pane for Remotes {
+    fn scrollable(&mut self) -> &mut dyn gitten_core::view::Scrollable {
+        self
+    }
+
+    fn mode(&self) -> &'static str {
+        "remotes"
+    }
+
+    fn set_scrolloff(&mut self, rows: usize) {
+        Remotes::set_scrolloff(self, rows);
+    }
+
+    fn resize(&mut self, cols: usize, height: usize, _host: &Host) {
+        Remotes::resize(self, cols, height);
+    }
+
+    fn paint(
+        &self,
+        screen: &mut Screen,
+        x: usize,
+        y: usize,
+        focused: bool,
+        host: &Host,
+        _out: &mut Vec<Run>,
+    ) {
+        Remotes::paint(self, screen, x, y, focused, host);
+    }
+
+    fn status(&self, _host: &Host) -> String {
+        Remotes::status(self)
+    }
+
+    fn paint_bar(
+        &self,
+        screen: &mut Screen,
+        x: usize,
+        divider: Option<usize>,
+        y: usize,
+        host: &Host,
+    ) {
+        Remotes::paint_bar(self, screen, x, divider, y, host);
+    }
+
+    fn press(&mut self, col: usize, row: usize, _clicks: u8, extend: bool, host: &Host) {
+        Remotes::press(self, col, row, extend, host);
+    }
+
+    fn drag(&mut self, _col: usize, row: isize, host: &Host) {
+        Remotes::drag(self, row, host);
+    }
+
+    fn release(&mut self) {
+        Remotes::release(self);
+    }
+
+    fn copy_text(&self) -> String {
+        Remotes::copy_text(self)
+    }
+
+    fn selection(&self) -> String {
+        Remotes::selection(self)
+    }
+
+    fn select_all(&mut self) {
+        Remotes::select_all(self);
+    }
+
+    fn select_none(&mut self) -> bool {
+        Remotes::select_none(self)
+    }
+
+    fn search_query(&self) -> Option<&str> {
+        Remotes::query(self)
+    }
+
+    fn search_note(&self) -> Option<String> {
+        Remotes::filter_note(self)
+    }
+
+    fn search_edit(&mut self, query: &str) {
+        Remotes::apply_query(self, query);
+    }
+
+    fn search_clear(&mut self) {
+        Remotes::clear_search(self);
+    }
+
+    fn search_next(&mut self, by: isize) {
+        Remotes::next_match(self, by);
+    }
 }
 
 #[cfg(test)]
@@ -574,17 +682,17 @@ mod tests {
         // refresh unconditionally disarms, and a keyboard move disarms.
         assert!(!v.confirm_or_arm_remove(&RefName::from("origin")));
         assert_eq!(
-            v.armed.as_ref().map(|n| n.as_bytes()),
+            v.armed.get().map(|n| n.as_bytes()),
             Some(b"origin".as_slice())
         );
         assert!(v.confirm_or_arm_remove(&RefName::from("origin")));
-        assert_eq!(v.armed, None);
+        assert_eq!(v.armed.get(), None);
         assert!(!v.confirm_or_arm_remove(&RefName::from("origin")));
         v.replace(vec![remote("origin", &["old.example"])]);
-        assert_eq!(v.armed, None, "a refresh disarms");
+        assert_eq!(v.armed.get(), None, "a refresh disarms");
         v.confirm_or_arm_remove(&RefName::from("origin"));
         v.down();
-        assert_eq!(v.armed, None, "a keyboard move disarms");
+        assert_eq!(v.armed.get(), None, "a keyboard move disarms");
 
         // A URL edit is not a refresh-shaped move of identity: the name
         // survives, and so does the cursor.

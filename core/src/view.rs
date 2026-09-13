@@ -421,6 +421,64 @@ impl Viewport {
     }
 }
 
+// -------------------------------------------------------------- the commands
+
+/// The `view.*` verbs, as a trait.
+///
+/// Every pane in every client answers the same vocabulary — down a row, up a
+/// row, a page, a wheel notch, the top, the bottom — and the clients were each
+/// spelling the command-name match that maps them, ten arms deep per pane.
+/// The trait is what the views *are*; [`run_view_commands`] is the mapping,
+/// held once, so a new pane is bindable in [`crate::command::GLOBAL`] the
+/// moment it implements six methods.
+///
+/// `scroll_x` has a default: most lists clip rather than pan, so `view.left`
+/// and `view.right` are consumed no-ops for them — the same answer they gave
+/// when the match was spelled out — while a diff, the one view with rows off
+/// the left edge, overrides it.
+pub trait Scrollable {
+    /// The cursor one row down — a `j`.
+    fn down(&mut self);
+    /// The cursor one row up — a `k`.
+    fn up(&mut self);
+    /// A screenful of cursor travel — `ctrl-d`/`ctrl-u`. Signed, so one
+    /// method is both.
+    fn page(&mut self, pages: isize);
+    /// A wheel notch of cursor travel, `rows` rows at a time.
+    fn scroll_y(&mut self, rows: isize);
+    /// A horizontal pan, `cols` columns at a time. Nothing by default: a
+    /// list with no rows off the left edge still consumes the key, which is
+    /// what the old per-pane match arms did with `{}`.
+    fn scroll_x(&mut self, _cols: isize) {}
+    /// The cursor on the list's first row — `gg`.
+    fn to_top(&mut self);
+    /// The cursor on its last — `G`.
+    fn to_bottom(&mut self);
+}
+
+/// Runs a `view.*` command against whatever scrolls, or says it is not one.
+///
+/// `rows` is `[view] rows` — the multiplier a wheel command applies — because
+/// the command names live in [`crate::command`] and the setting lives on
+/// `Host`, and neither is this module's to read. `true` is "handled": an
+/// unknown name answers `false` so the pane can ask about its own verbs next.
+pub fn run_view_commands(view: &mut dyn Scrollable, command: &str, rows: usize) -> bool {
+    match command {
+        "view.down" => view.down(),
+        "view.up" => view.up(),
+        "view.page-down" => view.page(1),
+        "view.page-up" => view.page(-1),
+        "view.scroll-down" => view.scroll_y(rows as isize),
+        "view.scroll-up" => view.scroll_y(-(rows as isize)),
+        "view.top" => view.to_top(),
+        "view.bottom" => view.to_bottom(),
+        "view.left" => view.scroll_x(-8),
+        "view.right" => view.scroll_x(8),
+        _ => return false,
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -22,8 +22,10 @@
 use crate::screen::{width, Ink, Pen, Screen};
 use crate::scrollbar::{self, Bar};
 use gitten_core::host::Host;
+use gitten_core::list::{self, conflict_letters, Armed, Mark};
+use gitten_core::runs::Run;
 use gitten_core::search::TextIndex;
-use gitten_core::status::{Change, ConflictKind, PathBytes, Status};
+use gitten_core::status::{PathBytes, Status};
 use gitten_core::view::Viewport;
 use std::collections::HashSet;
 
@@ -59,79 +61,21 @@ impl Section {
     }
 }
 
-/// What a status letter means, once you get past which side of the index it
-/// is about — which is what decides its colour, and nothing else. The same
-/// mapping the window's files pane makes; a theme field is a client decision
-/// and this is the terminal's copy of it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mark {
-    Add,
-    Modify,
-    Delete,
-    Rename,
-    TypeChange,
-    Untracked,
-    Conflict,
-}
-
-impl Mark {
-    /// From git's change letter set. A rename and a copy both mean "the index
-    /// matched content across two paths", and draw alike.
-    fn of(change: Change) -> Self {
-        match change {
-            Change::Added => Mark::Add,
-            Change::Modified => Mark::Modify,
-            Change::Deleted => Mark::Delete,
-            Change::Renamed | Change::Copied => Mark::Rename,
-            Change::TypeChanged => Mark::TypeChange,
-        }
-    }
-
-    /// The single letter git prints. Drawn from the theme, not spelled here.
-    fn letter(self) -> &'static str {
-        match self {
-            Mark::Add => "A",
-            Mark::Modify => "M",
-            Mark::Delete => "D",
-            Mark::Rename => "R",
-            Mark::TypeChange => "T",
-            // Known to no part of git: git itself prints `??`, and one honest
-            // glyph beats two.
-            Mark::Untracked => "?",
-            Mark::Conflict => "",
-        }
-    }
-
-    /// The ink each state draws in — the window's own mapping: adds and
-    /// deletes borrow the diff palette where those words already have
-    /// colours, modify takes the chrome accent, a rename steps onto the
-    /// graph's first lane, and the rest take the quiet furniture inks.
-    fn color(self, host: &Host) -> gitten_core::theme::Rgb {
-        let t = &host.theme;
-        match self {
-            Mark::Add => t.diff.adds_fg,
-            Mark::Delete => t.diff.dels_fg,
-            Mark::Conflict => t.chrome.error,
-            Mark::Modify => t.chrome.accent,
-            Mark::Rename => t.lanes.first().copied().unwrap_or(t.chrome.accent),
-            Mark::TypeChange => t.chrome.dim,
-            Mark::Untracked => t.chrome.faint,
-        }
-    }
-}
-
-/// The two-letter state of a conflicted path, exactly as porcelain v2 spells
-/// it — who added and who deleted decides what resolving means, so the
-/// letters are data and not decoration.
-fn conflict_letters(state: ConflictKind) -> &'static str {
-    match state {
-        ConflictKind::BothDeleted => "DD",
-        ConflictKind::AddedByUs => "AU",
-        ConflictKind::DeletedByThem => "UD",
-        ConflictKind::AddedByThem => "UA",
-        ConflictKind::DeletedByUs => "DU",
-        ConflictKind::BothAdded => "AA",
-        ConflictKind::BothModified => "UU",
+/// The ink each [`Mark`] draws in — the terminal's own mapping: adds and
+/// deletes borrow the diff palette where those words already have colours,
+/// modify takes the chrome accent, a rename steps onto the graph's first
+/// lane, and the rest take the quiet furniture inks. A theme field is a
+/// client decision, which is exactly why [`list::Mark`] stops at the letter.
+fn mark_color(mark: Mark, host: &Host) -> gitten_core::theme::Rgb {
+    let t = &host.theme;
+    match mark {
+        Mark::Add => t.diff.adds_fg,
+        Mark::Delete => t.diff.dels_fg,
+        Mark::Conflict => t.chrome.error,
+        Mark::Modify => t.chrome.accent,
+        Mark::Rename => t.lanes.first().copied().unwrap_or(t.chrome.accent),
+        Mark::TypeChange => t.chrome.dim,
+        Mark::Untracked => t.chrome.faint,
     }
 }
 
@@ -149,6 +93,14 @@ pub enum Entry {
         count: String,
     },
     File(FileRow),
+}
+
+impl Entry {
+    /// Headings exist for the eye, not the keyboard — the selectability half
+    /// of [`list::selectable_shown`].
+    fn is_heading(&self) -> bool {
+        matches!(self, Entry::Heading { .. })
+    }
 }
 
 /// One file of the working tree.
@@ -265,7 +217,7 @@ pub fn prepare(status: &Status, describe: &str) -> Prepared {
         .count();
     Prepared {
         rows,
-        label: format!("{describe} · {changed} changed"),
+        label: list::label(describe, [format!("{changed} changed")]),
     }
 }
 
@@ -294,7 +246,7 @@ fn file_row(
 /// still refreshes — the next successful read replaces both the rows and
 /// this sentence.
 pub fn unavailable_label(describe: &str) -> String {
-    format!("{describe} · status unavailable")
+    list::label(describe, ["status unavailable"])
 }
 
 /// The working-tree pane: flattened rows, a viewport, and the discard that
@@ -337,8 +289,8 @@ pub struct Files {
     /// Outliving a switch to another pane and back is deliberate: the
     /// question still sits on the row it was asked about, and only a cursor
     /// move, a wheel or a refresh can make its answer stale — none of which
-    /// is a focus change.
-    armed: Option<(Section, PathBytes)>,
+    /// is a focus change. The slot itself is the shared [`Armed`].
+    armed: Armed<(Section, PathBytes)>,
     /// How many of the rows are files — the status line's denominator, kept
     /// by the same pass that numbers the rows.
     total: usize,
@@ -377,7 +329,7 @@ impl Files {
             cols: 0,
             bar: Bar::default(),
             available: true,
-            armed: None,
+            armed: Armed::new(),
             total,
             opened: false,
         };
@@ -398,7 +350,7 @@ impl Files {
             cols: 0,
             bar: Bar::default(),
             available: false,
-            armed: None,
+            armed: Armed::new(),
             total: 0,
             opened: false,
         }
@@ -463,9 +415,7 @@ impl Files {
     /// heading.
     fn settle(&mut self, from: usize) {
         self.view.settle(from, |i| {
-            self.visible
-                .get(i)
-                .is_some_and(|&r| matches!(self.rows.get(r), Some(Entry::File(_))))
+            list::selectable_shown(&self.rows, &self.visible, Entry::is_heading, i)
         });
     }
 
@@ -473,7 +423,7 @@ impl Files {
     /// a row of the *filtered* list, and only the final lookup names a row of
     /// the source.
     fn row_at(&self, visual: usize) -> Option<&Entry> {
-        self.rows.get(*self.visible.get(visual)?)
+        list::shown(&self.rows, &self.visible, visual)
     }
 
     /// Rebuilds the folded search texts against the rows as they stand.
@@ -492,7 +442,7 @@ impl Files {
     fn refilter(&mut self) {
         self.visible = match &self.query {
             Some(q) => self.search.indices(q),
-            None => Vec::from_iter(0..self.rows.len()),
+            None => list::identity(&self.rows),
         };
         self.view.set_len(self.visible.len());
     }
@@ -507,9 +457,7 @@ impl Files {
     /// The filter while one stands, for a status line: `15/30` — hits over
     /// changed files. `None` unfiltered.
     pub fn filter_note(&self) -> Option<String> {
-        self.query
-            .is_some()
-            .then(|| format!("{}/{}", self.visible.len(), self.total))
+        list::filter_note(self.query.as_deref(), self.visible.len(), self.total)
     }
 
     /// Sets the filter — once per keystroke, and never anywhere else. The
@@ -522,17 +470,17 @@ impl Files {
     /// An armed discard dies with a result set that changed, like any other
     /// refresh: the question was about a row of yesterday's list.
     pub fn apply_query(&mut self, query: &str) {
-        let next = Some(query.trim()).filter(|q| !q.is_empty());
-        if self.query.as_deref() == next {
+        let next = list::normalize_query(query);
+        if self.query == next {
             return;
         }
         let anchored = self.row_at(self.view.cursor()).and_then(|e| match e {
             Entry::File(f) => Some((f.section, f.path.clone())),
             Entry::Heading { .. } => None,
         });
-        self.query = next.map(str::to_string);
+        self.query = next;
         self.refilter();
-        self.armed = None;
+        self.armed.disarm();
         let cursor = anchored
             .and_then(|(section, path)| {
                 self.visible.iter().position(|&r| {
@@ -553,9 +501,8 @@ impl Files {
         if self.query.is_none() || self.visible.is_empty() {
             return;
         }
-        let len = self.visible.len() as isize;
-        let at = (self.view.cursor() as isize + by).rem_euclid(len) as usize;
-        self.armed = None;
+        let at = list::wrap_index(self.view.cursor(), by, self.visible.len());
+        self.armed.disarm();
         self.view.go_to(at);
     }
 
@@ -577,7 +524,7 @@ impl Files {
     /// A refresh is the repository saying things moved; an armed discard was
     /// a promise about how they were, so it dies here first.
     pub fn replace(&mut self, rows: Vec<Entry>) {
-        self.armed = None;
+        self.armed.disarm();
         let old = self.view;
         let anchored = match self.rows.get(old.cursor()) {
             Some(Entry::File(f)) => Some((f.section, f.path.clone())),
@@ -669,31 +616,20 @@ impl Files {
     /// new target and returns false again, so there is no state here a
     /// caller has to remember.
     pub fn confirm_or_arm_discard(&mut self, section: Section, path: &PathBytes) -> bool {
-        let already = matches!(
-            &self.armed,
-            Some((armed_section, armed_path))
-                if *armed_section == section && armed_path == path
-        );
-        self.armed = match already {
-            true => None,
-            false => Some((section, path.clone())),
-        };
-        already
+        self.armed.confirm_or_arm((section, path.clone()))
     }
 
     /// Whether a discard is waiting for its second press — the paint's tint
     /// of the row the question is about, and the tests' window on it.
     pub fn armed_row(&self) -> Option<(Section, PathBytes)> {
-        self.armed.clone()
+        self.armed.get().cloned()
     }
 
     /// The row an armed discard sits on, found per frame — the tint is a
     /// property of the question, not of the draw.
     fn armed_index(&self) -> Option<usize> {
-        self.armed.as_ref().and_then(|(section, path)| {
-            self.rows.iter().position(
-                |e| matches!(e, Entry::File(f) if f.section == *section && f.path == *path),
-            )
+        self.armed.position_in(self.rows.iter(), |e, (section, path)| {
+            matches!(e, Entry::File(f) if f.section == *section && f.path == *path)
         })
     }
 
@@ -706,7 +642,7 @@ impl Files {
         let from = self.view.cursor();
         self.view.move_by(by);
         self.settle(from);
-        self.armed = None;
+        self.armed.disarm();
     }
 
     pub fn down(&mut self) {
@@ -721,26 +657,26 @@ impl Files {
         let from = self.view.cursor();
         self.view.page(pages);
         self.settle(from);
-        self.armed = None;
+        self.armed.disarm();
     }
 
     /// Scrolls the viewport without moving the cursor — the wheel.
     /// Also a move of attention, and it disarms like one.
     pub fn scroll_y(&mut self, by: isize) {
         self.view.pan_by(by);
-        self.armed = None;
+        self.armed.disarm();
     }
 
     pub fn to_top(&mut self) {
         self.view.to_top();
         self.settle(0);
-        self.armed = None;
+        self.armed.disarm();
     }
 
     pub fn to_bottom(&mut self) {
         self.view.to_bottom();
         self.settle(self.visible.len().saturating_sub(1));
-        self.armed = None;
+        self.armed.disarm();
     }
 
     /// A press in the list: the cursor moves there.
@@ -757,8 +693,8 @@ impl Files {
         let from = self.view.cursor();
         self.view.go_to(index);
         self.settle(from);
-        if self.armed.is_some() && Some(self.view.cursor()) != armed_on {
-            self.armed = None;
+        if self.armed.is_armed() && Some(self.view.cursor()) != armed_on {
+            self.armed.disarm();
         }
     }
 
@@ -906,7 +842,7 @@ impl Files {
             Entry::File(f) => {
                 let letters = match armed {
                     true => Ink::new(c.error, bg),
-                    false => Ink::new(f.mark.color(host), bg),
+                    false => Ink::new(mark_color(f.mark, host), bg),
                 };
                 let text = match armed {
                     true => Ink::new(c.error, bg),
@@ -940,11 +876,125 @@ impl Files {
     }
 }
 
+/// The `view.*` vocabulary — the verbs are the inherent methods above; this
+/// impl is what [`run_view_commands`] routes them by name.
+///
+/// [`run_view_commands`]: gitten_core::view::run_view_commands
+impl gitten_core::view::Scrollable for Files {
+    fn down(&mut self) {
+        Files::down(self);
+    }
+    fn up(&mut self) {
+        Files::up(self);
+    }
+    fn page(&mut self, pages: isize) {
+        Files::page(self, pages);
+    }
+    fn scroll_y(&mut self, rows: isize) {
+        Files::scroll_y(self, rows);
+    }
+    fn to_top(&mut self) {
+        Files::to_top(self);
+    }
+    fn to_bottom(&mut self) {
+        Files::to_bottom(self);
+    }
+}
+
+/// The [`Pane`] half of the files pane — the tenant contract over the inherent
+/// methods above. `view.*` and `search.*` come from the provided `run`;
+/// this pane has no verbs of its own to add.
+impl crate::pane::Pane for Files {
+    fn scrollable(&mut self) -> &mut dyn gitten_core::view::Scrollable {
+        self
+    }
+
+    fn mode(&self) -> &'static str {
+        "files"
+    }
+
+    fn set_scrolloff(&mut self, rows: usize) {
+        Files::set_scrolloff(self, rows);
+    }
+
+    fn resize(&mut self, cols: usize, height: usize, _host: &Host) {
+        Files::resize(self, cols, height);
+    }
+
+    fn paint(
+        &self,
+        screen: &mut Screen,
+        x: usize,
+        y: usize,
+        focused: bool,
+        host: &Host,
+        _out: &mut Vec<Run>,
+    ) {
+        Files::paint(self, screen, x, y, focused, host);
+    }
+
+    fn status(&self, _host: &Host) -> String {
+        Files::status(self)
+    }
+
+    fn paint_bar(
+        &self,
+        screen: &mut Screen,
+        x: usize,
+        divider: Option<usize>,
+        y: usize,
+        host: &Host,
+    ) {
+        Files::paint_bar(self, screen, x, divider, y, host);
+    }
+
+    fn press(&mut self, col: usize, row: usize, clicks: u8, extend: bool, host: &Host) {
+        Files::press(self, col, row, clicks, extend, host);
+    }
+
+    fn copy_text(&self) -> String {
+        Files::copy_text(self)
+    }
+
+    fn selection(&self) -> String {
+        Files::selection(self)
+    }
+
+    fn select_all(&mut self) {
+        Files::select_all(self);
+    }
+
+    fn select_none(&mut self) -> bool {
+        Files::select_none(self)
+    }
+
+    fn search_query(&self) -> Option<&str> {
+        Files::query(self)
+    }
+
+    fn search_note(&self) -> Option<String> {
+        Files::filter_note(self)
+    }
+
+    fn search_edit(&mut self, query: &str) {
+        Files::apply_query(self, query);
+    }
+
+    fn search_clear(&mut self) {
+        Files::clear_search(self);
+    }
+
+    fn search_next(&mut self, by: isize) {
+        Files::next_match(self, by);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use gitten_core::status::{
-        ConflictEntry, Kind, StagedEntry, Submodule, UnstagedEntry, UntrackedEntry,
+        Change, ConflictEntry, ConflictKind, Kind, StagedEntry, Submodule, UnstagedEntry,
+        UntrackedEntry,
     };
 
     fn staged(path: &str, change: Change) -> StagedEntry {

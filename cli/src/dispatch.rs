@@ -3,9 +3,11 @@
 //! The same `core::command` resolution every client runs — a command name from
 //! the registry, or a key spelling resolved through the keymap — applied to a
 //! [`Viewport`](gitten_core::view::Viewport) over already-loaded data. No window,
-//! no terminal, no writes: anything that would mutate the repository is refused
-//! (see [`WRITE_PREFIXES`]), because a harness an agent drives must not stage,
-//! discard or push by spelling a command name.
+//! no terminal, no writes: anything [`Command::mutates`] flags as mutating
+//! the repository is refused, because a harness an agent drives must not
+//! stage, discard or push by spelling a command name.
+//!
+//! [`Command::mutates`]: gitten_core::command::Command::mutates
 //!
 //! `selection` is what the cursor sits on: `short subject` for a commit, the row
 //! text for a diff row. `status` is one of:
@@ -22,7 +24,7 @@
 //! - `pending` — the start of a longer chord; single-key maps never produce it,
 //!   a custom `gitten.toml` with multi-key chords can.
 
-use gitten_core::command::{Key, Keymap, Modes, Resolve};
+use gitten_core::command::{Commands, Key, Keymap, Modes, Resolve};
 use gitten_core::host::Host;
 use gitten_core::rows::{Flat, Row};
 use gitten_core::view::Viewport;
@@ -42,30 +44,6 @@ const REFLOW_COLS: usize = 80;
 /// steps through here rather than a registry no headless client owns.
 const LAYOUTS: [&str; 2] = ["unified", "split"];
 
-/// Command prefixes that only ever mutate repository state. A harness refuses
-/// the whole prefix rather than enumerating verbs, so a verb added next month is
-/// refused by default rather than staged by accident.
-const WRITE_PREFIXES: [&str; 4] = ["files.", "branches.", "stashes.", "rebase."];
-
-/// Write verbs outside the refused prefixes, spelled out.
-const WRITE_COMMANDS: [&str; 15] = [
-    "diff.stage-hunk",
-    "diff.unstage-hunk",
-    "diff.discard-hunk",
-    "commits.reset-soft",
-    "commits.reset-mixed",
-    "commits.reset-hard",
-    "commits.revert",
-    "commits.squash-up",
-    "commits.fixup-up",
-    "commits.drop-commit",
-    "commits.rebase-onto",
-    "commits.cherry-pick",
-    "commits.cherry-pick-abort",
-    "commits.cherry-pick-continue",
-    "repo.push",
-];
-
 /// `diff.*` commands, for the wrong-view check.
 fn is_diff_command(cmd: &str) -> bool {
     cmd == "diff.focus" || cmd.starts_with("diff.")
@@ -74,12 +52,6 @@ fn is_diff_command(cmd: &str) -> bool {
 /// `commits.*` commands, for the wrong-view check.
 fn is_commits_command(cmd: &str) -> bool {
     cmd == "commits.focus" || cmd.starts_with("commits.")
-}
-
-fn is_write(cmd: &str) -> bool {
-    WRITE_COMMANDS.contains(&cmd)
-        || WRITE_PREFIXES.iter().any(|p| cmd.starts_with(p))
-        || matches!(cmd, "repo.pull" | "repo.fetch")
 }
 
 /// Which view the harness walks.
@@ -282,7 +254,7 @@ impl Harness {
             Kind::Diff { .. } => DispView::Diff.modes(),
             Kind::Commits { .. } => DispView::Commits.modes(),
         };
-        let resolved = resolve(&self.host.keys, &modes, input);
+        let resolved = resolve(&self.host.keys, &self.host.commands, &modes, input);
         let (command, status) = match resolved {
             Resolved::Run(name) => {
                 let status = self.apply(&name);
@@ -305,7 +277,7 @@ impl Harness {
     /// Runs a resolved command name against the viewport and the host copy.
     fn apply(&mut self, command: &str) -> String {
         let diff = self.is_diff();
-        if is_write(command) {
+        if self.host.commands.get(command).is_some_and(|c| c.mutates) {
             return "refused: write verbs never run in the harness".to_string();
         }
         if diff && is_commits_command(command) {
@@ -426,8 +398,8 @@ enum Resolved {
 
 /// A command name straight from the registry, or a key spelling through the
 /// keymap — the same two spellings every client accepts.
-fn resolve(keys: &Keymap, modes: &Modes, input: &str) -> Resolved {
-    if gitten_core::command::Commands::builtin().known(input) || keys_known(keys, input) {
+fn resolve(keys: &Keymap, commands: &Commands, modes: &Modes, input: &str) -> Resolved {
+    if commands.known(input) || keys_known(keys, input) {
         return Resolved::Run(input.to_string());
     }
     let Some(key) = Key::parse(input) else {
@@ -567,10 +539,19 @@ index 1111111..2222222 100644
         assert_eq!(j.cursor, 1);
         assert_eq!(j.status, "ok");
         assert_eq!(j.selection, "bbb second");
-        let file = h.step(2, "diff.next-file");
+        // The registry's `mutates` flag is the refusal: a write verb the old
+        // hardcoded list missed still refuses, and a command nothing wrote
+        // down never reaches the match.
+        let write = h.step(2, "commits.checkout");
+        assert_eq!(
+            write.status,
+            "refused: write verbs never run in the harness"
+        );
+        assert_eq!(write.cursor, 1, "a refused step moves nothing");
+        let file = h.step(3, "diff.next-file");
         assert_eq!(file.status, "wrong-view: a diff command on commits");
-        assert_eq!(file.cursor, 1, "a refused step moves nothing");
-        let unknown = h.step(3, "not-a-command-or-key-spelling!!");
+        assert_eq!(file.cursor, 1);
+        let unknown = h.step(4, "not-a-command-or-key-spelling!!");
         assert_eq!(unknown.status, "unknown-command");
         assert!(unknown.command.is_empty());
     }

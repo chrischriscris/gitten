@@ -15,7 +15,7 @@ mod stats;
 mod theme_picker;
 mod views;
 
-use gitten_app::acquire::{Data, Loaded};
+use gitten_app::acquire::Data;
 use gitten_app::cli::{Request, Source, View};
 use gitten_app::jobs::{Event as JobEvent, Generation, Job, Runner, Submitter};
 use gitten_app::{Configured, Started, Startup};
@@ -413,6 +413,46 @@ impl Refresh {
     }
 }
 
+/// The refresh every repository-backed built-in speaks: the same two erased
+/// halves [`Pane::refresh`] hands an extension — blocking load on the
+/// background executor, GPUI apply on the main thread. What differs per
+/// screen is the loader and the pane type, so both are parameters here; the
+/// generation guard, the label write and the `Prepared` swap are the parts
+/// no screen spells twice.
+///
+/// `load` returns the next label beside the pane's prepared data, because
+/// the strip's line is part of the same read's answer. `replace` decides
+/// the pane's own notify — the diff's `replace_prepared` already knows when
+/// a swap is worth a redraw.
+fn pane_refresh<V: 'static, P: Send + 'static>(
+    target: Generation,
+    view: &Entity<V>,
+    generation: &Rc<Cell<Generation>>,
+    label: &Rc<RefCell<String>>,
+    load: impl FnOnce() -> Result<(String, P), String> + Send + 'static,
+    replace: impl FnOnce(&mut V, P, &Host, &mut Context<V>) + 'static,
+) -> Option<Refresh> {
+    if generation.get() >= target {
+        return None;
+    }
+    let view = view.clone();
+    let generation = generation.clone();
+    let label = label.clone();
+    Some(Refresh::new(
+        target,
+        load,
+        move |(next_label, prepared), host, cx| {
+            if generation.get() >= target {
+                return Ok(());
+            }
+            view.update(cx, |v, cx| replace(v, prepared, host, cx));
+            label.replace(next_label);
+            generation.set(target);
+            Ok(())
+        },
+    ))
+}
+
 /// One pane tenant, independent of how the shell lays panes out.
 ///
 /// Built-ins and compiled-in extensions enter through the same object-safe
@@ -687,6 +727,11 @@ impl Screen {
         }
     }
 
+    /// The screen's half of a refresh wave, when it is owed one. Every
+    /// repository-backed built-in goes through [`pane_refresh`], the same
+    /// erased load/apply an extension's [`Pane::refresh`] speaks: what the
+    /// match adds per variant is which loader runs and which `Prepared` the
+    /// apply hands the pane.
     fn refresh(
         &self,
         target: Generation,
@@ -701,16 +746,16 @@ impl Screen {
                 generation,
                 label,
             } => {
-                if generation.get() >= target || matches!(source, Source::Fixtures) {
+                if matches!(source, Source::Fixtures) {
                     return None;
                 }
                 let source = source.clone();
                 let load_host = host.clone();
-                let view = view.clone();
-                let generation = generation.clone();
-                let label = label.clone();
-                Some(Refresh::new(
+                pane_refresh(
                     target,
+                    view,
+                    generation,
+                    label,
                     move || {
                         let loaded = gitten_app::acquire::reacquire(
                             View::Commits,
@@ -724,19 +769,11 @@ impl Screen {
                         };
                         Ok((loaded.label, views::commits::prepare(commits, &load_host)))
                     },
-                    move |(next_label, prepared): (String, views::commits::Prepared), host, cx| {
-                        if generation.get() >= target {
-                            return Ok(());
-                        }
-                        view.update(cx, |view, cx| {
-                            view.replace_prepared(prepared, host);
-                            cx.notify();
-                        });
-                        label.replace(next_label);
-                        generation.set(target);
-                        Ok(())
+                    |v, prepared, host, cx| {
+                        v.replace_prepared(prepared, host);
+                        cx.notify();
                     },
-                ))
+                )
             }
             Screen::Diff {
                 view,
@@ -750,218 +787,129 @@ impl Screen {
                 // all. Anything else re-acquires its own revspec, exactly as
                 // the stacked pane did.
                 let source = source.borrow().clone()?;
-                if generation.get() >= target || matches!(source, Source::Fixtures) {
+                if matches!(source, Source::Fixtures) {
                     return None;
                 }
                 let load_host = host.clone();
-                let overrides = overrides.clone();
-                let view = view.clone();
-                let generation = generation.clone();
-                let label = label.clone();
-                Some(Refresh::new(
+                let over = overrides.clone();
+                pane_refresh(
                     target,
+                    view,
+                    generation,
+                    label,
                     move || {
                         let loaded = gitten_app::acquire::reacquire(
                             View::Diff,
                             &source,
                             &load_host,
                             Some(repo.as_ref()),
-                            &overrides,
+                            &over,
                         )?;
-                        let Data::Diff(files) = &loaded.data else {
-                            return Err("re-acquisition returned the wrong view".into());
-                        };
-                        let prepared = views::diff::prepare_files(files, &load_host);
-                        Ok((loaded, prepared))
-                    },
-                    move |(loaded, prepared): (Loaded, gitten_core::prepared::Prepared),
-                          host,
-                          cx| {
-                        if generation.get() >= target {
-                            return Ok(());
-                        }
                         let Data::Diff(files) = loaded.data else {
                             return Err("re-acquisition returned the wrong view".into());
                         };
-                        view.update(cx, |view, cx| {
-                            view.replace_prepared(files, prepared, host, cx)
-                        });
-                        label.replace(loaded.label);
-                        generation.set(target);
-                        Ok(())
+                        let prepared = views::diff::prepare_files(&files, &load_host);
+                        Ok((loaded.label, (files, prepared)))
                     },
-                ))
+                    |v, (files, prepared), host, cx| v.replace_prepared(files, prepared, host, cx),
+                )
             }
             Screen::Files {
                 view,
                 generation,
                 label,
             } => {
-                if generation.get() >= target {
-                    return None;
-                }
-                let view = view.clone();
-                let generation = generation.clone();
-                let label = label.clone();
                 // The hunk counts' inputs, cloned on the main thread: the
                 // blocking half diffs staged sides through the host's own
                 // registry (a clone shares its answer cache), so a refresh
                 // after an unrelated write re-diffs nothing it already knew.
                 let differs = host.differ.clone();
                 let over = overrides.clone();
-                Some(Refresh::new(
+                pane_refresh(
                     target,
+                    view,
+                    generation,
+                    label,
                     move || {
-                        // The whole of the blocking half: one `git status`,
-                        // then one side read per staged path for the `n/m`
-                        // fractions and the staged summary. The describe rides
-                        // along beside it so the label keeps naming the
-                        // repository, the way acquisition overlaps its own
-                        // pieces.
-                        let described = std::thread::scope(|s| {
-                            let title = s.spawn(|| repo.describe());
-                            let status = repo.status()?;
-                            let counts = gitten_app::acquire::side_hunk_counts(
-                                repo.as_ref(),
-                                &differs,
-                                &over,
-                                &status,
-                            );
-                            Ok::<_, String>(views::files::prepare(
-                                status,
-                                &title.join().unwrap_or_default(),
-                                counts,
-                            ))
-                        })?;
-                        Ok(described)
+                        // One `git status` beside the describe, the loader's
+                        // own overlap; the staged paths' `n/m` counts stay
+                        // the pane's add, which `acquire::files` deliberately
+                        // does not pay.
+                        let loaded = gitten_app::acquire::files(repo.as_ref())?;
+                        let counts = gitten_app::acquire::side_hunk_counts(
+                            repo.as_ref(),
+                            &differs,
+                            &over,
+                            &loaded.status,
+                        );
+                        let prepared = views::files::prepare(loaded.status, &loaded.label, counts);
+                        Ok((prepared.label.clone(), prepared))
                     },
-                    move |prepared: views::files::Prepared, host, cx| {
-                        if generation.get() >= target {
-                            return Ok(());
-                        }
-                        let label_text = prepared.label.clone();
-                        view.update(cx, |v, cx| {
-                            v.replace_prepared(prepared, host);
-                            cx.notify();
-                        });
-                        label.replace(label_text);
-                        generation.set(target);
-                        Ok(())
+                    |v, prepared, host, cx| {
+                        v.replace_prepared(prepared, host);
+                        cx.notify();
                     },
-                ))
+                )
             }
             Screen::Stashes {
                 view,
                 generation,
                 label,
             } => {
-                if generation.get() >= target {
-                    return None;
-                }
-                let view = view.clone();
-                let generation = generation.clone();
-                let label = label.clone();
-                Some(Refresh::new(
+                pane_refresh(
                     target,
+                    view,
+                    generation,
+                    label,
                     move || {
-                        // The whole of the blocking half: one `git stash list`
-                        // beside the describe the label keeps naming.
-                        let described = std::thread::scope(|s| {
-                            let title = s.spawn(|| repo.describe());
-                            let stashes = repo.stashes()?;
-                            Ok::<_, String>(views::stashes::prepare(
-                                &stashes,
-                                &title.join().unwrap_or_default(),
-                            ))
-                        })?;
-                        Ok(described)
+                        // One `git stash list` beside the describe the label
+                        // keeps naming — the loader's own overlap.
+                        let loaded = gitten_app::acquire::stashes(repo.as_ref())?;
+                        let prepared = views::stashes::prepare(&loaded.stashes, &loaded.label);
+                        Ok((prepared.label.clone(), prepared))
                     },
-                    move |prepared: views::stashes::Prepared, host, cx| {
-                        if generation.get() >= target {
-                            return Ok(());
-                        }
-                        let label_text = prepared.label.clone();
-                        view.update(cx, |v, cx| {
-                            v.replace_prepared(prepared, host);
-                            cx.notify();
-                        });
-                        label.replace(label_text);
-                        generation.set(target);
-                        Ok(())
+                    |v, prepared, host, cx| {
+                        v.replace_prepared(prepared, host);
+                        cx.notify();
                     },
-                ))
+                )
             }
             Screen::Branches {
                 view,
                 generation,
                 label,
             } => {
-                if generation.get() >= target {
-                    return None;
-                }
-                let view = view.clone();
-                let generation = generation.clone();
-                let label = label.clone();
+                // The theme rides along because the dots are coloured at
+                // flatten, once, and not per frame.
                 let theme = host.theme.clone();
-                Some(Refresh::new(
+                pane_refresh(
                     target,
+                    view,
+                    generation,
+                    label,
                     move || {
-                        // The whole of the blocking half: the two ref
-                        // listings, HEAD's state and the worktree checkouts,
-                        // run beside each other — five independent processes,
-                        // one spawn floor. The theme rides along because the
-                        // dots are coloured at flatten, once, and not per
-                        // frame.
-                        let prepared = std::thread::scope(|s| {
-                            let title = s.spawn(|| repo.describe());
-                            let local = s.spawn(|| repo.branches());
-                            let remote = s.spawn(|| repo.remote_branches());
-                            let head = s.spawn(|| repo.head());
-                            let taken = s.spawn(|| repo.worktree_branches());
-                            let described = title.join().unwrap_or_default();
-                            let local = local
-                                .join()
-                                .unwrap_or_else(|p| std::panic::resume_unwind(p))?;
-                            let remote = remote
-                                .join()
-                                .unwrap_or_else(|p| std::panic::resume_unwind(p))?;
-                            // A failed HEAD read must not take the listing
-                            // down: the rows are still true, only the top
-                            // row's honesty is lost, and that loss is said.
-                            let head = match head
-                                .join()
-                                .unwrap_or_else(|p| std::panic::resume_unwind(p))
-                            {
-                                Ok(head) => Some(head),
-                                Err(e) => {
-                                    eprintln!("gitten: head read failed, showing attached: {e}");
-                                    None
-                                }
-                            };
-                            // A failed worktree read is a garnish lost, not a
-                            // listing lost: the rows are still true, one word
-                            // of honesty is simply not said.
-                            let taken = taken.join().unwrap_or_default();
-                            Ok::<_, String>(views::branches::prepare(
-                                local, remote, head, taken, &theme, &described,
-                            ))
-                        });
-                        prepared
+                        // The two listings, HEAD's state, the worktree
+                        // checkouts and the describe — the loader's five
+                        // processes, one spawn floor. A failed `head` degrades
+                        // to `warning` instead of taking the listing down;
+                        // the pane carries it to the notice band.
+                        let loaded = gitten_app::acquire::branches(repo.as_ref())?;
+                        let mut prepared = views::branches::prepare(
+                            loaded.local,
+                            loaded.remotes,
+                            loaded.head,
+                            loaded.worktree_branches,
+                            &theme,
+                            &loaded.label,
+                        );
+                        prepared.warning = loaded.warning;
+                        Ok((prepared.label.clone(), prepared))
                     },
-                    move |prepared: views::branches::Prepared, host, cx| {
-                        if generation.get() >= target {
-                            return Ok(());
-                        }
-                        let label_text = prepared.label.clone();
-                        view.update(cx, |v, cx| {
-                            v.replace_prepared(prepared, host);
-                            cx.notify();
-                        });
-                        label.replace(label_text);
-                        generation.set(target);
-                        Ok(())
+                    |v, prepared, host, cx| {
+                        v.replace_prepared(prepared, host);
+                        cx.notify();
                     },
-                ))
+                )
             }
             Screen::Custom(pane) => pane.refresh(target, host, overrides, repo),
         }
@@ -2205,9 +2153,9 @@ impl DevShell {
                 None => true,
             };
             if !armed {
-                self.set_question(format!(
-                    "discard this hunk of {path}? press again to confirm"
-                ));
+                self.set_question(gitten_core::list::question(&format!(
+                    "discard this hunk of {path}"
+                )));
                 return;
             }
             self.notice = None; // the question is spent; the running band speaks next
@@ -2489,15 +2437,13 @@ impl DevShell {
         };
         if !view.update(cx, |v, _| v.confirm_or_arm_rewrite(&commit.sha)) {
             let asked = match kind {
-                Rewrite::SquashUp => format!(
-                    "squash {} into its parent? press again to confirm",
-                    commit.short
-                ),
-                Rewrite::FixupUp => format!(
-                    "fixup {} into its parent? press again to confirm",
-                    commit.short
-                ),
-                Rewrite::Drop => format!("drop {}? press again to confirm", commit.short),
+                Rewrite::SquashUp => {
+                    gitten_core::list::question(&format!("squash {} into its parent", commit.short))
+                }
+                Rewrite::FixupUp => {
+                    gitten_core::list::question(&format!("fixup {} into its parent", commit.short))
+                }
+                Rewrite::Drop => gitten_core::list::question(&format!("drop {}", commit.short)),
             };
             self.set_question(asked);
             return;
@@ -2640,9 +2586,9 @@ impl DevShell {
             return;
         };
         if !view.update(cx, |b, _| b.confirm_or_arm_rebase(&target)) {
-            self.set_question(format!(
-                "rebase this branch onto {shown}? press again to confirm"
-            ));
+            self.set_question(gitten_core::list::question(&format!(
+                "rebase this branch onto {shown}"
+            )));
             return;
         }
         self.notice = None; // the question is spent; the running band speaks next
@@ -3415,6 +3361,14 @@ impl DevShell {
                 if let Some(stats) = &mut self.stats {
                     stats.reloaded(load);
                     stats.total_rows.set(total);
+                }
+            }
+            // A degraded read is a warning, not an error: the branches pane
+            // holds its `head` failure until the whole wave has landed, and
+            // the notice band says it once.
+            if let Some(Screen::Branches { view, .. }) = self.panes.get("branches") {
+                if let Some(warning) = view.read(cx).take_warning() {
+                    self.set_notice(warning);
                 }
             }
             // A QA door that needed the wave's rows fires now that it has
@@ -7948,22 +7902,21 @@ fn open_main_window(launch: Launch, cx: &mut App) {
                 } else if let Some((_, handle)) = &repo {
                     start::mark("files status begin");
                     let described = std::thread::scope(|s| {
-                        // Beside, not behind — describe, status and the stash
-                        // stack spawn together and are joined only once all
-                        // three are back. Joining each in sequence would put
-                        // three git processes on the launch path one after
-                        // another.
-                        let title = s.spawn(|| handle.describe());
-                        let status = s.spawn(|| handle.status());
-                        let parked = s.spawn(|| handle.stashes());
-                        let title = title.join().unwrap_or_default();
-                        let files_prepared = match status
+                        // Beside, not behind — the two loaders spawn together
+                        // and are joined only once both are back; each
+                        // overlaps its own describe with its read, the same
+                        // floor the refresh wave pays. Joining each in
+                        // sequence would put the reads on the launch path
+                        // one after another.
+                        let files = s.spawn(|| gitten_app::acquire::files(handle.as_ref()));
+                        let parked = s.spawn(|| gitten_app::acquire::stashes(handle.as_ref()));
+                        let files_prepared = match files
                             .join()
                             .unwrap_or_else(|p| std::panic::resume_unwind(p))
                         {
-                            Ok(status) => views::files::prepare(
-                                status,
-                                &title,
+                            Ok(loaded) => views::files::prepare(
+                                loaded.status,
+                                &loaded.label,
                                 std::collections::HashMap::new(),
                             ),
                             // Shown as a clean tree rather than failing the
@@ -7972,7 +7925,7 @@ fn open_main_window(launch: Launch, cx: &mut App) {
                                 eprintln!("gitten: status failed, showing an empty pane: {e}");
                                 views::files::prepare(
                                     Default::default(),
-                                    &title,
+                                    &handle.describe(),
                                     std::collections::HashMap::new(),
                                 )
                             }
@@ -7983,10 +7936,10 @@ fn open_main_window(launch: Launch, cx: &mut App) {
                             .join()
                             .unwrap_or_else(|p| std::panic::resume_unwind(p))
                         {
-                            Ok(stashes) => views::stashes::prepare(&stashes, &title),
+                            Ok(loaded) => views::stashes::prepare(&loaded.stashes, &loaded.label),
                             Err(e) => {
                                 eprintln!("gitten: stashes failed, showing an empty pane: {e}");
-                                views::stashes::prepare(&[], &title)
+                                views::stashes::prepare(&[], &handle.describe())
                             }
                         };
                         (files_prepared, stashes_prepared)
@@ -8013,58 +7966,38 @@ fn open_main_window(launch: Launch, cx: &mut App) {
                     initial_panes.focus(0);
                     start::mark("files pane built");
 
-                    // The branches panel beside it — three reads run side by
-                    // side, behind the same spawn floor the files pane pays.
-                    // A failed read shows an empty panel rather than failing
-                    // the launch, for the same reason a bad status does.
+                    // The branches panel beside it — the loader's five reads
+                    // behind one spawn floor. A failed read shows an empty
+                    // panel rather than failing the launch, for the same
+                    // reason a bad status does; a failed `head` only costs
+                    // the top row's honesty, which the pane's `warning`
+                    // carries to the notice band once the shell stands.
                     start::mark("branches read begin");
-                    let described = handle.describe();
-                    let prepared = std::thread::scope(|s| {
-                        let local = s.spawn(|| handle.branches());
-                        let remote = s.spawn(|| handle.remote_branches());
-                        let head = s.spawn(|| handle.head());
-                        let taken = s.spawn(|| handle.worktree_branches());
-                        let local = local
-                            .join()
-                            .unwrap_or_else(|p| std::panic::resume_unwind(p));
-                        let remote = remote
-                            .join()
-                            .unwrap_or_else(|p| std::panic::resume_unwind(p));
-                        let head = head.join().unwrap_or_else(|p| std::panic::resume_unwind(p));
-                        let taken = taken.join().unwrap_or_default();
-                        match (local, remote) {
-                            (Ok(local), Ok(remote)) => {
-                                let head = match head {
-                                    Ok(head) => Some(head),
-                                    Err(e) => {
-                                        eprintln!(
-                                            "gitten: head read failed, showing attached: {e}"
-                                        );
-                                        None
-                                    }
-                                };
-                                views::branches::prepare(
-                                    local,
-                                    remote,
-                                    head,
-                                    taken,
-                                    &host.theme,
-                                    &described,
-                                )
-                            }
-                            (Err(e), _) | (_, Err(e)) => {
-                                eprintln!("gitten: branch reads failed, empty panel: {e}");
-                                views::branches::prepare(
-                                    Vec::new(),
-                                    Vec::new(),
-                                    None,
-                                    Vec::new(),
-                                    &host.theme,
-                                    &described,
-                                )
-                            }
+                    let prepared = match gitten_app::acquire::branches(handle.as_ref()) {
+                        Ok(loaded) => {
+                            let mut prepared = views::branches::prepare(
+                                loaded.local,
+                                loaded.remotes,
+                                loaded.head,
+                                loaded.worktree_branches,
+                                &host.theme,
+                                &loaded.label,
+                            );
+                            prepared.warning = loaded.warning;
+                            prepared
                         }
-                    });
+                        Err(e) => {
+                            eprintln!("gitten: {e}, empty panel");
+                            views::branches::prepare(
+                                Vec::new(),
+                                Vec::new(),
+                                None,
+                                Vec::new(),
+                                &host.theme,
+                                &handle.describe(),
+                            )
+                        }
+                    };
                     start::mark("branches read done");
                     let label = prepared.label.clone();
                     let branches = cx.new(|_| views::branches::Branches::from_prepared(prepared));
@@ -8246,6 +8179,15 @@ fn open_main_window(launch: Launch, cx: &mut App) {
                     // skeleton's rows arrive with its wave, which re-aims
                     // the preview on landing.
                     shell.enter_workspace(cx);
+                    // A Ready launch's panes stand without a wave, so the
+                    // degraded-read warning a `finish_refresh` would say at
+                    // wave end is said here instead — the same band, the
+                    // same once.
+                    if let Some(Screen::Branches { view, .. }) = shell.panes.get("branches") {
+                        if let Some(warning) = view.read(cx).take_warning() {
+                            shell.set_notice(warning);
+                        }
+                    }
                     // Frame one already names its commit: schedule the
                     // newest one's diff through the same guarded rails
                     // every later selection rides. The header and the

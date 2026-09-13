@@ -12,15 +12,44 @@
 //! window of rows, the terminal does both — and `prepare` is one call away in
 //! `core`. Stopping here is what keeps this from being a fourth opinion about
 //! what a client needs.
+//!
+//! Past startup, a pane re-loads through the named loaders — [`files`],
+//! [`branches`], [`stashes`], [`remotes`], [`tags`], [`worktrees`],
+//! [`reflog`], [`conflict`]. Each runs one pane's whole read set behind a
+//! single call: the reads its rows are made of, beside each other and beside
+//! the `describe` its label is spelled with — one `thread::scope`, one spawn
+//! floor, the protocol a client used to write per pane.
+//!
+//! Which reads a loader treats how is one policy, held here and not per pane:
+//!
+//! - **A read the rows are *made of* is load-bearing.** Its failure is the
+//!   loader's `Err`, in the repository's own words — the caller keeps
+//!   whatever it last drew, or marks a first load "unavailable".
+//! - **A read that only *decorates* degrades.** The field comes back `None`
+//!   or empty and the error rides in the load's `warning`, for the caller to
+//!   surface on a status line or swallow. The load itself stays `Ok`.
+//! - **An empty listing is a successful load.** Before the first branch and
+//!   after the last drop, nothing is the state of the world — the same
+//!   posture [`stashes`] already takes. Whether an empty answer was *asked
+//!   for* is startup's question ([`acquire`]), not a refresh's.
+//! - **`describe` is never part of the policy** — it cannot fail by trait
+//!   signature — and a panic in any spawned read resumes on the caller's
+//!   thread through `joined`, because a panic is a bug and not an answer.
+//!
+//! The commits and diff panes already had their loaders — [`acquire`],
+//! [`reacquire`] and [`diff_source`] — and this is where their shape was
+//! borrowed from.
 
 use crate::cli::{Source, View};
+use gitten_core::conflict::ConflictFile;
 use gitten_core::differ::{Differs, Overrides};
 use gitten_core::host::Host;
-use gitten_core::refs::Stash;
+use gitten_core::refs::{Branch, HeadState, ReflogEntry, Remote, RemoteBranch, Stash, Tag};
 use gitten_core::source::DiffSource;
-use gitten_core::status::Status;
+use gitten_core::status::{PathBytes, Status};
+use gitten_core::worktrees::Worktree;
 use gitten_core::{Commit, FileDiff};
-use gitten_git::Repo;
+use gitten_git::{Repo, UnmergedStage};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -42,10 +71,7 @@ pub enum Data {
     /// One conflicted file: the working-tree bytes parsed into regions, and
     /// the stages git still holds for the path — the undo's raw material
     /// and the delete/modify answer's evidence.
-    Conflict(
-        gitten_core::conflict::ConflictFile,
-        Vec<gitten_git::UnmergedStage>,
-    ),
+    Conflict(ConflictFile, Vec<UnmergedStage>),
 }
 
 impl Data {
@@ -166,13 +192,14 @@ pub fn diff_source(
     // The conflict source is not a diff and never becomes one: its answer
     // is the file's own markers and the stages behind them. It also carries
     // its own empty answer — a file whose markers are gone is "resolved",
-    // which is a state a merging view wants to draw, not an error.
+    // which is a state a merging view wants to draw, not an error. The read
+    // is [`conflict`]'s, so the resolved deletion an emptied stage list
+    // means arrives here the same way it does on a merging pane's refresh.
     if let DiffSource::Conflict { path } = source {
-        let file = repo.conflict_file(path.as_bytes())?;
-        let stages = repo.unmerged(path.as_bytes())?;
+        let loaded = conflict(repo, path)?;
         return Ok(Loaded {
-            label: source.label(),
-            data: Data::Conflict(file, stages),
+            label: loaded.label,
+            data: Data::Conflict(loaded.file, loaded.stages),
         });
     }
     let pairs = match source {
@@ -436,15 +463,222 @@ pub fn stashes(repo: &dyn Repo) -> Result<LoadedStashes, String> {
     })
 }
 
-/// Joins the thread fetching the title.
+// ------------------------------------------------------------ pane loaders
+
+/// What the files pane loaded: the working tree's four lists, and the
+/// repository's own description for its label.
+#[derive(Debug)]
+pub struct LoadedFiles {
+    pub label: String,
+    pub status: Status,
+}
+
+/// Reads `status` beside `describe` — the files pane's whole read set.
 ///
-/// `describe` returns a `String` and cannot fail, so the only thing left in
-/// that `join` is a panic — resumed here, on the caller's thread, exactly as it
-/// came out of the inline call this used to be.
-fn joined(title: std::thread::ScopedJoinHandle<'_, String>) -> String {
-    title
-        .join()
-        .unwrap_or_else(|p| std::panic::resume_unwind(p))
+/// The staged paths' `n/m` counts are [`side_hunk_counts`]' to add, not
+/// this load's: they cost a diff per staged path, and a pane that does
+/// not draw fractions should not pay for them.
+pub fn files(repo: &dyn Repo) -> Result<LoadedFiles, String> {
+    std::thread::scope(|s| {
+        let title = s.spawn(|| repo.describe());
+        let status = repo.status()?;
+        Ok(LoadedFiles {
+            label: joined(title),
+            status,
+        })
+    })
+}
+
+/// What the branches pane loaded: both listings, where HEAD is, which
+/// branches other worktrees hold, and the description.
+#[derive(Debug)]
+pub struct LoadedBranches {
+    pub label: String,
+    /// The local branches, most recently committed first, the checked-out
+    /// one first of all.
+    pub local: Vec<Branch>,
+    /// The remote-tracking branches, as of the last fetch.
+    pub remotes: Vec<RemoteBranch>,
+    /// Where HEAD points — the one read here that only decorates, so it
+    /// degrades per the module's policy: `None` on a failed read and
+    /// `warning` says why. The listings stay true; only the detached row
+    /// is not said.
+    pub head: Option<HeadState>,
+    /// The local branches checked out in *other* worktrees — the ones a
+    /// checkout here would be refused for. Infallible by trait signature,
+    /// so it degrades silently: empty when the implementation cannot say.
+    pub worktree_branches: Vec<String>,
+    /// The first decorating read that failed, in the repository's own
+    /// words. `None` is a clean load.
+    pub warning: Option<String>,
+}
+
+/// Reads both branch listings, HEAD's state, the worktree-held branches and
+/// the description — five processes, one spawn floor.
+///
+/// The two listings are the pane, so either's refusal is the load's, named
+/// as theirs: a bare git error beside the pane would read as a status
+/// read's or a log's. `head` is the decoration and degrades to `None`
+/// with its error in `warning`. `worktree_branches` rides along because
+/// the pane's fullest incarnation marks its rows with it — a client that
+/// does not draw the marks pays one parallel process it can ignore.
+pub fn branches(repo: &dyn Repo) -> Result<LoadedBranches, String> {
+    std::thread::scope(|s| {
+        let title = s.spawn(|| repo.describe());
+        let local = s.spawn(|| repo.branches());
+        let remotes = s.spawn(|| repo.remote_branches());
+        let head = s.spawn(|| repo.head());
+        let taken = s.spawn(|| repo.worktree_branches());
+        let local = joined(local).map_err(|e| format!("branch reads failed: {e}"))?;
+        let remotes = joined(remotes).map_err(|e| format!("branch reads failed: {e}"))?;
+        let (head, warning) = match joined(head) {
+            Ok(head) => (Some(head), None),
+            Err(e) => (None, Some(format!("branch reads failed: {e}"))),
+        };
+        Ok(LoadedBranches {
+            label: joined(title),
+            local,
+            remotes,
+            head,
+            worktree_branches: joined(taken),
+            warning,
+        })
+    })
+}
+
+/// What the remotes pane loaded: the named remotes and their URLs, and the
+/// description.
+#[derive(Debug)]
+pub struct LoadedRemotes {
+    pub label: String,
+    pub remotes: Vec<Remote>,
+}
+
+/// Reads `remotes` beside `describe` — the remotes pane's whole read set.
+pub fn remotes(repo: &dyn Repo) -> Result<LoadedRemotes, String> {
+    std::thread::scope(|s| {
+        let title = s.spawn(|| repo.describe());
+        let remotes = repo.remotes()?;
+        Ok(LoadedRemotes {
+            label: joined(title),
+            remotes,
+        })
+    })
+}
+
+/// What the tags pane loaded: every tag resolved to the commit it names,
+/// and the description.
+#[derive(Debug)]
+pub struct LoadedTags {
+    pub label: String,
+    pub tags: Vec<Tag>,
+}
+
+/// Reads `tags` beside `describe` — the tags pane's whole read set.
+pub fn tags(repo: &dyn Repo) -> Result<LoadedTags, String> {
+    std::thread::scope(|s| {
+        let title = s.spawn(|| repo.describe());
+        let tags = repo.tags()?;
+        Ok(LoadedTags {
+            label: joined(title),
+            tags,
+        })
+    })
+}
+
+/// What the worktrees pane loaded: every checkout of the repository, this
+/// one first, and the description.
+#[derive(Debug)]
+pub struct LoadedWorktrees {
+    pub label: String,
+    pub worktrees: Vec<Worktree>,
+}
+
+/// Reads `worktrees` beside `describe` — the worktrees pane's whole read
+/// set. The row guard's `here` — which entry is this checkout — stays the
+/// caller's: it is a canonicalized *path*, a fact about the client, not a
+/// repository read.
+pub fn worktrees(repo: &dyn Repo) -> Result<LoadedWorktrees, String> {
+    std::thread::scope(|s| {
+        let title = s.spawn(|| repo.describe());
+        let worktrees = repo.worktrees()?;
+        Ok(LoadedWorktrees {
+            label: joined(title),
+            worktrees,
+        })
+    })
+}
+
+/// What the reflog pane loaded: where HEAD has been, newest first, and the
+/// description.
+#[derive(Debug)]
+pub struct LoadedReflog {
+    pub label: String,
+    pub entries: Vec<ReflogEntry>,
+}
+
+/// Reads `reflog` beside `describe` — the reflog pane's whole read set.
+/// `limit` is the caller's bound, because how much history is worth
+/// flattening is a pane's decision and not the read's.
+pub fn reflog(repo: &dyn Repo, limit: usize) -> Result<LoadedReflog, String> {
+    std::thread::scope(|s| {
+        let title = s.spawn(|| repo.describe());
+        let entries = repo.reflog(limit)?;
+        Ok(LoadedReflog {
+            label: joined(title),
+            entries,
+        })
+    })
+}
+
+/// What the merging pane loaded: one conflicted path — the file's own
+/// markers, and the stages git still holds for it.
+#[derive(Debug)]
+pub struct LoadedConflict {
+    /// The conflict source's own label — `path · conflict` — and not the
+    /// describe: this pane names the file, not the repository.
+    pub label: String,
+    pub file: ConflictFile,
+    pub stages: Vec<UnmergedStage>,
+}
+
+/// Reads one path's conflict: the stages git still holds, beside the file's
+/// own markers.
+///
+/// The stages are load-bearing — the region answers write back through
+/// them. The file read is load-bearing *while they stand*: a file that
+/// left the working tree with its stages gone too is the resolved
+/// deletion, an honest empty answer the pane draws — not an error, and
+/// not a warning, because nothing was lost.
+pub fn conflict(repo: &dyn Repo, path: &PathBytes) -> Result<LoadedConflict, String> {
+    std::thread::scope(|s| {
+        let file = s.spawn(|| repo.conflict_file(path.as_bytes()));
+        let stages = repo.unmerged(path.as_bytes())?;
+        let file = match joined(file) {
+            Ok(file) => file,
+            // The resolved deletion: gone from the working tree, and the
+            // index no longer disagrees about it either.
+            Err(_) if stages.is_empty() => ConflictFile::parse(path.clone(), Vec::new()),
+            Err(e) => return Err(e),
+        };
+        Ok(LoadedConflict {
+            label: DiffSource::Conflict { path: path.clone() }.label(),
+            file,
+            stages,
+        })
+    })
+}
+
+/// Joins a spawned read, resuming a panic on the caller's thread — the
+/// same answer the inline call this replaced would have given.
+///
+/// For `describe` the panic is all the `join` can hold, since it returns a
+/// `String` and cannot fail; for the data reads it is the one thing a
+/// `Result` cannot say — either way it was a bug, so it propagates as one.
+/// Public so a client's own `thread::scope` wave — the terminal's startup
+/// reads — pays the same answer rather than growing a second copy.
+pub fn joined<T>(read: std::thread::ScopedJoinHandle<'_, T>) -> T {
+    read.join().unwrap_or_else(|p| std::panic::resume_unwind(p))
 }
 
 /// The injected handle, or an error naming what was asked for.
@@ -1274,6 +1508,310 @@ mod tests {
         };
         let err = stashes(&repo).unwrap_err();
         assert_eq!(err, "fatal: bad object refs/stash");
+    }
+
+    /// A repository scripted for the pane loaders: every read answers out
+    /// of a field and defaults to a refusal, so a test sees exactly which
+    /// leg a load treats as load-bearing and which it lets degrade — and
+    /// `reflog` records the limit it was handed, so the argument a caller
+    /// passed is observable too.
+    struct PaneFake {
+        label: &'static str,
+        status: Result<Status, &'static str>,
+        branches: Result<Vec<Branch>, &'static str>,
+        remote_branches: Result<Vec<RemoteBranch>, &'static str>,
+        head: Result<HeadState, &'static str>,
+        taken: Vec<String>,
+        remotes: Result<Vec<Remote>, &'static str>,
+        tags: Result<Vec<Tag>, &'static str>,
+        worktrees: Result<Vec<Worktree>, &'static str>,
+        entries: Result<Vec<ReflogEntry>, &'static str>,
+        reflog_limit: Mutex<Option<usize>>,
+        stages: Result<Vec<UnmergedStage>, &'static str>,
+        file: Result<ConflictFile, &'static str>,
+    }
+
+    impl Default for PaneFake {
+        fn default() -> Self {
+            Self {
+                label: "pane (main)",
+                status: Err("status unserved"),
+                branches: Err("branches unserved"),
+                remote_branches: Err("remote branches unserved"),
+                head: Err("head unserved"),
+                taken: Vec::new(),
+                remotes: Err("remotes unserved"),
+                tags: Err("tags unserved"),
+                worktrees: Err("worktrees unserved"),
+                entries: Err("reflog unserved"),
+                reflog_limit: Mutex::new(None),
+                stages: Err("unmerged unserved"),
+                file: Err("conflict file unserved"),
+            }
+        }
+    }
+
+    fn branch(name: &str) -> Branch {
+        Branch {
+            name: PathBytes::from(name),
+            commit: "a".repeat(40),
+            upstream: None,
+            head: true,
+        }
+    }
+
+    impl Repo for PaneFake {
+        fn log(&self, _limit: usize) -> gitten_git::Result<Vec<Commit>> {
+            Ok(Vec::new())
+        }
+
+        fn pairs(&self, _revspec: &str) -> gitten_git::Result<Vec<Pair>> {
+            Ok(Vec::new())
+        }
+
+        fn status(&self) -> gitten_git::Result<Status> {
+            self.status.clone().map_err(str::to_string)
+        }
+
+        fn describe(&self) -> String {
+            self.label.into()
+        }
+
+        fn branches(&self) -> gitten_git::Result<Vec<Branch>> {
+            self.branches.clone().map_err(str::to_string)
+        }
+
+        fn remote_branches(&self) -> gitten_git::Result<Vec<RemoteBranch>> {
+            self.remote_branches.clone().map_err(str::to_string)
+        }
+
+        fn head(&self) -> gitten_git::Result<HeadState> {
+            self.head.clone().map_err(str::to_string)
+        }
+
+        fn worktree_branches(&self) -> Vec<String> {
+            self.taken.clone()
+        }
+
+        fn remotes(&self) -> gitten_git::Result<Vec<Remote>> {
+            self.remotes.clone().map_err(str::to_string)
+        }
+
+        fn tags(&self) -> gitten_git::Result<Vec<Tag>> {
+            self.tags.clone().map_err(str::to_string)
+        }
+
+        fn worktrees(&self) -> gitten_git::Result<Vec<Worktree>> {
+            self.worktrees.clone().map_err(str::to_string)
+        }
+
+        fn reflog(&self, limit: usize) -> gitten_git::Result<Vec<ReflogEntry>> {
+            *self.reflog_limit.lock().unwrap() = Some(limit);
+            self.entries.clone().map_err(str::to_string)
+        }
+
+        fn unmerged(&self, _path: &[u8]) -> gitten_git::Result<Vec<UnmergedStage>> {
+            self.stages.clone().map_err(str::to_string)
+        }
+
+        fn conflict_file(&self, _path: &[u8]) -> gitten_git::Result<ConflictFile> {
+            self.file.clone().map_err(str::to_string)
+        }
+    }
+
+    #[test]
+    fn the_branch_load_runs_the_whole_ref_read_beside_the_describe() {
+        let repo = PaneFake {
+            branches: Ok(vec![branch("main")]),
+            remote_branches: Ok(vec![RemoteBranch {
+                remote: PathBytes::from("origin"),
+                branch: PathBytes::from("main"),
+                commit: "b".repeat(40),
+            }]),
+            head: Ok(HeadState::Branch {
+                name: PathBytes::from("main"),
+                commit: Some("a".repeat(40)),
+            }),
+            taken: vec!["dev".to_string()],
+            ..Default::default()
+        };
+        let loaded = branches(&repo).expect("a clean load");
+        assert_eq!(loaded.label, "pane (main)", "the describe ran beside");
+        assert_eq!(loaded.local.len(), 1);
+        assert_eq!(loaded.remotes.len(), 1);
+        assert!(matches!(loaded.head, Some(HeadState::Branch { .. })));
+        assert_eq!(loaded.worktree_branches, ["dev"]);
+        assert!(loaded.warning.is_none());
+    }
+
+    #[test]
+    fn a_listing_failure_fails_the_branch_load_but_a_head_failure_only_warns() {
+        // The listings are the pane's rows: either's refusal is the load's,
+        // named as theirs.
+        let repo = PaneFake {
+            remote_branches: Ok(Vec::new()),
+            ..Default::default()
+        };
+        assert_eq!(
+            branches(&repo).unwrap_err(),
+            "branch reads failed: branches unserved"
+        );
+
+        // HEAD's state only decorates: a refusal there leaves the rows
+        // true, and the sentence rides out in the warning.
+        let repo = PaneFake {
+            branches: Ok(vec![branch("main")]),
+            remote_branches: Ok(Vec::new()),
+            head: Err("fatal: bad HEAD"),
+            ..Default::default()
+        };
+        let loaded = branches(&repo).expect("a lost head read must not take the listing");
+        assert!(loaded.head.is_none());
+        assert_eq!(
+            loaded.warning.as_deref(),
+            Some("branch reads failed: fatal: bad HEAD")
+        );
+        assert_eq!(loaded.local.len(), 1);
+    }
+
+    #[test]
+    fn the_single_listing_loaders_carry_their_read_and_the_describe() {
+        let staged = |path: &str| gitten_core::status::StagedEntry {
+            path: PathBytes::from(path),
+            change: gitten_core::status::Change::Modified,
+            old_path: None,
+            kind: gitten_core::status::Kind::File,
+            submodule: gitten_core::status::Submodule::default(),
+        };
+        let repo = PaneFake {
+            status: Ok(Status {
+                staged: vec![staged("a.rs")],
+                ..Status::default()
+            }),
+            remotes: Ok(vec![Remote {
+                name: PathBytes::from("origin"),
+                urls: vec!["git@x:y".into()],
+            }]),
+            tags: Ok(vec![Tag {
+                name: PathBytes::from("v1"),
+                commit: "c".repeat(40),
+                annotated: true,
+                subject: Some("release".into()),
+            }]),
+            worktrees: Ok(vec![Worktree {
+                path: b"/repo".to_vec(),
+                head: "d".repeat(40),
+                branch: Some(b"main".to_vec()),
+                bare: false,
+                lock: None,
+                prunable: None,
+            }]),
+            entries: Ok(vec![ReflogEntry {
+                commit: "e".repeat(40),
+                selector: "HEAD@{0}".into(),
+                message: "commit: x".into(),
+            }]),
+            ..Default::default()
+        };
+
+        let loaded = files(&repo).expect("status is served");
+        assert_eq!(loaded.label, "pane (main)");
+        assert_eq!(loaded.status.staged.len(), 1);
+
+        let loaded = remotes(&repo).expect("remotes are served");
+        assert_eq!(loaded.label, "pane (main)");
+        assert_eq!(loaded.remotes[0].name.as_bytes(), b"origin");
+
+        let loaded = tags(&repo).expect("tags are served");
+        assert_eq!(loaded.tags.len(), 1);
+
+        let loaded = worktrees(&repo).expect("worktrees are served");
+        assert_eq!(loaded.worktrees.len(), 1);
+
+        let loaded = reflog(&repo, 500).expect("the reflog is served");
+        assert_eq!(loaded.entries.len(), 1);
+        assert_eq!(loaded.label, "pane (main)");
+        // The caller's bound reached the read itself.
+        assert_eq!(*repo.reflog_limit.lock().unwrap(), Some(500));
+    }
+
+    #[test]
+    fn a_listing_refusal_is_the_loaders_error_in_the_repositorys_words() {
+        // One policy for every pane whose rows are the read: the refusal
+        // arrives verbatim, never as an empty list that would draw as
+        // success.
+        let repo = PaneFake::default();
+        assert_eq!(files(&repo).unwrap_err(), "status unserved");
+        assert_eq!(remotes(&repo).unwrap_err(), "remotes unserved");
+        assert_eq!(tags(&repo).unwrap_err(), "tags unserved");
+        assert_eq!(worktrees(&repo).unwrap_err(), "worktrees unserved");
+        assert_eq!(reflog(&repo, 500).unwrap_err(), "reflog unserved");
+    }
+
+    #[test]
+    fn the_conflict_load_reads_the_file_and_the_stages_beside_it() {
+        let repo = PaneFake {
+            file: Ok(ConflictFile::parse(
+                PathBytes::from("f.txt"),
+                b"<<<<<<< ours\nx\n=======\ny\n>>>>>>> theirs\n".to_vec(),
+            )),
+            stages: Ok(vec![
+                UnmergedStage {
+                    mode: "100644".into(),
+                    oid: "1".repeat(40),
+                    stage: 2,
+                },
+                UnmergedStage {
+                    mode: "100644".into(),
+                    oid: "2".repeat(40),
+                    stage: 3,
+                },
+            ]),
+            ..Default::default()
+        };
+        let loaded = conflict(&repo, &PathBytes::from("f.txt")).expect("both reads served");
+        assert_eq!(loaded.label, "f.txt · conflict");
+        assert!(loaded.file.is_conflicted());
+        assert_eq!(loaded.stages.len(), 2);
+    }
+
+    #[test]
+    fn a_conflict_file_gone_with_its_stages_is_the_resolved_deletion() {
+        // The file left the working tree and the index no longer disagrees:
+        // the honest empty answer — not an error, and not a warning,
+        // because nothing was lost.
+        let repo = PaneFake {
+            file: Err("f.txt is gone"),
+            stages: Ok(Vec::new()),
+            ..Default::default()
+        };
+        let loaded =
+            conflict(&repo, &PathBytes::from("f.txt")).expect("a resolved deletion draws empty");
+        assert!(loaded.file.bytes.is_empty());
+        assert!(!loaded.file.is_conflicted());
+        assert!(loaded.stages.is_empty());
+
+        // Stages still standing make the file read load-bearing again.
+        let repo = PaneFake {
+            file: Err("f.txt unreadable"),
+            stages: Ok(vec![UnmergedStage {
+                mode: "100644".into(),
+                oid: "1".repeat(40),
+                stage: 2,
+            }]),
+            ..Default::default()
+        };
+        assert_eq!(
+            conflict(&repo, &PathBytes::from("f.txt")).unwrap_err(),
+            "f.txt unreadable"
+        );
+
+        // And the stages themselves are load-bearing throughout.
+        let repo = PaneFake::default();
+        assert_eq!(
+            conflict(&repo, &PathBytes::from("f.txt")).unwrap_err(),
+            "unmerged unserved"
+        );
     }
 
     #[test]

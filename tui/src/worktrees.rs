@@ -19,6 +19,8 @@
 use crate::screen::{Ink, Screen};
 use crate::scrollbar::{self, Bar};
 use gitten_core::host::Host;
+use gitten_core::list::{self, Armed};
+use gitten_core::runs::Run;
 use gitten_core::search::TextIndex;
 use gitten_core::view::Viewport;
 use gitten_core::worktrees::Worktree;
@@ -104,10 +106,10 @@ pub struct Worktrees {
     bar: Bar,
     /// The removal awaiting its second press: the path that asked, and
     /// whether the force spelling is what the next press runs. One slot —
-    /// arming a different row moves the question, never queues two. Killed
-    /// by any cursor move, any moving scroll, any mouse row change and any
-    /// refresh.
-    armed: Option<(Vec<u8>, bool)>,
+    /// the shared [`Armed`] — arming a different row moves the question,
+    /// never queues two. Killed by any cursor move, any moving scroll, any
+    /// mouse row change and any refresh.
+    armed: Armed<(Vec<u8>, bool)>,
     dragging: bool,
 }
 
@@ -127,7 +129,7 @@ impl Worktrees {
             view,
             cols: 0,
             bar: Bar::default(),
-            armed: None,
+            armed: Armed::new(),
             dragging: false,
         };
         this.reindex();
@@ -147,13 +149,13 @@ impl Worktrees {
             view: Viewport::new(),
             cols: 0,
             bar: Bar::default(),
-            armed: None,
+            armed: Armed::new(),
             dragging: false,
         }
     }
 
     fn row_at(&self, visual: usize) -> Option<&Row> {
-        self.rows.get(*self.visible.get(visual)?)
+        list::shown(&self.rows, &self.visible, visual)
     }
 
     fn reindex(&mut self) {
@@ -164,7 +166,7 @@ impl Worktrees {
     fn refilter(&mut self) {
         self.visible = match &self.query {
             Some(q) => self.search.indices(q),
-            None => Vec::from_iter(0..self.rows.len()),
+            None => list::identity(&self.rows),
         };
         self.view.set_len(self.visible.len());
     }
@@ -176,9 +178,7 @@ impl Worktrees {
     }
 
     pub fn filter_note(&self) -> Option<String> {
-        self.query
-            .is_some()
-            .then(|| format!("{}/{}", self.visible.len(), self.rows.len()))
+        list::filter_note(self.query.as_deref(), self.visible.len(), self.rows.len())
     }
 
     /// Sets the filter — once per keystroke, never anywhere else. The
@@ -186,14 +186,14 @@ impl Worktrees {
     /// result set wherever it survives, clamped when it does not. An armed
     /// removal dies with a result set that changed, like any other refresh.
     pub fn apply_query(&mut self, query: &str) {
-        let next = Some(query.trim()).filter(|q| !q.is_empty());
-        if self.query.as_deref() == next {
+        let next = list::normalize_query(query);
+        if self.query == next {
             return;
         }
         let anchored = self.row_at(self.view.cursor()).map(|r| r.path.clone());
-        self.query = next.map(str::to_string);
+        self.query = next;
         self.refilter();
-        self.armed = None;
+        self.armed.disarm();
         let cursor = anchored
             .and_then(|p| {
                 self.visible
@@ -208,9 +208,8 @@ impl Worktrees {
         if self.query.is_none() || self.visible.is_empty() {
             return;
         }
-        let len = self.visible.len() as isize;
-        let at = (self.view.cursor() as isize + by).rem_euclid(len) as usize;
-        self.armed = None;
+        let at = list::wrap_index(self.view.cursor(), by, self.visible.len());
+        self.armed.disarm();
         self.view.go_to(at);
     }
 
@@ -226,10 +225,8 @@ impl Worktrees {
     /// the row, and the arm with it, so a force is never spent twice.
     pub fn replace(&mut self, worktrees: Vec<Worktree>, here: &[u8]) {
         let rows = flatten(worktrees, here);
-        self.armed = self
-            .armed
-            .take()
-            .filter(|(p, f)| *f && rows.iter().any(|r| r.path == *p));
+        self.armed
+            .keep_if(|(p, f)| *f && rows.iter().any(|r| r.path == *p));
         self.dragging = false;
         self.available = true;
         let (cursor, top) = (self.view.cursor(), self.view.top());
@@ -279,7 +276,7 @@ impl Worktrees {
     }
 
     pub fn move_by(&mut self, by: isize) {
-        self.armed = None;
+        self.armed.disarm();
         self.view.move_by(by);
     }
 
@@ -292,7 +289,7 @@ impl Worktrees {
     }
 
     pub fn page(&mut self, pages: isize) {
-        self.armed = None;
+        self.armed.disarm();
         self.view.page(pages);
     }
 
@@ -300,17 +297,17 @@ impl Worktrees {
         let before = self.view.top();
         self.view.pan_by(by);
         if self.view.top() != before {
-            self.armed = None;
+            self.armed.disarm();
         }
     }
 
     pub fn to_top(&mut self) {
-        self.armed = None;
+        self.armed.disarm();
         self.view.to_top();
     }
 
     pub fn to_bottom(&mut self) {
-        self.armed = None;
+        self.armed.disarm();
         self.view.to_bottom();
     }
 
@@ -352,20 +349,18 @@ impl Worktrees {
     }
 
     fn disarm_if_row_moved(&mut self, index: usize) {
-        let at = self
-            .visible
-            .get(index)
-            .and_then(|&r| self.rows.get(r))
-            .map(|r| (r.path.clone(), self.armed.as_ref().is_some_and(|(_, f)| *f)));
-        if self.armed.is_some() && self.armed != at {
-            self.armed = None;
-        }
+        // The comparison keeps the standing arm's own force flag: a press
+        // on the armed row answers its question as it was asked — forced
+        // or not — and a different row, or attention on nothing, drops it.
+        let force = self.armed.get().is_some_and(|(_, f)| *f);
+        let at = self.row_at(index).map(|r| (r.path.clone(), force));
+        self.armed.disarm_unless(at.as_ref());
     }
 
     /// The removal standing, if one is — what the tests read to prove an
     /// arm moved, died, upgraded to force, or stayed exactly where asked.
     pub fn armed(&self) -> Option<(Vec<u8>, bool)> {
-        self.armed.clone()
+        self.armed.get().cloned()
     }
 
     /// Arms — or spends — a removal of this exact path. First call stores
@@ -375,15 +370,7 @@ impl Worktrees {
     /// a new question, never as a spent old one — and a refresh disarms
     /// unconditionally.
     pub fn confirm_or_arm_remove(&mut self, path: &[u8], force: bool) -> bool {
-        let already = self
-            .armed
-            .as_ref()
-            .is_some_and(|(p, f)| p == path && *f == force);
-        self.armed = match already {
-            true => None,
-            false => Some((path.to_vec(), force)),
-        };
-        already
+        self.armed.confirm_or_arm((path.to_vec(), force))
     }
 
     /// Stands the force upgrade on this path after the plain removal was
@@ -392,7 +379,7 @@ impl Worktrees {
     /// spent, so it sets unconditionally — the spend cleared the arm, and
     /// a refresh or a cursor move still kills the upgrade like any arm.
     pub fn upgrade_to_force(&mut self, path: &[u8]) {
-        self.armed = Some((path.to_vec(), true));
+        self.armed.arm((path.to_vec(), true));
     }
     // ------------------------------------------------------- copy and selection
 
@@ -454,7 +441,7 @@ impl Worktrees {
                     false => theme.chrome.bg,
                 };
                 let name = Ink::new(theme.chrome.fg, bg);
-                let armed = self.armed.as_ref().is_some_and(|(p, _)| p == &r.path);
+                let armed = self.armed.get().is_some_and(|(p, _)| p == &r.path);
                 let rest = Ink::new(
                     match armed || r.lock.is_some() || r.prunable.is_some() {
                         true => theme.chrome.error,
@@ -499,6 +486,31 @@ impl Worktrees {
     }
 }
 
+/// The `view.*` vocabulary — the verbs themselves are the inherent methods
+/// above; this impl is what [`run_view_commands`] routes them by name.
+///
+/// [`run_view_commands`]: gitten_core::view::run_view_commands
+impl gitten_core::view::Scrollable for Worktrees {
+    fn down(&mut self) {
+        Worktrees::down(self);
+    }
+    fn up(&mut self) {
+        Worktrees::up(self);
+    }
+    fn page(&mut self, pages: isize) {
+        Worktrees::page(self, pages);
+    }
+    fn scroll_y(&mut self, rows: isize) {
+        Worktrees::scroll_y(self, rows);
+    }
+    fn to_top(&mut self) {
+        Worktrees::to_top(self);
+    }
+    fn to_bottom(&mut self) {
+        Worktrees::to_bottom(self);
+    }
+}
+
 fn flatten(worktrees: Vec<Worktree>, here: &[u8]) -> Vec<Row> {
     // Exact bytes: the listing spells paths symlink-resolved, so the
     // caller canonicalizes its own root first. Exactness here is what
@@ -518,6 +530,101 @@ fn flatten(worktrees: Vec<Worktree>, here: &[u8]) -> Vec<Row> {
             }
         })
         .collect()
+}
+/// The [`Pane`] half of the worktrees pane — the tenant contract over the inherent
+/// methods above. `view.*` and `search.*` come from the provided `run`;
+/// this pane has no verbs of its own to add.
+impl crate::pane::Pane for Worktrees {
+    fn scrollable(&mut self) -> &mut dyn gitten_core::view::Scrollable {
+        self
+    }
+
+    fn mode(&self) -> &'static str {
+        "worktrees"
+    }
+
+    fn set_scrolloff(&mut self, rows: usize) {
+        Worktrees::set_scrolloff(self, rows);
+    }
+
+    fn resize(&mut self, cols: usize, height: usize, _host: &Host) {
+        Worktrees::resize(self, cols, height);
+    }
+
+    fn paint(
+        &self,
+        screen: &mut Screen,
+        x: usize,
+        y: usize,
+        focused: bool,
+        host: &Host,
+        _out: &mut Vec<Run>,
+    ) {
+        Worktrees::paint(self, screen, x, y, focused, host);
+    }
+
+    fn status(&self, _host: &Host) -> String {
+        Worktrees::status(self)
+    }
+
+    fn paint_bar(
+        &self,
+        screen: &mut Screen,
+        x: usize,
+        divider: Option<usize>,
+        y: usize,
+        host: &Host,
+    ) {
+        Worktrees::paint_bar(self, screen, x, divider, y, host);
+    }
+
+    fn press(&mut self, col: usize, row: usize, _clicks: u8, extend: bool, host: &Host) {
+        Worktrees::press(self, col, row, extend, host);
+    }
+
+    fn drag(&mut self, _col: usize, row: isize, host: &Host) {
+        Worktrees::drag(self, row, host);
+    }
+
+    fn release(&mut self) {
+        Worktrees::release(self);
+    }
+
+    fn copy_text(&self) -> String {
+        Worktrees::copy_text(self)
+    }
+
+    fn selection(&self) -> String {
+        Worktrees::selection(self)
+    }
+
+    fn select_all(&mut self) {
+        Worktrees::select_all(self);
+    }
+
+    fn select_none(&mut self) -> bool {
+        Worktrees::select_none(self)
+    }
+
+    fn search_query(&self) -> Option<&str> {
+        Worktrees::query(self)
+    }
+
+    fn search_note(&self) -> Option<String> {
+        Worktrees::filter_note(self)
+    }
+
+    fn search_edit(&mut self, query: &str) {
+        Worktrees::apply_query(self, query);
+    }
+
+    fn search_clear(&mut self) {
+        Worktrees::clear_search(self);
+    }
+
+    fn search_next(&mut self, by: isize) {
+        Worktrees::next_match(self, by);
+    }
 }
 
 #[cfg(test)]

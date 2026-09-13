@@ -50,8 +50,8 @@
 
 use super::diff::{
     column_at, columns, extent_line, file_header, header_hit, hunk_header, hunk_hit, into_text,
-    line_colors, row_background, row_bar, row_frame, scrolled, selected, slice, Hit, RowState,
-    Rows, Scratch, PAD, ROW_BAR, ROW_H,
+    row_background, row_bar, row_frame, scrolled, selected, slice, Hit, RowState, Rows, Scratch,
+    PAD, ROW_BAR, ROW_H,
 };
 use gitten_core::align::align;
 use gitten_core::host::Host;
@@ -577,7 +577,10 @@ impl SplitRows {
         let p = &theme.diff;
         let base = match self.present(line, seg) {
             None => p.absent_bg,
-            Some(i) => line_colors(self.lines[i as usize].kind, self.lines[i as usize].moved, p).0,
+            Some(i) => {
+                let l = &self.lines[i as usize];
+                p.line_colors(l.kind, l.moved).0
+            }
         };
         super::diff::row_background(state.current, base, theme)
     }
@@ -615,7 +618,7 @@ impl SplitRows {
         // — and the same `side_bg` the frame's pads read, so a cell and the
         // pad beside it can never disagree.
         let bg = self.side_bg(Some(index), seg, state, theme);
-        let (_, fg, sign) = line_colors(line.kind, line.moved, p);
+        let (_, fg, sign) = p.line_colors(line.kind, line.moved);
         // The same substitution the unified view makes: the row paints the
         // wash over whatever the line was, so a number resolved for the line
         // kind was resolved against a background it never lands on.

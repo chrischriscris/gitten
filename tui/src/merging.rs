@@ -24,6 +24,7 @@ use crate::screen::{Ink, Screen};
 use crate::scrollbar::{self, Bar};
 use gitten_core::conflict::{Answer, ConflictFile};
 use gitten_core::host::Host;
+use gitten_core::runs::Run;
 use gitten_core::status::PathBytes;
 use gitten_core::view::Viewport;
 use gitten_git::UnmergedStage;
@@ -499,6 +500,118 @@ fn display_lines(bytes: &[u8]) -> Vec<String> {
             String::from_utf8_lossy(line).into_owned()
         })
         .collect()
+}
+
+/// The `view.*` vocabulary — the verbs are the inherent methods above; this
+/// impl is what [`run_view_commands`] routes them by name. `scroll_x` keeps
+/// its default no-op: the file clips rather than pans.
+///
+/// [`run_view_commands`]: gitten_core::view::run_view_commands
+impl gitten_core::view::Scrollable for Merging {
+    fn down(&mut self) {
+        Merging::down(self);
+    }
+    fn up(&mut self) {
+        Merging::up(self);
+    }
+    fn page(&mut self, pages: isize) {
+        Merging::page(self, pages);
+    }
+    fn scroll_y(&mut self, rows: isize) {
+        Merging::scroll_y(self, rows);
+    }
+    fn to_top(&mut self) {
+        Merging::to_top(self);
+    }
+    fn to_bottom(&mut self) {
+        Merging::to_bottom(self);
+    }
+}
+
+/// The [`Pane`] half of the conflict view — the tenant contract over the
+/// inherent methods above. It answers no `search.*`: there is no indexable
+/// list here to filter, only a file, so `searchable` is the refusal the
+/// prompt and the run dispatch share.
+impl crate::pane::Pane for Merging {
+    fn scrollable(&mut self) -> &mut dyn gitten_core::view::Scrollable {
+        self
+    }
+
+    fn mode(&self) -> &'static str {
+        "merge"
+    }
+
+    fn set_scrolloff(&mut self, rows: usize) {
+        Merging::set_scrolloff(self, rows);
+    }
+
+    fn resize(&mut self, cols: usize, height: usize, _host: &Host) {
+        Merging::resize(self, cols, height);
+    }
+
+    fn paint(
+        &self,
+        screen: &mut Screen,
+        x: usize,
+        y: usize,
+        focused: bool,
+        host: &Host,
+        _out: &mut Vec<Run>,
+    ) {
+        Merging::paint(self, screen, x, y, focused, host);
+    }
+
+    fn status(&self, _host: &Host) -> String {
+        Merging::status(self)
+    }
+
+    fn paint_bar(
+        &self,
+        screen: &mut Screen,
+        x: usize,
+        divider: Option<usize>,
+        y: usize,
+        host: &Host,
+    ) {
+        Merging::paint_bar(self, screen, x, divider, y, host);
+    }
+
+    fn press(&mut self, col: usize, row: usize, _clicks: u8, extend: bool, host: &Host) {
+        Merging::press(self, col, row, extend, host);
+    }
+
+    fn drag(&mut self, _col: usize, row: isize, host: &Host) {
+        Merging::drag(self, row, host);
+    }
+
+    fn release(&mut self) {
+        Merging::release(self);
+    }
+
+    fn selection(&self) -> String {
+        Merging::selection(self)
+    }
+
+    fn select_all(&mut self) {
+        Merging::select_all(self);
+    }
+
+    fn select_none(&mut self) -> bool {
+        Merging::select_none(self)
+    }
+
+    fn searchable(&self) -> bool {
+        false
+    }
+
+    fn verbs(&mut self, command: &str, _host: &Host) -> bool {
+        match command {
+            "merge.next-conflict" => Merging::jump_region(self, 1),
+            "merge.prev-conflict" => Merging::jump_region(self, -1),
+            _ => return false,
+        }
+        true
+    }
 }
 
 #[cfg(test)]
