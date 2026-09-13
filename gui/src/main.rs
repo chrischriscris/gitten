@@ -4365,6 +4365,10 @@ impl DevShell {
             // answer this, which is the honest silence of a command that does
             // not apply.
             "blob.flip" => self.flip_blob(cx),
+            // The centre's other body: the file as a document rather than as a
+            // diff. A sentence in the band when the file has no document to
+            // draw, which is what keeps this from being a mode.
+            "document.flip" => self.flip_document(cx),
             "files.stage" => self.stage_or_unstage(cx),
             "files.commit" => self.begin_commit_message(cx),
             "files.amend" => self.begin_amend_message(cx),
@@ -5214,6 +5218,56 @@ impl DevShell {
         });
     }
 
+    /// `document.flip`: the centre between the file's diff and the file's
+    /// rendered document.
+    ///
+    /// The choice is the reader's, so it survives a file the pane cannot draw —
+    /// a `.rs`, a patch, a selection that vanished. Asking for a document for
+    /// one of those is a sentence in the band rather than a mode that quietly
+    /// did nothing, which is the difference between a key that did not work and
+    /// a key that should not have.
+    fn flip_document(&mut self, cx: &mut Context<Self>) {
+        let wanted = !self.workspace.document_wanted;
+        if wanted && !self.cursor_is_markdown(cx) {
+            self.set_notice("no document to show for this file".to_string());
+            return;
+        }
+        self.workspace.document_wanted = wanted;
+        match wanted {
+            // A new key, so the preview re-runs rather than comparing equal:
+            // the document is read by the same job the diff is, on the same
+            // thread, and the diff is already in hand.
+            true => {
+                self.workspace.last = None;
+                self.sync_workspace_preview(cx);
+            }
+            // Standing down is immediate: the rows are already loaded, and a
+            // pane left holding the last file's document would draw it over
+            // the selection that replaced it.
+            false => {
+                if let Some(pane) = self.workspace.document.clone() {
+                    pane.update(cx, |pane, cx| {
+                        pane.clear();
+                        cx.notify();
+                    });
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Whether the file under the files pane's cursor is one a document pane
+    /// can draw — asked of the presentation that would render it, so the two
+    /// cannot disagree about which files are markdown.
+    fn cursor_is_markdown(&self, cx: &Context<Self>) -> bool {
+        let Some(Screen::Files { view, .. }) = self.panes.get("files") else {
+            return false;
+        };
+        view.read(cx)
+            .current_file()
+            .is_some_and(|f| views::markdown::claims(&f.path_text))
+    }
+
     /// `workspace.preview`: re-aim the center at the files cursor — the
     /// workspace's answer to [`DevShell::sync_main_diff`], called from the
     /// same two places: the tail of every command and the landing of every
@@ -5340,6 +5394,13 @@ impl DevShell {
         let req = self.workspace.request + 1;
         self.workspace.request = req;
         let over = self.over.clone();
+        // The document, when the reader asked for one, is read by this same job
+        // and on this same thread: a whole file is I/O, and the render path
+        // does none. `None` here is the ordinary case — a diff and no document.
+        let document_path = match self.workspace.document_wanted {
+            true => Some(String::from_utf8_lossy(path.as_bytes()).into_owned()),
+            false => None,
+        };
         cx.spawn(async move |shell, cx| {
             let mut job = None;
             let live = shell
@@ -5391,7 +5452,59 @@ impl DevShell {
                                 })
                             })
                             .flatten();
-                        Ok((files, prepared, blob))
+                        // The rendered document, for a reader who asked for
+                        // one: the whole file, off the same source the diff
+                        // came from, capped — and laid out here rather than on
+                        // the render path, which reads nothing and parses
+                        // nothing.
+                        let document = match &document_path {
+                            Some(path) => {
+                                let lines = repo.file_lines(
+                                    &source,
+                                    path.as_bytes(),
+                                    views::document::CAP,
+                                )?;
+                                // The file's other side, for the removals. A
+                                // refusal — an untracked file, a patch — is not
+                                // an error here: it means there is nothing
+                                // before this, and the document is all addition.
+                                let old = match source.other_side() {
+                                    Some(other) => repo.file_lines(
+                                        &other,
+                                        path.as_bytes(),
+                                        views::document::CAP,
+                                    )?,
+                                    None => Vec::new(),
+                                };
+                                // Which lines the diff touched, from the rows
+                                // this load just prepared. The markdown
+                                // presentation has already taken the markers
+                                // off them, so only the numbering is read from
+                                // here; the text of a removal comes from the
+                                // file's own before, whole.
+                                let changed: Vec<gitten_core::prepared::Line> = prepared
+                                    .files
+                                    .iter()
+                                    .find(|file| file.path.as_bytes() == path.as_bytes())
+                                    .map(|file| {
+                                        file.hunks
+                                            .iter()
+                                            .flat_map(|hunk| hunk.lines.iter().cloned())
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+                                let (lines, kinds) =
+                                    gitten_core::document::redline(&lines, &old, &changed);
+                                let text = lines.join("\n");
+                                Some((
+                                    path.clone(),
+                                    gitten_core::document::Document::new(&text, path, &host.syntax),
+                                    kinds,
+                                ))
+                            }
+                            None => None,
+                        };
+                        Ok((files, prepared, blob, document))
                     }));
                     true
                 })
@@ -5407,7 +5520,7 @@ impl DevShell {
                     return;
                 }
                 match outcome {
-                    Ok((files, prepared, blob)) => {
+                    Ok((files, prepared, blob, document)) => {
                         if let Some(center) = shell.workspace.center.clone() {
                             let host = config::host(cx);
                             center
@@ -5433,6 +5546,36 @@ impl DevShell {
                                 if let Some(blob) = shell.workspace.blob.clone() {
                                     blob.update(cx, |b, cx| {
                                         b.clear();
+                                        cx.notify();
+                                    });
+                                }
+                            }
+                        }
+                        // One slot, two bodies: the document pane when the
+                        // reader asked for one and the file has a document to
+                        // draw, the diff's rows otherwise. The pane is built
+                        // once and kept — a second file must not cost a second
+                        // view — and an absent document is how the body goes
+                        // back to the rows.
+                        match document {
+                            Some((path, doc, kinds)) => {
+                                let pane = shell
+                                    .workspace
+                                    .document
+                                    .get_or_insert_with(|| {
+                                        cx.new(|_| views::document::DocumentPane::new())
+                                    })
+                                    .clone();
+                                let host = config::host(cx);
+                                pane.update(cx, |pane, cx| {
+                                    pane.show(&path, doc, kinds, &host.font);
+                                    cx.notify();
+                                });
+                            }
+                            None => {
+                                if let Some(pane) = shell.workspace.document.clone() {
+                                    pane.update(cx, |pane, cx| {
+                                        pane.clear();
                                         cx.notify();
                                     });
                                 }
@@ -6568,11 +6711,14 @@ impl DevShell {
                     .min_h_0()
                     .flex_grow(1.0)
                     .overflow_hidden()
-                    // One slot, two bodies: the diff's rows, or the blob pane
-                    // when the selection is a file with no lines to show. The
-                    // choice is made here rather than inside the diff view,
-                    // because it is the *selection* that decides and the shell
-                    // is what owns the selection.
+                    // One slot, three bodies: the blob pane when the selection
+                    // is a file with no lines to show, the rendered document
+                    // when the reader asked for one and the file has one to
+                    // draw, the diff's rows otherwise. The choice is made here
+                    // rather than inside the diff view, because it is the
+                    // *selection* that decides and the shell is what owns the
+                    // selection — and each pane stands itself down when it is
+                    // handed a file it cannot draw.
                     .child(
                         match self
                             .workspace
@@ -6581,7 +6727,15 @@ impl DevShell {
                             .filter(|blob| blob.read(cx).is_showing())
                         {
                             Some(blob) => blob.into_any_element(),
-                            None => center.clone().into_any_element(),
+                            None => match self
+                                .workspace
+                                .document
+                                .clone()
+                                .filter(|pane| pane.read(cx).is_showing())
+                            {
+                                Some(pane) => pane.into_any_element(),
+                                None => center.clone().into_any_element(),
+                            },
                         },
                     ),
             );
@@ -10563,6 +10717,10 @@ diff --git a/one.txt b/one.txt
         /// files have no bytes to show, which is every test that is not about
         /// one.
         blob: std::sync::Mutex<gitten_core::blob::Pair>,
+        /// What [`Repo::file_lines`] answers — the whole of one side, for a
+        /// test that asks for a rendered document. Empty until a test serves
+        /// it, which is a file with no lines rather than an unserved read.
+        lines: std::sync::Mutex<Vec<Arc<str>>>,
     }
 
     impl RecordingRepo {
@@ -10580,6 +10738,7 @@ diff --git a/one.txt b/one.txt
                 diffs: std::sync::Mutex::new(Vec::new()),
                 unstaged: std::sync::Mutex::new(Vec::new()),
                 blob: std::sync::Mutex::new(gitten_core::blob::Pair::default()),
+                lines: std::sync::Mutex::new(Vec::new()),
             }
         }
 
@@ -10644,6 +10803,19 @@ diff --git a/one.txt b/one.txt
     /// dispatch test needs, standing where the binary implementation stands in
     /// a live window.
     impl Repo for RecordingRepo {
+        fn file_lines(
+            &self,
+            _: &gitten_core::source::DiffSource,
+            _: &[u8],
+            _: u64,
+        ) -> gitten_git::Result<Vec<Arc<str>>> {
+            Ok(self.lines.lock().unwrap().clone())
+        }
+
+        fn pairs_unstaged(&self, _: Option<&[u8]>) -> gitten_git::Result<Vec<Pair>> {
+            Ok(self.unstaged.lock().unwrap().clone())
+        }
+
         fn log(&self, _: usize) -> gitten_git::Result<Vec<Commit>> {
             Ok(self.log_answer.lock().unwrap().clone())
         }
@@ -10651,10 +10823,6 @@ diff --git a/one.txt b/one.txt
         fn pairs(&self, revspec: &str) -> gitten_git::Result<Vec<Pair>> {
             self.diffs.lock().unwrap().push(revspec.to_string());
             Ok(Vec::new())
-        }
-
-        fn pairs_unstaged(&self, _: Option<&[u8]>) -> gitten_git::Result<Vec<Pair>> {
-            Ok(self.unstaged.lock().unwrap().clone())
         }
 
         fn blob_pair(
@@ -11131,6 +11299,7 @@ diff --git a/one.txt b/one.txt
             diffs: std::sync::Mutex::new(Vec::new()),
             unstaged: std::sync::Mutex::new(Vec::new()),
             blob: std::sync::Mutex::new(gitten_core::blob::Pair::default()),
+            lines: std::sync::Mutex::new(Vec::new()),
         });
         let handle: gitten_git::Handle = repo.clone();
         let shell = shell(None, cx);
@@ -13708,6 +13877,109 @@ diff --git a/added.txt b/added.txt
                 panic!("branches pane lost");
             };
             assert!(view.read(cx).current().is_some(), "clamped onto a row");
+        });
+    }
+
+    /// The document pane through the **real** path: the files cursor's file,
+    /// the preview lane's own job, and the shell's own choice of body.
+    ///
+    /// A `.md` file nobody asked about is a diff — the rows are what a diff
+    /// pane is for — and the key swaps the centre for the file laid out as a
+    /// document, reading it on the same thread the diff came in on. The key
+    /// again gives the centre back to the rows.
+    #[gpui::test]
+    fn a_markdown_file_gives_the_centre_a_document_when_it_is_asked_for(cx: &mut TestAppContext) {
+        let mut tree = Status::default();
+        tree.unstaged.push(gitten_core::status::UnstagedEntry {
+            path: gitten_core::status::PathBytes::from("README.md"),
+            change: gitten_core::status::Change::Modified,
+            kind: gitten_core::status::Kind::File,
+            submodule: Default::default(),
+        });
+        let (shell, repo, _handle) = tree_shell(cx, tree);
+        // The diff read and the whole-file read answer from the same fake, so
+        // the document is laid out from the file the diff was taken of.
+        *repo.unstaged.lock().unwrap() = vec![Pair {
+            path: "README.md".into(),
+            old_path: None,
+            status: 'M',
+            old: vec![Arc::from("# Title")],
+            new: vec![Arc::from("# Title"), Arc::from(""), Arc::from("- a bullet")],
+            old_oid: None,
+            new_oid: None,
+            old_final_newline: true,
+            new_final_newline: true,
+            binary: false,
+        }];
+        *repo.lines.lock().unwrap() =
+            vec![Arc::from("# Title"), Arc::from(""), Arc::from("- a bullet")];
+
+        // The centre is the diff until somebody asks for the document.
+        shell.update(cx, |shell, cx| shell.sync_workspace_preview(cx));
+        cx.run_until_parked();
+        assert!(
+            shell.read_with(cx, |shell, cx| shell
+                .workspace
+                .document
+                .as_ref()
+                .is_none_or(|pane| !pane.read(cx).is_showing())),
+            "the centre opened on a document nobody asked for"
+        );
+
+        // `m`, through the door the keyboard reaches — and the load the key
+        // schedules is the preview lane's, not a second one.
+        shell.update(cx, |shell, cx| shell.run_command("document.flip", cx));
+        cx.run_until_parked();
+        assert!(
+            shell.read_with(cx, |shell, cx| shell
+                .workspace
+                .document
+                .as_ref()
+                .is_some_and(|pane| pane.read(cx).is_showing())),
+            "flipping a markdown file did not reach the document pane"
+        );
+        assert!(
+            shell.read_with(cx, |shell, _| shell.workspace.document_wanted),
+            "the pane is showing and the choice was not recorded"
+        );
+        // And the key again, which stands the pane down immediately rather
+        // than waiting for a load nobody needs.
+        shell.update(cx, |shell, cx| shell.run_command("document.flip", cx));
+        cx.run_until_parked();
+        assert!(
+            shell.read_with(cx, |shell, cx| shell
+                .workspace
+                .document
+                .as_ref()
+                .is_none_or(|pane| !pane.read(cx).is_showing())),
+            "the document stayed in the centre"
+        );
+    }
+
+    /// A file with no document to draw is a sentence and not a mode: the key
+    /// says so and changes nothing, which is the difference between a key that
+    /// did not work and a key that should not have.
+    #[gpui::test]
+    fn flipping_a_file_with_no_document_says_so(cx: &mut TestAppContext) {
+        let mut tree = Status::default();
+        tree.unstaged.push(gitten_core::status::UnstagedEntry {
+            path: gitten_core::status::PathBytes::from("one.rs"),
+            change: gitten_core::status::Change::Modified,
+            kind: gitten_core::status::Kind::File,
+            submodule: Default::default(),
+        });
+        let (shell, _repo, _handle) = tree_shell(cx, tree);
+        shell.update(cx, |shell, cx| shell.run_command("document.flip", cx));
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, _| {
+            assert!(
+                shell.notice.is_some(),
+                "a file with no document flipped in silence"
+            );
+            assert!(
+                !shell.workspace.document_wanted,
+                "the centre was given to a document that does not exist"
+            );
         });
     }
 }

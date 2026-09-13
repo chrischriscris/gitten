@@ -153,6 +153,17 @@ pub struct Workspace {
     /// everywhere a `diff <repo> <revspec>` launch did not ask for rows by
     /// name.
     pub launch: LaunchHold,
+    /// The centre's other body, for a markdown file: the rendered document.
+    /// Built once and kept, like the centre itself, and `None` until something
+    /// asks for one.
+    pub document: Option<Entity<crate::views::document::DocumentPane>>,
+    /// Whether the centre is showing documents rather than rows.
+    ///
+    /// The reader's choice and not the selection's — with one exception the
+    /// pane makes for itself: a file it cannot draw leaves it showing nothing,
+    /// so the body falls back to the rows without the flag having to be
+    /// cleared by whoever moved the cursor.
+    pub document_wanted: bool,
     /// The sidebar list's own scroll handle. The sidebar shares the files
     /// pane's *cursor* but pans its own rows: grouped space has its own
     /// addresses, so the stack list's handle cannot serve it.
@@ -191,6 +202,8 @@ impl Default for Workspace {
             request: 0,
             last: None,
             launch: LaunchHold::Off,
+            document: None,
+            document_wanted: false,
             sidebar_scroll: UniformListScrollHandle::new(),
             history_scroll: UniformListScrollHandle::new(),
             history_cursor: Cell::new(usize::MAX),

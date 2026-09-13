@@ -424,6 +424,7 @@ pub mod blob;
 pub mod branches;
 pub mod commits;
 pub mod diff;
+pub mod document;
 pub mod files;
 pub mod history;
 pub mod inspector;
