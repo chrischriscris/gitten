@@ -648,6 +648,10 @@ impl Keymap {
         // not a side. The pane's own strip carries the same two words as
         // buttons, so the mouse half is a click and not a keypress.
         bind("diff", "b", "blob.flip");
+        // The centre's other body, for the one file type that has one: a `.md`
+        // file draws as a document rather than as rows. `m`, unclaimed in this
+        // mode and named for what it shows.
+        bind("diff", "m", "document.flip");
         bind("diff", "]", "diff.next-file");
         bind("diff", "[", "diff.prev-file");
         bind("diff", "tab", "diff.next-file");
@@ -1536,6 +1540,12 @@ impl Commands {
             (
                 "blob.flip",
                 "the other side of a picture or a document — before, or after",
+                None,
+                false,
+            ),
+            (
+                "document.flip",
+                "the rendered document, for a markdown file",
                 None,
                 false,
             ),

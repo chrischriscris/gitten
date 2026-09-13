@@ -1345,3 +1345,5 @@ diff --git a/x b/x
         }
     }
 }
+
+pub mod document;

@@ -366,7 +366,7 @@ fn align_tables(
 
 /// Column widths and alignments for one run. `None` when the run is nothing but
 /// separators and so has no content to align to.
-fn measure(lines: &[Line], blocks: &[Block], run: &[usize]) -> Option<Grid> {
+pub(crate) fn measure(lines: &[Line], blocks: &[Block], run: &[usize]) -> Option<Grid> {
     let mut widths: Vec<usize> = Vec::new();
     let mut aligns: Vec<Align> = Vec::new();
     let mut cells: Vec<Range<usize>> = Vec::new();
@@ -401,7 +401,7 @@ fn measure(lines: &[Line], blocks: &[Block], run: &[usize]) -> Option<Grid> {
 ///
 /// A `\|` is a pipe in a cell, not a cell boundary — the one escape that matters
 /// here, because a table of operators is full of them.
-fn split_cells(text: &str, out: &mut Vec<Range<usize>>) {
+pub(crate) fn split_cells(text: &str, out: &mut Vec<Range<usize>>) {
     out.clear();
     let b = text.as_bytes();
     let start = text.len() - text.trim_start().len();

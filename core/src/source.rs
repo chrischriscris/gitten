@@ -51,6 +51,36 @@ pub enum DiffSource {
 }
 
 impl DiffSource {
+    /// The side this one replaced, when it has one.
+    ///
+    /// A diff is two texts with a source naming both by asking for one; a
+    /// caller that needs the *other* text — a rendered document that leaves
+    /// the removals in place — asks for the other side rather than reaching
+    /// into the diff's own rows, whose markdown markers are already off. The
+    /// two are the same read through the same door, which is why this is a
+    /// name and not a second method.
+    ///
+    /// `None` where there is nothing before: an untracked file is all
+    /// addition, a patch and a fixture have no repository to have a before
+    /// in, and an empty revspec is the aggregate read of `HEAD` against the
+    /// working tree rather than one file's side.
+    pub fn other_side(&self) -> Option<DiffSource> {
+        match self {
+            DiffSource::Unstaged { path } => Some(DiffSource::Staged { path: path.clone() }),
+            DiffSource::Staged { path: _ } => Some(DiffSource::Revspec { arg: "HEAD".into() }),
+            DiffSource::Commit { sha } => Some(DiffSource::Revspec {
+                arg: format!("{sha}^"),
+            }),
+            DiffSource::Stash { commit, .. } => Some(DiffSource::Revspec {
+                arg: format!("{commit}^"),
+            }),
+            DiffSource::Untracked { .. }
+            | DiffSource::Revspec { .. }
+            | DiffSource::Conflict { .. }
+            | DiffSource::Fixture
+            | DiffSource::Patch => None,
+        }
+    }
     /// The one path the source is about, when it names one — the file-side
     /// sources do, and nothing else does.
     pub fn path(&self) -> Option<&PathBytes> {
@@ -97,6 +127,27 @@ impl DiffSource {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_side_names_the_side_it_replaced() {
+        let path = super::PathBytes::from("README.md");
+        assert!(matches!(
+            super::DiffSource::Unstaged { path: path.clone() }.other_side(),
+            Some(super::DiffSource::Staged { .. })
+        ));
+        assert!(matches!(
+            super::DiffSource::Staged { path: path.clone() }.other_side(),
+            Some(super::DiffSource::Revspec { .. })
+        ));
+        // Nothing before it, and each for its own reason: an untracked file is
+        // all addition, a patch has no repository behind it, and an empty
+        // revspec is the aggregate read rather than one file's side.
+        assert!(super::DiffSource::Untracked { path }.other_side().is_none());
+        assert!(super::DiffSource::Patch.other_side().is_none());
+        assert!(super::DiffSource::Revspec { arg: String::new() }
+            .other_side()
+            .is_none());
+    }
     use super::*;
 
     #[test]

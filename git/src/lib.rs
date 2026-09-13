@@ -350,6 +350,28 @@ fn chunk_end(paths: &[&[u8]], at: usize) -> usize {
 /// view, reload and re-acquire a client makes without threading a concrete
 /// type through all of them.
 pub trait Repo: Send + Sync {
+    /// The whole of one side of a file, as lines.
+    ///
+    /// The line-shaped reads answer "what changed"; this answers "what is
+    /// there", which is what a viewer that draws the file as a document needs.
+    /// A hunk is the wrong shape for that twice over: it is the middle of a
+    /// document with everything around it missing, and a fence opened in one
+    /// hunk and closed in another is not a fence at all.
+    ///
+    /// **Bounded before the body is read**, because the caller is a pane that
+    /// cannot use a 400 MB file and reading one to find that out is the whole
+    /// cost. A working-tree side is `stat`ed; an object-database side is asked
+    /// its length with `cat-file -s` before the body is fetched. A refusal is
+    /// an error and never an empty document: "too large" and "not there" are
+    /// different sentences on screen.
+    ///
+    /// The default refuses, so an implementation that serves diffs and nothing
+    /// else stays usable — a document pane is a second body, not a
+    /// requirement of the trait.
+    fn file_lines(&self, _source: &DiffSource, _path: &[u8], _cap: u64) -> Result<Vec<Arc<str>>> {
+        Err(unserved("whole-file content"))
+    }
+
     /// Commit history, newest first.
     ///
     /// `--topo-order` is not optional: lane assignment assumes it, and without
@@ -1561,6 +1583,75 @@ pub trait Repo: Send + Sync {
     fn describe(&self) -> String;
 }
 
+/// A file's bytes split into lines, lossily, without their newlines.
+///
+/// Lossy because a file that is not UTF-8 must still be shown: one Latin-1
+/// author name in a README is not a reason to refuse a repository, and this is
+/// the rule every other read here follows — read bytes, and never hand a body
+/// git gave back to `String::from_utf8`.
+///
+/// **One trailing newline is dropped, not kept.** `"a\nb\n"` is two lines, not
+/// three, because that is what an editor shows and what `str::lines` — which is
+/// what the document pass itself runs on — makes of the same text. Keeping the
+/// newline in the element instead would make every consumer responsible for
+/// joining with the right separator, and one of them would eventually join with
+/// `\n` and double-space the whole document.
+fn split_lines(bytes: &[u8]) -> Vec<Arc<str>> {
+    let text = String::from_utf8_lossy(bytes);
+    let text = text.strip_suffix('\n').unwrap_or(&text);
+    match text.is_empty() {
+        true => Vec::new(),
+        false => text.split('\n').map(Arc::from).collect(),
+    }
+}
+
+/// One file's lines off the disk, refused by its length before it is read.
+///
+/// `top` is the repository's *top level* and not the directory the handle was
+/// opened at: every path a read here is handed is repository-relative, and
+/// joining one onto a subdirectory is how a read ends up looking for
+/// `src/src/main.rs`. Same rule as every other working-tree read.
+fn worktree_lines(top: &Path, path: &[u8], cap: u64) -> Result<Vec<Arc<str>>> {
+    let name = String::from_utf8_lossy(path).into_owned();
+    let file = join_raw(top, path);
+    let meta = std::fs::metadata(&file).map_err(|e| format!("document: {name}: {e}"))?;
+    if meta.len() > cap {
+        return Err(format!("file is larger than the {cap} byte limit: {name}"));
+    }
+    if !meta.is_file() {
+        return Err(format!("document: {name} is not a regular file"));
+    }
+    let mut bytes = Vec::with_capacity(meta.len() as usize);
+    std::fs::File::open(&file)
+        .and_then(|f| f.take(cap + 1).read_to_end(&mut bytes))
+        .map_err(|e| format!("document: {name}: {e}"))?;
+    Ok(split_lines(&bytes))
+}
+
+/// One file's lines out of the object database, sized before it is fetched.
+///
+/// `revision` is empty for the index — `cat-file -s :path` — and a revision
+/// otherwise. The size is asked of the *same* `<rev>:<path>` the body is, so
+/// the refusal and the read can never be talking about two different blobs, and
+/// the empty revision is not a special case anywhere but here.
+fn object_lines(root: &Path, revision: &[u8], path: &[u8], cap: u64) -> Result<Vec<Arc<str>>> {
+    let name = String::from_utf8_lossy(path).into_owned();
+    let mut spec = revision.to_vec();
+    spec.push(b':');
+    spec.extend_from_slice(path);
+    let size = run_bytes(root, &[b"cat-file", b"-s", &spec])
+        .map_err(|_| format!("document: {name} is not in this revision"))?;
+    let size: u64 = String::from_utf8_lossy(&size)
+        .trim()
+        .parse()
+        .map_err(|_| format!("document: {name} has no readable size"))?;
+    if size > cap {
+        return Err(format!("file is larger than the {cap} byte limit: {name}"));
+    }
+    let bytes = run_bytes(root, &[b"cat-file", b"blob", &spec])?;
+    Ok(split_lines(&bytes))
+}
+
 /// The error a read answers when an implementation does not serve it.
 ///
 /// The new reads default rather than being required, so an implementation
@@ -1703,6 +1794,42 @@ struct Binary {
 }
 
 impl Repo for Binary {
+    fn file_lines(&self, source: &DiffSource, path: &[u8], cap: u64) -> Result<Vec<Arc<str>>> {
+        match source {
+            // The new side of a working-tree diff, an untracked file and a
+            // conflict's working-tree half are all the same file in the same
+            // place, and that place is the disk.
+            DiffSource::Unstaged { .. }
+            | DiffSource::Untracked { .. }
+            | DiffSource::Conflict { .. } => {
+                let top = self.top.get_or_init(|| top_level(&self.root));
+                worktree_lines(top, path, cap)
+            }
+            // A side git is holding. `cat-file -s` before the body, for the
+            // same reason the working tree is `stat`ed first: an object's
+            // length is a dozen bytes of answer, and `cat-file blob` of a 2 GB
+            // one is two gigabytes of pipe read to discover it should have been
+            // refused. One extra spawn, once, per file somebody opens.
+            DiffSource::Staged { .. } => object_lines(&self.root, b"", path, cap),
+            DiffSource::Commit { sha } => object_lines(&self.root, sha.as_bytes(), path, cap),
+            DiffSource::Stash { commit, .. } => {
+                object_lines(&self.root, commit.as_bytes(), path, cap)
+            }
+            DiffSource::Revspec { arg } if !arg.is_empty() => {
+                object_lines(&self.root, arg.as_bytes(), path, cap)
+            }
+            // None of the rest names one file's one side: a patch is text with
+            // no repository behind it, a fixture is content with no repository
+            // at all, and an empty revspec is the aggregate read of `HEAD`
+            // against the working tree. The default's refusal, said here so
+            // that `Binary` is not the implementation that quietly answers
+            // something else.
+            DiffSource::Revspec { .. } | DiffSource::Fixture | DiffSource::Patch => {
+                Err(unserved("whole-file content"))
+            }
+        }
+    }
+
     fn log(&self, limit: usize) -> Result<Vec<Commit>> {
         let n = limit.to_string();
         let bytes = run(
@@ -14065,5 +14192,126 @@ mod tests {
             "the stream says what the log says"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The whole-file read: the side a document pane draws, fetched from
+    /// wherever that side actually lives. A working-tree side is on disk and
+    /// nowhere else, an index side is in the object database, and the two move
+    /// independently — which is the whole reason the read takes a
+    /// [`DiffSource`] and not a path.
+    #[test]
+    fn a_whole_file_reads_from_the_working_tree_and_from_the_index() {
+        let repo = Scratch::new("file-lines");
+        repo.write("README.md", b"# Title\n\ntext\n");
+        let handle = repo.open();
+        let read = |source: DiffSource| handle.file_lines(&source, b"README.md", 1 << 16);
+        let staged = || DiffSource::Staged {
+            path: PathBytes::from("README.md"),
+        };
+        let unstaged = || DiffSource::Unstaged {
+            path: PathBytes::from("README.md"),
+        };
+
+        // Untracked: in no part of git, and read off disk.
+        let lines = read(DiffSource::Untracked {
+            path: PathBytes::from("README.md"),
+        })
+        .expect("an untracked file is readable");
+        assert_eq!(
+            lines.iter().map(|l| l.as_ref()).collect::<Vec<_>>(),
+            ["# Title", "", "text"],
+            "a trailing newline became a line of its own"
+        );
+
+        // The index side is what a staged file shows, and the working tree
+        // moving on does not move it.
+        repo.git(&["add", "README.md"]);
+        assert_eq!(read(staged()).expect("the index side").len(), 3);
+        repo.write("README.md", b"# Title\n\ntext\nmore\n");
+        assert_eq!(
+            read(staged()).expect("the index side").len(),
+            3,
+            "the index side followed the working tree"
+        );
+        assert_eq!(read(unstaged()).expect("the working tree").len(), 4);
+    }
+
+    /// A file past the cap is refused with its limit, from both sides, and the
+    /// refusal happens on the *size* — the read that matters is the one that
+    /// does not happen when somebody selects a 2 GB log.
+    #[test]
+    fn a_side_over_the_cap_is_refused_rather_than_read() {
+        let repo = Scratch::new("file-lines-cap");
+        repo.write("big.md", &vec![b'x'; 4096]);
+        repo.git(&["add", "big.md"]);
+        let handle = repo.open();
+        for source in [
+            DiffSource::Unstaged {
+                path: PathBytes::from("big.md"),
+            },
+            DiffSource::Staged {
+                path: PathBytes::from("big.md"),
+            },
+        ] {
+            let err = handle
+                .file_lines(&source, b"big.md", 1024)
+                .expect_err("a file over the cap is refused");
+            assert!(err.contains("1024"), "the refusal names no limit: {err}");
+        }
+        // And the same file under the cap is served, or the test above would
+        // pass for the wrong reason.
+        assert_eq!(
+            handle
+                .file_lines(
+                    &DiffSource::Unstaged {
+                        path: PathBytes::from("big.md")
+                    },
+                    b"big.md",
+                    1 << 16,
+                )
+                .expect("a file under the cap reads")
+                .len(),
+            1
+        );
+    }
+
+    /// Bytes that are not UTF-8 are shown rather than refused: a Latin-1
+    /// author name in a README is not a reason for a repository to look empty.
+    #[test]
+    fn a_file_that_is_not_utf8_is_still_read() {
+        let repo = Scratch::new("file-lines-latin1");
+        repo.write("NOTES.md", b"caf\xe9 and more\n");
+        let handle = repo.open();
+        let lines = handle
+            .file_lines(
+                &DiffSource::Untracked {
+                    path: PathBytes::from("NOTES.md"),
+                },
+                b"NOTES.md",
+                1 << 16,
+            )
+            .expect("lossy decoding reads it");
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].starts_with("caf"), "{:?}", lines[0]);
+    }
+
+    /// A side that is not there is an error and not an empty document:
+    /// "too large", "not there" and "empty file" are three sentences, and a
+    /// pane that shows a blank page for all three tells the reader nothing.
+    #[test]
+    fn a_missing_side_says_so_rather_than_answering_empty() {
+        let repo = Scratch::new("file-lines-missing");
+        repo.git(&["commit", "-q", "--allow-empty", "-m", "empty"]);
+        let handle = repo.open();
+        let err = handle
+            .file_lines(
+                &DiffSource::Untracked {
+                    path: PathBytes::from("nope.md"),
+                },
+                b"nope.md",
+                1 << 16,
+            )
+            .expect_err("a file that is not there is an error");
+        assert!(err.contains("nope.md"), "the error names no file: {err}");
     }
 }

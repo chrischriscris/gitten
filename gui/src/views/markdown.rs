@@ -272,6 +272,16 @@ impl MarkdownRows {
     }
 }
 
+/// Whether a path is one this presentation would take.
+///
+/// For anything that has to ask *before* there is a view — the shell deciding
+/// whether a keypress has a document to show. It delegates to the presentation
+/// rather than repeating the list, because two answers to "is this markdown"
+/// is how a file ends up rendered as rows with no document to show for it.
+pub(crate) fn claims(path: &str) -> bool {
+    MarkdownRows::default().claims(path)
+}
+
 impl Rows for MarkdownRows {
     fn claims(&self, path: &str) -> bool {
         // `rsplit` on the whole path, not the file name: a path with no dot in

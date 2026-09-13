@@ -57,9 +57,16 @@ rather than nine.
 | [0030](0030-window-before-acquisition.md) | The desktop opens its window before it acquires |
 | [0032](0032-blobs-are-shown-by-the-renderer.md) | Blobs are shown by the renderer that can draw them |
 | [0031](0031-the-sidebar-is-tabbed-sections.md) | The terminal sidebar is tabbed sections, not eight slices |
+| [0032](0032-a-markdown-document-pane.md) | A markdown file's diff is a document, in a pane of its own |
+| [0033](0033-the-pane-is-a-redline.md) | The document pane is a redline, not a preview |
 
 **0011 is deliberately absent.** It was a rendered-Markdown reader that was built,
 looked at, judged broken and parked in a `git stash` rather than deleted. The
 number is held for it so that recovering the stash needs no renumbering — which
 this file promises never happens. If the work is abandoned for good, this line is
 what should say so.
+
+That reader came back as [0032](0032-a-markdown-document-pane.md), which is a *pane*
+reached by a key on a file already on screen rather than a reader of its own. The
+number is still held: what it was reserved for is the stash's text, and that is
+still where it is.
