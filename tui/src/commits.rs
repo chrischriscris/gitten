@@ -48,7 +48,9 @@ use crate::screen::{Ink, Pen, Screen};
 use crate::scrollbar::{self, Bar};
 use gitten_core::graph::{lane_count, Hues, MAX_LANES};
 use gitten_core::host::Host;
+use gitten_core::list;
 use gitten_core::rebase::FixupKind;
+use gitten_core::runs::Run;
 use gitten_core::search::Index;
 use gitten_core::theme::{Rgb, Theme};
 use gitten_core::view::Viewport;
@@ -276,7 +278,7 @@ impl Commits {
         // Search text folded beside the rest of the load work, and the whole
         // list visible to start.
         let search = Index::new(&commits);
-        let visible = Vec::from_iter(0..commits.len());
+        let visible = list::identity(&commits);
         let mut view = Viewport::new();
         view.set_len(visible.len());
         Self {
@@ -327,7 +329,7 @@ impl Commits {
     /// position. Everything that acts on "this commit" — open-diff, copy —
     /// reads through here, which is why filtering cannot desync them.
     pub fn current(&self) -> Option<&Commit> {
-        self.commits.get(*self.visible.get(self.view.cursor())?)
+        list::shown(&self.commits, &self.visible, self.view.cursor())
     }
 
     /// Tells the pane which commits are on the cherry-pick clipboard, so a
@@ -374,7 +376,7 @@ impl Commits {
     /// range answers `None`; under a filter the visible table is what the
     /// eye marked, so this is the only honest way from one to the other.
     pub fn at(&self, row: usize) -> Option<&Commit> {
-        self.commits.get(*self.visible.get(row)?)
+        list::shown(&self.commits, &self.visible, row)
     }
 
     /// The whole loaded window, newest first, and the source index of
@@ -413,9 +415,11 @@ impl Commits {
     /// The filter while one stands, for a status line: `15/30` — hits over
     /// loaded. `None` unfiltered, so a note is only drawn when there is one.
     pub fn filter_note(&self) -> Option<String> {
-        self.query
-            .is_some()
-            .then(|| format!("{}/{}", self.visible.len(), self.commits.len()))
+        list::filter_note(
+            self.query.as_deref(),
+            self.visible.len(),
+            self.commits.len(),
+        )
     }
 
     /// Sets the filter — once per keystroke, and never anywhere else. The
@@ -432,8 +436,8 @@ impl Commits {
     /// rows of the *visible* list, and a range named against yesterday's table
     /// would read as different commits under today's.
     pub fn apply_query(&mut self, query: &str) {
-        let next = Some(query.trim()).filter(|q| !q.is_empty());
-        if self.query.as_deref() == next {
+        let next = list::normalize_query(query);
+        if self.query == next {
             return;
         }
         // Anchor first: named by sha, because row numbers are about to stop
@@ -444,7 +448,7 @@ impl Commits {
             .and_then(|&i| self.commits.get(i))
             .map(|c| c.sha.clone());
 
-        self.query = next.map(str::to_string);
+        self.query = next;
         self.refilter();
         self.sel = None;
         self.dragging = false;
@@ -473,7 +477,7 @@ impl Commits {
     fn refilter(&mut self) {
         self.visible = match &self.query {
             Some(q) => self.search.indices(q),
-            None => Vec::from_iter(0..self.commits.len()),
+            None => list::identity(&self.commits),
         };
         self.view.set_len(self.visible.len());
     }
@@ -487,8 +491,7 @@ impl Commits {
         if self.query.is_none() || self.visible.is_empty() {
             return;
         }
-        let len = self.visible.len() as isize;
-        let at = (self.view.cursor() as isize + by).rem_euclid(len) as usize;
+        let at = list::wrap_index(self.view.cursor(), by, self.visible.len());
         self.sel = None;
         self.view.go_to(at);
         self.extend_marks();
@@ -1074,6 +1077,138 @@ fn draws(commits: &[Commit], rows: &[GraphRow]) -> Vec<Draw> {
         });
     }
     out
+}
+
+/// The `view.*` vocabulary — the verbs are the inherent methods above; this
+/// impl is what [`run_view_commands`] routes them by name. `scroll_x` keeps
+/// its default no-op: the graph does not pan sideways.
+///
+/// [`run_view_commands`]: gitten_core::view::run_view_commands
+impl gitten_core::view::Scrollable for Commits {
+    fn down(&mut self) {
+        Commits::down(self);
+    }
+    fn up(&mut self) {
+        Commits::up(self);
+    }
+    fn page(&mut self, pages: isize) {
+        Commits::page(self, pages);
+    }
+    fn scroll_y(&mut self, rows: isize) {
+        Commits::scroll_y(self, rows);
+    }
+    fn to_top(&mut self) {
+        Commits::to_top(self);
+    }
+    fn to_bottom(&mut self) {
+        Commits::to_bottom(self);
+    }
+}
+
+/// The [`Pane`] half of the commit list — the tenant contract over the
+/// inherent methods above. `view.*` and `search.*` come from the provided
+/// `run`; what is this pane's alone is `select.mark`.
+impl crate::pane::Pane for Commits {
+    fn scrollable(&mut self) -> &mut dyn gitten_core::view::Scrollable {
+        self
+    }
+
+    fn mode(&self) -> &'static str {
+        "commits"
+    }
+
+    fn set_scrolloff(&mut self, rows: usize) {
+        Commits::set_scrolloff(self, rows);
+    }
+
+    fn resize(&mut self, cols: usize, height: usize, _host: &Host) {
+        Commits::resize(self, cols, height);
+    }
+
+    fn paint(
+        &self,
+        screen: &mut Screen,
+        x: usize,
+        y: usize,
+        focused: bool,
+        host: &Host,
+        _out: &mut Vec<Run>,
+    ) {
+        Commits::paint(self, screen, x, y, focused, host);
+    }
+
+    fn status(&self, _host: &Host) -> String {
+        Commits::status(self)
+    }
+
+    fn paint_bar(
+        &self,
+        screen: &mut Screen,
+        x: usize,
+        divider: Option<usize>,
+        y: usize,
+        host: &Host,
+    ) {
+        Commits::paint_bar(self, screen, x, divider, y, host);
+    }
+
+    fn press(&mut self, col: usize, row: usize, _clicks: u8, extend: bool, host: &Host) {
+        Commits::press(self, col, row, extend, host);
+    }
+
+    fn drag(&mut self, _col: usize, row: isize, host: &Host) {
+        Commits::drag(self, row, host);
+    }
+
+    fn release(&mut self) {
+        Commits::release(self);
+    }
+
+    fn copy_text(&self) -> String {
+        Commits::copy_text(self)
+    }
+
+    fn selection(&self) -> String {
+        Commits::selection(self)
+    }
+
+    fn select_all(&mut self) {
+        Commits::select_all(self);
+    }
+
+    fn select_none(&mut self) -> bool {
+        Commits::select_none(self)
+    }
+
+    fn search_query(&self) -> Option<&str> {
+        Commits::query(self)
+    }
+
+    fn search_note(&self) -> Option<String> {
+        Commits::filter_note(self)
+    }
+
+    fn search_edit(&mut self, query: &str) {
+        Commits::apply_query(self, query);
+    }
+
+    fn search_clear(&mut self) {
+        Commits::clear_search(self);
+    }
+
+    fn search_next(&mut self, by: isize) {
+        Commits::next_match(self, by);
+    }
+
+    fn verbs(&mut self, command: &str, _host: &Host) -> bool {
+        match command {
+            "select.mark" => {
+                Commits::select_mark(self);
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 #[cfg(test)]

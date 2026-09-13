@@ -16,7 +16,8 @@ use crate::chrome::{empty_line, list_row, path_spans, section_label};
 use crate::graph::ROW_H;
 use gitten_core::groups::StageFraction;
 use gitten_core::host::Host;
-use gitten_core::status::{Change, ConflictKind, PathBytes, Status};
+use gitten_core::list::{self, conflict_letters, Armed, Mark};
+use gitten_core::status::{PathBytes, Status};
 use gitten_core::theme::{Rgb, Surface};
 use gitten_core::view::Viewport;
 use gpui::prelude::FluentBuilder as _;
@@ -144,64 +145,6 @@ impl Section {
             Section::Untracked => t.chrome.faint,
             Section::Conflicts => t.chrome.error,
         }
-    }
-}
-
-/// What a status letter means. The mark owns the letter and nothing else —
-/// which side of the index the file sits on is the section's, and so is the
-/// colour: see [`Section::ink`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mark {
-    Add,
-    Modify,
-    Delete,
-    Rename,
-    TypeChange,
-    Untracked,
-    Conflict,
-}
-
-impl Mark {
-    /// From git's change letter set. A rename and a copy both mean "the index
-    /// matched content across two paths", and draw alike.
-    fn of(change: Change) -> Self {
-        match change {
-            Change::Added => Mark::Add,
-            Change::Modified => Mark::Modify,
-            Change::Deleted => Mark::Delete,
-            Change::Renamed | Change::Copied => Mark::Rename,
-            Change::TypeChanged => Mark::TypeChange,
-        }
-    }
-
-    /// The single letter git prints. Drawn from the theme, not spelled here.
-    fn letter(self) -> &'static str {
-        match self {
-            Mark::Add => "A",
-            Mark::Modify => "M",
-            Mark::Delete => "D",
-            Mark::Rename => "R",
-            Mark::TypeChange => "T",
-            // Known to no part of git: git itself prints `??`, and one honest
-            // glyph beats two.
-            Mark::Untracked => "?",
-            Mark::Conflict => "",
-        }
-    }
-}
-
-/// The two-letter state of a conflicted path, exactly as porcelain v2 spells
-/// it — who added and who deleted decides what resolving means, so the letters
-/// are data and not decoration.
-fn conflict_letters(state: ConflictKind) -> &'static str {
-    match state {
-        ConflictKind::BothDeleted => "DD",
-        ConflictKind::AddedByUs => "AU",
-        ConflictKind::DeletedByThem => "UD",
-        ConflictKind::AddedByThem => "UA",
-        ConflictKind::DeletedByUs => "DU",
-        ConflictKind::BothAdded => "AA",
-        ConflictKind::BothModified => "UU",
     }
 }
 
@@ -375,11 +318,29 @@ pub(crate) fn prepare(
     }
 }
 
+/// Which rows are furniture: a heading is a label over rows, not a place a
+/// verb can aim or the cursor can rest. The one judgment [`gitten_core::list`]'s
+/// helpers cannot make — which row is which is this pane's to say.
+fn is_heading(e: &Entry) -> bool {
+    matches!(e, Entry::Heading { .. })
+}
+
+/// What a query can match: a file's whole shown path — dir plus name, the
+/// string the row draws. A heading is never matched on its own; it survives
+/// a filter only while a file under it does, which [`list::search_rows`]
+/// already spells.
+fn entry_text(e: &Entry) -> Option<&str> {
+    match e {
+        Entry::File(f) => Some(&f.path_text),
+        _ => None,
+    }
+}
+
 /// Whether row `i` can hold the cursor: a file can, a heading cannot. The
 /// predicate [`Viewport::settle`] runs — the one thing about skipping headings
 /// that is this pane's to say.
 fn selectable(rows: &[Entry], i: usize) -> bool {
-    matches!(rows.get(i), Some(Entry::File(_)))
+    list::selectable(rows, is_heading, i)
 }
 
 /// One row of the directory-grouped projection the workspace sidebar draws:
@@ -472,39 +433,8 @@ fn settle(rows: &[Entry], v: &mut Viewport, from: usize) {
 /// and the cursor never rests on one either way.
 fn settle_shown(rows: &[Entry], visible: &[usize], v: &mut Viewport, from: usize) {
     v.settle(from, |i| {
-        visible.get(i).is_some_and(|&d| selectable(rows, d))
+        list::selectable_shown(rows, visible, is_heading, i)
     });
-}
-
-/// The one matcher, where the rows live: a query matches when the row's
-/// text contains it, folded — exactly what the commit list's search does.
-fn matches(haystack: &str, needle: &str) -> bool {
-    haystack.to_lowercase().contains(&needle.to_lowercase())
-}
-
-/// The rows a query keeps, as indices into `rows`: a file whose **path** —
-/// dir plus name, the whole string the row shows — matches, plus the
-/// heading of every section that still has a file under it, exactly the
-/// sections an empty one drops at flatten.
-fn search_rows(rows: &[Entry], query: &str) -> Vec<usize> {
-    let mut out = Vec::new();
-    let mut pending_heading = None;
-    for (i, entry) in rows.iter().enumerate() {
-        match entry {
-            Entry::Heading { .. } => {
-                pending_heading = Some(i);
-            }
-            Entry::File(f) => {
-                if matches(f.path_text.as_ref(), query) {
-                    if let Some(h) = pending_heading.take() {
-                        out.push(h);
-                    }
-                    out.push(i);
-                }
-            }
-        }
-    }
-    out
 }
 
 /// The working-tree pane. Holds flattened rows behind an `Rc`, so a refresh
@@ -542,7 +472,7 @@ pub struct Files {
     /// deliberate: the question still sits on the row it was asked about,
     /// and only a cursor move, a wheel or a refresh can make its answer
     /// stale — none of which is a focus change.
-    armed: Option<(Section, PathBytes)>,
+    armed: Armed<(Section, PathBytes)>,
     /// The distinct-path count from the last refresh — what the shell's FILES
     /// header prints. A property of the data, decided by [`prepare`] once and
     /// read for free however often a frame wants it.
@@ -608,7 +538,7 @@ impl Files {
             synced: Rc::new(Cell::new(0.0)),
             pending_scroll: PendingScroll::default(),
             rendered: Rc::new(Cell::new(0)),
-            armed: None,
+            armed: Armed::new(),
             focused: false,
             changed,
             counts: Rc::new(counts),
@@ -698,20 +628,15 @@ impl Files {
     /// furniture the query did not ask about. `None` unfiltered — the
     /// header then stays exactly what acquisition named it.
     pub fn filter_note(&self) -> Option<String> {
-        let files = |rows: &[Entry]| {
-            rows.iter()
-                .filter(|e| !matches!(e, Entry::Heading { .. }))
-                .count()
-        };
-        self.filter.is_some().then(|| {
-            let shown = self
-                .visible
-                .iter()
-                .filter_map(|&d| self.data.get(d))
-                .filter(|e| !matches!(e, Entry::Heading { .. }))
-                .count();
-            format!("{shown}/{}", files(&self.data))
-        })
+        self.filter.as_ref()?;
+        let shown = self
+            .visible
+            .iter()
+            .filter_map(|&d| self.data.get(d))
+            .filter(|e| !is_heading(e))
+            .count();
+        let total = self.data.iter().filter(|e| !is_heading(e)).count();
+        list::filter_note(self.filter.as_deref(), shown, total)
     }
 
     /// Replaces repository data while keeping the selection anchored to its
@@ -725,7 +650,7 @@ impl Files {
     pub(crate) fn replace_prepared(&mut self, prepared: Prepared, host: &Host) {
         // A refresh is the repository saying things moved; an armed discard
         // was a promise about how they were, so it dies here first.
-        self.armed = None;
+        self.armed.disarm();
         self.reconcile(host);
         let old = self.view.get();
         // Only a file anchors, and on its **section and path together**: the
@@ -756,8 +681,8 @@ impl Files {
         // the filter the user is looking through, and the anchor below is
         // found in this space, not in the full list's.
         self.visible = Rc::new(match &self.filter {
-            Some(q) => search_rows(&self.data, q),
-            None => Vec::from_iter(0..self.data.len()),
+            Some(q) => list::search_rows(&self.data, q, is_heading, entry_text),
+            None => list::identity(&self.data),
         });
         self.grouped = Rc::new(build_grouped(&self.data, &self.visible));
         let cursor = anchored
@@ -801,13 +726,13 @@ impl Files {
     /// the next prepaint, and writing an offset against it would clamp in
     /// the wrong place.
     pub fn apply_query(&mut self, query: &str) {
-        let next = Some(query.trim()).filter(|q| !q.is_empty());
-        if self.filter.as_deref() == next {
+        let next = list::normalize_query(query);
+        if self.filter.as_deref() == next.as_deref() {
             return;
         }
         // A changed filter can move the cursor by clamping, and a question
         // aimed at yesterday's row is the thing the arm exists to prevent.
-        self.armed = None;
+        self.armed.disarm();
         // Anchor first, on section and path together like every other
         // re-anchor in this file, because row numbers are about to stop
         // meaning anything.
@@ -820,10 +745,10 @@ impl Files {
             _ => None,
         };
 
-        self.filter = next.map(str::to_string);
+        self.filter = next;
         self.visible = Rc::new(match &self.filter {
-            Some(q) => search_rows(&self.data, q),
-            None => Vec::from_iter(0..self.data.len()),
+            Some(q) => list::search_rows(&self.data, q, is_heading, entry_text),
+            None => list::identity(&self.data),
         });
         self.grouped = Rc::new(build_grouped(&self.data, &self.visible));
 
@@ -910,7 +835,7 @@ impl Files {
         // The keyboard moved — including the two scrolls above, which leave
         // the cursor but not the question's row in view. Whatever was armed
         // was armed to what the keyboard used to be on.
-        self.armed = None;
+        self.armed.disarm();
         self.view.set(v);
         self.show(v);
         true
@@ -927,7 +852,7 @@ impl Files {
         settle_shown(&self.data, &self.visible, &mut v, index);
         // The mouse moved — whatever was armed was armed to what the mouse
         // used to be on.
-        self.armed = None;
+        self.armed.disarm();
         self.view.set(v);
         self.show(v);
     }
@@ -1003,23 +928,14 @@ impl Files {
     /// the new target and returns false again, so there is no state here a
     /// caller has to remember.
     pub(crate) fn confirm_or_arm_discard(&mut self, section: Section, path: &PathBytes) -> bool {
-        let already = matches!(
-            &self.armed,
-            Some((armed_section, armed_path))
-                if *armed_section == section && armed_path == path
-        );
-        self.armed = match already {
-            true => None,
-            false => Some((section, path.clone())),
-        };
-        already
+        self.armed.confirm_or_arm((section, path.clone()))
     }
 
     /// Whether a discard is waiting for its second press — the render's
     /// tint of the row the question is about.
     #[cfg(test)]
     pub(crate) fn armed_row(&self) -> Option<(Section, PathBytes)> {
-        self.armed.clone()
+        self.armed.get().cloned()
     }
 
     /// What `copy.selection` copies here: the row the keyboard is on, as git
@@ -1073,11 +989,12 @@ impl Render for Files {
         // The row an armed discard is waiting on, found once per frame in the
         // *shown* rows — the cursor's space — the tint a property of the
         // question, not of the draw.
-        let armed = self.armed.as_ref().and_then(|(section, path)| {
-            visible.iter().position(
-                |&d| matches!(&data[d], Entry::File(f) if f.section == *section && f.path == *path),
-            )
-        });
+        let armed = self.armed.position_in(
+            visible.iter().map(|&d| &data[d]),
+            |row, (section, path)| {
+                matches!(row, Entry::File(f) if f.section == *section && f.path == *path)
+            },
+        );
         let list = uniform_list("files", visible.len(), move |range, _, cx| {
             rendered.set(range.len());
             let host = crate::config::host(cx);

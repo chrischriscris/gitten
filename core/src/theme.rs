@@ -12,6 +12,7 @@
 //! matched so a lookup on the render path is one load.
 
 use crate::syntax::Kind;
+use crate::LineKind;
 
 /// Which background ink is drawn on. A single colour per class is not
 /// enough: the same grey that reads as a quiet comment on the
@@ -172,6 +173,28 @@ pub struct DiffPalette {
     /// appears: 1.25:1 against an addition and 1.20:1 against a removal, which
     /// is the same step the changed rows themselves get against context.
     pub absent_bg: Rgb,
+}
+
+impl DiffPalette {
+    /// Which background a line is drawn on, and the foreground and sign that
+    /// go with it. Shared by every presentation and every client so they
+    /// cannot drift on what "added" looks like.
+    ///
+    /// `moved` swaps the background and nothing else. The `+` and `-` stay, so
+    /// a column of signs is still scannable, and the foreground stays so a
+    /// moved block reads as ordinary text — which it is. Only the hue says
+    /// "you may skip this", which is how git's `--color-moved` does it too.
+    pub fn line_colors(&self, kind: LineKind, moved: bool) -> (Rgb, Rgb, &'static str) {
+        match (kind, moved) {
+            (LineKind::Added, false) => (self.added_bg, self.added_fg, "+"),
+            (LineKind::Added, true) => (self.moved_added_bg, self.added_fg, "+"),
+            (LineKind::Removed, false) => (self.removed_bg, self.removed_fg, "-"),
+            (LineKind::Removed, true) => (self.moved_removed_bg, self.removed_fg, "-"),
+            // Context is never moved: a line that did not change did not go
+            // anywhere, and `mark_moved` says so.
+            (LineKind::Context, _) => (self.context_bg, self.context_fg, " "),
+        }
+    }
 }
 
 /// The furniture a rendered Markdown row draws in place of the markers it hides.

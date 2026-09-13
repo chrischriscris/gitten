@@ -25,7 +25,9 @@
 use crate::screen::{Ink, Screen};
 use crate::scrollbar::{self, Bar};
 use gitten_core::host::Host;
+use gitten_core::list::{self, Armed};
 use gitten_core::refs::{Stash, StashId};
+use gitten_core::runs::Run;
 use gitten_core::search::TextIndex;
 use gitten_core::view::Viewport;
 
@@ -86,11 +88,12 @@ pub struct Stashes {
     /// The identity and not the number, because the number is what churns:
     /// a yes addressed to `stash@{1}` must never be spent on whatever
     /// `stash@{1}` became. One slot — arming a different row moves the
-    /// question, never queues two. Killed by any cursor move, any moving
+    /// question, never queues two — and that slot is the shared
+    /// [`Armed`]. Killed by any cursor move, any moving
     /// scroll, any mouse row change and any refresh; a focus round trip
     /// alone does not touch it, because the question sits on the row it was
     /// asked about.
-    armed: Option<StashId>,
+    armed: Armed<StashId>,
     dragging: bool,
 }
 
@@ -109,7 +112,7 @@ impl Stashes {
             view,
             cols: 0,
             bar: Bar::default(),
-            armed: None,
+            armed: Armed::new(),
             dragging: false,
         };
         this.reindex();
@@ -129,7 +132,7 @@ impl Stashes {
             view: Viewport::new(),
             cols: 0,
             bar: Bar::default(),
-            armed: None,
+            armed: Armed::new(),
             dragging: false,
         }
     }
@@ -138,7 +141,7 @@ impl Stashes {
     /// a row of the *filtered* list, and only the final lookup names a row of
     /// the source.
     fn row_at(&self, visual: usize) -> Option<&Row> {
-        self.rows.get(*self.visible.get(visual)?)
+        list::shown(&self.rows, &self.visible, visual)
     }
 
     /// Rebuilds the folded search texts against the rows as they stand.
@@ -156,7 +159,7 @@ impl Stashes {
     fn refilter(&mut self) {
         self.visible = match &self.query {
             Some(q) => self.search.indices(q),
-            None => Vec::from_iter(0..self.rows.len()),
+            None => list::identity(&self.rows),
         };
         self.view.set_len(self.visible.len());
     }
@@ -171,9 +174,7 @@ impl Stashes {
     /// The filter while one stands, for a status line: `2/5` — hits over
     /// parked. `None` unfiltered.
     pub fn filter_note(&self) -> Option<String> {
-        self.query
-            .is_some()
-            .then(|| format!("{}/{}", self.visible.len(), self.rows.len()))
+        list::filter_note(self.query.as_deref(), self.visible.len(), self.rows.len())
     }
 
     /// Sets the filter — once per keystroke, and never anywhere else. The
@@ -185,14 +186,14 @@ impl Stashes {
     /// nothing. An armed drop dies with a result set that changed, like any
     /// other refresh: the question was about a row of yesterday's list.
     pub fn apply_query(&mut self, query: &str) {
-        let next = Some(query.trim()).filter(|q| !q.is_empty());
-        if self.query.as_deref() == next {
+        let next = list::normalize_query(query);
+        if self.query == next {
             return;
         }
         let anchored = self.row_at(self.view.cursor()).map(|r| r.commit.clone());
-        self.query = next.map(str::to_string);
+        self.query = next;
         self.refilter();
-        self.armed = None;
+        self.armed.disarm();
         let cursor = anchored
             .and_then(|c| {
                 self.visible
@@ -210,9 +211,8 @@ impl Stashes {
         if self.query.is_none() || self.visible.is_empty() {
             return;
         }
-        let len = self.visible.len() as isize;
-        let at = (self.view.cursor() as isize + by).rem_euclid(len) as usize;
-        self.armed = None;
+        let at = list::wrap_index(self.view.cursor(), by, self.visible.len());
+        self.armed.disarm();
         self.view.go_to(at);
     }
 
@@ -235,7 +235,7 @@ impl Stashes {
     /// A successful read, empty or not, also clears the unavailable state —
     /// the recovery path of a pane that opened on a failed side read.
     pub fn replace(&mut self, stashes: Vec<Stash>) {
-        self.armed = None;
+        self.armed.disarm();
         self.dragging = false;
         self.available = true;
         let (cursor, top) = (self.view.cursor(), self.view.top());
@@ -316,7 +316,7 @@ impl Stashes {
     /// disarm that fires once too often costs a second press, while one
     /// that fires once too late costs a stash.
     pub fn move_by(&mut self, by: isize) {
-        self.armed = None;
+        self.armed.disarm();
         self.view.move_by(by);
     }
 
@@ -329,7 +329,7 @@ impl Stashes {
     }
 
     pub fn page(&mut self, pages: isize) {
-        self.armed = None;
+        self.armed.disarm();
         self.view.page(pages);
     }
 
@@ -340,17 +340,17 @@ impl Stashes {
         let before = self.view.top();
         self.view.pan_by(by);
         if self.view.top() != before {
-            self.armed = None;
+            self.armed.disarm();
         }
     }
 
     pub fn to_top(&mut self) {
-        self.armed = None;
+        self.armed.disarm();
         self.view.to_top();
     }
 
     pub fn to_bottom(&mut self) {
-        self.armed = None;
+        self.armed.disarm();
         self.view.to_bottom();
     }
 
@@ -405,17 +405,11 @@ impl Stashes {
     /// if one stands, was asked about the row it stood on. Different rows,
     /// no question.
     fn disarm_if_row_moved(&mut self, index: usize) {
-        let at = self
-            .visible
-            .get(index)
-            .and_then(|&r| self.rows.get(r))
-            .map(|r| StashId {
-                index: r.index,
-                commit: r.commit.clone(),
-            });
-        if self.armed.is_some() && self.armed != at {
-            self.armed = None;
-        }
+        let at = self.row_at(index).map(|r| StashId {
+            index: r.index,
+            commit: r.commit.clone(),
+        });
+        self.armed.disarm_unless(at.as_ref());
     }
 
     /// Arms — or confirms — a drop of this exact entry. First call on a
@@ -430,12 +424,7 @@ impl Stashes {
     /// disarms unconditionally on top of that — belt and braces, and the
     /// cheaper of the two to be sure about.
     pub fn confirm_or_arm_drop(&mut self, id: &StashId) -> bool {
-        let already = self.armed.as_ref() == Some(id);
-        self.armed = match already {
-            true => None,
-            false => Some(id.clone()),
-        };
-        already
+        self.armed.confirm_or_arm(id.clone())
     }
 
     // ------------------------------------------------------- copy and selection
@@ -444,10 +433,7 @@ impl Stashes {
     /// would spell it — the address, then the message. Empty on an empty or
     /// unavailable stack, because there is nothing to name.
     pub fn copy_text(&self) -> String {
-        match self
-            .current()
-            .and_then(|_| self.rows.get(self.view.cursor()))
-        {
+        match self.current().and_then(|_| self.row_at(self.view.cursor())) {
             Some(r) => format!("{} {}", r.title, r.message),
             None => String::new(),
         }
@@ -527,7 +513,7 @@ impl Stashes {
                 let address = Ink::new(theme.chrome.dim, bg);
                 let armed = self
                     .armed
-                    .as_ref()
+                    .get()
                     .is_some_and(|id| id.index == r.index && id.commit == r.commit);
                 let body = Ink::new(
                     match armed {
@@ -579,6 +565,31 @@ impl Stashes {
     }
 }
 
+/// The `view.*` vocabulary — the verbs themselves are the inherent methods
+/// above; this impl is what [`run_view_commands`] routes them by name.
+///
+/// [`run_view_commands`]: gitten_core::view::run_view_commands
+impl gitten_core::view::Scrollable for Stashes {
+    fn down(&mut self) {
+        Stashes::down(self);
+    }
+    fn up(&mut self) {
+        Stashes::up(self);
+    }
+    fn page(&mut self, pages: isize) {
+        Stashes::page(self, pages);
+    }
+    fn scroll_y(&mut self, rows: isize) {
+        Stashes::scroll_y(self, rows);
+    }
+    fn to_top(&mut self) {
+        Stashes::to_top(self);
+    }
+    fn to_bottom(&mut self) {
+        Stashes::to_bottom(self);
+    }
+}
+
 /// Flattens the stack into display rows, newest first as the read gives it.
 fn flatten(stashes: &[Stash]) -> Vec<Row> {
     stashes
@@ -590,6 +601,101 @@ fn flatten(stashes: &[Stash]) -> Vec<Row> {
             message: s.message.clone(),
         })
         .collect()
+}
+/// The [`Pane`] half of the stash stack — the tenant contract over the inherent
+/// methods above. `view.*` and `search.*` come from the provided `run`;
+/// this pane has no verbs of its own to add.
+impl crate::pane::Pane for Stashes {
+    fn scrollable(&mut self) -> &mut dyn gitten_core::view::Scrollable {
+        self
+    }
+
+    fn mode(&self) -> &'static str {
+        "stashes"
+    }
+
+    fn set_scrolloff(&mut self, rows: usize) {
+        Stashes::set_scrolloff(self, rows);
+    }
+
+    fn resize(&mut self, cols: usize, height: usize, _host: &Host) {
+        Stashes::resize(self, cols, height);
+    }
+
+    fn paint(
+        &self,
+        screen: &mut Screen,
+        x: usize,
+        y: usize,
+        focused: bool,
+        host: &Host,
+        _out: &mut Vec<Run>,
+    ) {
+        Stashes::paint(self, screen, x, y, focused, host);
+    }
+
+    fn status(&self, _host: &Host) -> String {
+        Stashes::status(self)
+    }
+
+    fn paint_bar(
+        &self,
+        screen: &mut Screen,
+        x: usize,
+        divider: Option<usize>,
+        y: usize,
+        host: &Host,
+    ) {
+        Stashes::paint_bar(self, screen, x, divider, y, host);
+    }
+
+    fn press(&mut self, col: usize, row: usize, _clicks: u8, extend: bool, host: &Host) {
+        Stashes::press(self, col, row, extend, host);
+    }
+
+    fn drag(&mut self, _col: usize, row: isize, host: &Host) {
+        Stashes::drag(self, row, host);
+    }
+
+    fn release(&mut self) {
+        Stashes::release(self);
+    }
+
+    fn copy_text(&self) -> String {
+        Stashes::copy_text(self)
+    }
+
+    fn selection(&self) -> String {
+        Stashes::selection(self)
+    }
+
+    fn select_all(&mut self) {
+        Stashes::select_all(self);
+    }
+
+    fn select_none(&mut self) -> bool {
+        Stashes::select_none(self)
+    }
+
+    fn search_query(&self) -> Option<&str> {
+        Stashes::query(self)
+    }
+
+    fn search_note(&self) -> Option<String> {
+        Stashes::filter_note(self)
+    }
+
+    fn search_edit(&mut self, query: &str) {
+        Stashes::apply_query(self, query);
+    }
+
+    fn search_clear(&mut self) {
+        Stashes::clear_search(self);
+    }
+
+    fn search_next(&mut self, by: isize) {
+        Stashes::next_match(self, by);
+    }
 }
 
 #[cfg(test)]
@@ -770,18 +876,18 @@ mod tests {
         // First press asks; second press on the same row acts, and the act
         // spends the arm.
         assert!(!v.confirm_or_arm_drop(&tall_id(0)));
-        assert_eq!(v.armed, Some(tall_id(0)));
+        assert_eq!(v.armed.get(), Some(&tall_id(0)));
         assert!(v.confirm_or_arm_drop(&tall_id(0)));
-        assert_eq!(v.armed, None);
+        assert_eq!(v.armed.get(), None);
 
         // A different row re-arms rather than inheriting the question.
         assert!(!v.confirm_or_arm_drop(&tall_id(1)));
-        assert_eq!(v.armed, Some(tall_id(1)));
+        assert_eq!(v.armed.get(), Some(&tall_id(1)));
         assert!(
             !v.confirm_or_arm_drop(&tall_id(0)),
             "another row asks again"
         );
-        assert_eq!(v.armed, Some(tall_id(0)));
+        assert_eq!(v.armed.get(), Some(&tall_id(0)));
 
         // The same *number* under a different commit is a different entry,
         // and asks again — which is the whole reason the arm holds the
@@ -795,38 +901,38 @@ mod tests {
             !v.confirm_or_arm_drop(&inherited),
             "a stale yes was not spent on the entry that inherited the number"
         );
-        assert_eq!(v.armed, Some(inherited));
+        assert_eq!(v.armed.get(), Some(&inherited));
 
         // A keyboard move disarms: the question was about the row that was
         // under the keyboard.
         v.confirm_or_arm_drop(&tall_id(0));
         v.down();
-        assert_eq!(v.armed, None);
+        assert_eq!(v.armed.get(), None);
         // ...a wheel that actually moved the list...
         v.confirm_or_arm_drop(&tall_id(0));
         v.scroll_y(3);
-        assert_eq!(v.armed, None, "a moving scroll disarms");
+        assert_eq!(v.armed.get(), None, "a moving scroll disarms");
         // ...a press on another row...
         v.confirm_or_arm_drop(&tall_id(0));
         v.press(3, 2, false, &host);
-        assert_eq!(v.armed, None, "a mouse row change disarms");
+        assert_eq!(v.armed.get(), None, "a mouse row change disarms");
         // ...and a refresh, unconditionally: indices renumber under a drop,
         // and belt beats braces on the one question that destroys work.
         v.confirm_or_arm_drop(&tall_id(0));
         v.replace(stack());
-        assert_eq!(v.armed, None, "a refresh disarms");
+        assert_eq!(v.armed.get(), None, "a refresh disarms");
         v.replace(tall_stack());
 
         // A click on the armed row itself is neither an answer nor a re-ask.
         v.confirm_or_arm_drop(&tall_id(0));
         v.press(3, 0, false, &host);
-        assert_eq!(v.armed, Some(tall_id(0)));
+        assert_eq!(v.armed.get(), Some(&tall_id(0)));
 
         // Merely painting the pane unfocused, then focused — the focus round
         // trip — moves nothing: the question sits on its row.
         let mut screen = Screen::new(44, 6);
         v.paint(&mut screen, 0, 0, false, &host);
-        assert_eq!(v.armed, Some(tall_id(0)));
+        assert_eq!(v.armed.get(), Some(&tall_id(0)));
         // The armed row wears the error ink with the keyboard *elsewhere*:
         // the address keeps its furniture ink, the message is the thing
         // being asked about, and neither waits for focus.
@@ -835,8 +941,8 @@ mod tests {
         assert_eq!(screen.ink(11, 0).unwrap().fg, c.error);
         v.paint(&mut screen, 0, 0, true, &host);
         assert_eq!(
-            v.armed,
-            Some(tall_id(0)),
+            v.armed.get(),
+            Some(&tall_id(0)),
             "the focus round trip moved nothing"
         );
         assert_eq!(screen.ink(11, 0).unwrap().fg, c.error);

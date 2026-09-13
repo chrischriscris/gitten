@@ -62,9 +62,9 @@
 //! decided at load and is a `Copy` field read out of a `Vec`.
 
 use super::diff::{
-    column_at, columns, file_header, header_hit, hunk_header, hunk_hit, into_text, line_colors,
-    num, row_bar, row_frame, scrolled, selected, slice, Hit, RowState, Rows, Scratch, PAD, ROW_BAR,
-    ROW_H, SIGN_W, TEXT_CHROME,
+    column_at, columns, file_header, header_hit, hunk_header, hunk_hit, into_text, num, row_bar,
+    row_frame, scrolled, selected, slice, Hit, RowState, Rows, Scratch, PAD, ROW_BAR, ROW_H,
+    SIGN_W, TEXT_CHROME,
 };
 use gitten_core::host::Host;
 use gitten_core::markdown::{Bar, Block, DocRow, Document};
@@ -448,7 +448,7 @@ impl MarkdownRows {
         // steps, a bullet slot, a rule, a grid. The drawing below only turns
         // each into pixels.
         let f = block.furniture();
-        let (bg, fg, sign) = line_colors(line.kind, line.moved, &theme.diff);
+        let (bg, fg, sign) = theme.diff.line_colors(line.kind, line.moved);
         // The keyboard's row, on prose exactly as on source: the same helper
         // every presentation goes through, so a paragraph cannot be the one row
         // that hides the cursor.

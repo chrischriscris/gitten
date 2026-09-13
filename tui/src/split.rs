@@ -38,8 +38,7 @@
 //! the rest, which is the same thing it already draws opposite a lone addition.
 
 use crate::rows::{
-    col_at, digits, file_header, header_hit, hunk_header, line_colors, number, row_bg, text_run,
-    Frame, Rows,
+    col_at, digits, file_header, header_hit, hunk_header, number, row_bg, text_run, Frame, Rows,
 };
 use crate::screen::{self, Ink, Pen};
 use crate::MIN_WRAP_COLS;
@@ -185,7 +184,7 @@ impl SplitRows {
             return;
         };
         let l = &self.lines[index as usize];
-        let (own, fg, sign) = line_colors(l.kind, l.moved, p);
+        let (own, fg, sign) = p.line_colors(l.kind, l.moved);
         let bg = row_bg(own, at);
         let row_ink = Ink::new(fg, bg);
         let gutter = Ink::new(p.gutter_fg, bg);

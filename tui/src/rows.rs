@@ -37,7 +37,7 @@ use gitten_core::rows::{Entry, Flat, Present, Row};
 use gitten_core::runs::{runs, Run};
 use gitten_core::select::{Hit, Selected};
 use gitten_core::syntax::Token;
-use gitten_core::theme::{DiffPalette, Rgb, Style, Surface, Theme};
+use gitten_core::theme::{Rgb, Style, Surface, Theme};
 use gitten_core::wrap::Wrap;
 use gitten_core::{LineKind, Span};
 use std::ops::Range;
@@ -359,19 +359,9 @@ pub fn row_bg(own: Rgb, at: &Frame) -> Rgb {
     }
 }
 
-/// The background, foreground and sign of a line of this kind.
-///
-/// The `+` and `-` survive a move, deliberately: a moved block recedes in colour
-/// so the eye can skip it, but the columns still have to scan.
-pub fn line_colors(kind: LineKind, moved: bool, p: &DiffPalette) -> (Rgb, Rgb, &'static str) {
-    match (kind, moved) {
-        (LineKind::Added, false) => (p.added_bg, p.added_fg, "+"),
-        (LineKind::Added, true) => (p.moved_added_bg, p.added_fg, "+"),
-        (LineKind::Removed, false) => (p.removed_bg, p.removed_fg, "-"),
-        (LineKind::Removed, true) => (p.moved_removed_bg, p.removed_fg, "-"),
-        (LineKind::Context, _) => (p.context_bg, p.context_fg, " "),
-    }
-}
+// The background, foreground and sign of a line of this kind are
+// `DiffPalette::line_colors`' — the palette owns the policy, so a client cannot
+// drift on what "added" looks like.
 
 /// Draws one line's text, styled, from `at.start` of the line to `at.end`.
 ///
@@ -673,7 +663,7 @@ impl Rows for TextRows {
             Row::File { path, adds, dels } => file_header(path, *adds, *dels, at, pen),
             Row::Hunk(header) => hunk_header(header, at, pen),
             Row::Line(l) => {
-                let (own, fg, sign) = line_colors(l.kind, l.moved, p);
+                let (own, fg, sign) = p.line_colors(l.kind, l.moved);
                 let bg = row_bg(own, at);
                 let row_ink = Ink::new(fg, bg);
                 let gutter = Ink::new(p.gutter_fg, bg);

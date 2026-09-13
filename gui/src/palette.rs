@@ -240,6 +240,7 @@ mod tests {
             name: name.into(),
             doc: doc.into(),
             hint: None,
+            mutates: false,
         }
     }
 

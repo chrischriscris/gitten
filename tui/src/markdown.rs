@@ -14,7 +14,8 @@
 //! Right-aligned old/new numbers through
 //! [`Theme::gutter_on`](gitten_core::theme::Theme::gutter_on), the sign, this
 //! block's furniture, then text. Row backgrounds and signs are
-//! [`line_colors`](crate::rows::line_colors); token pieces are
+//! [`DiffPalette::line_colors`](gitten_core::theme::DiffPalette::line_colors);
+//! token pieces are
 //! [`Theme::syntax_on`](gitten_core::theme::Theme::syntax_on) through the same
 //! runs sweep the built-in uses; marker, bar and rule colours come from
 //! `theme.markdown`. A heading is bold, because cells cannot change point size
@@ -42,8 +43,8 @@
 //! overflowing the grid.
 
 use crate::rows::{
-    col_at, digits, draw_runs, file_header, header_hit, hunk_header, line_colors, number, row_bg,
-    Override, Rows, Text, MIN_DIGITS,
+    col_at, digits, draw_runs, file_header, header_hit, hunk_header, number, row_bg, Override,
+    Rows, Text, MIN_DIGITS,
 };
 use crate::screen::{self, Ink, Pen};
 use crate::MIN_WRAP_COLS;
@@ -203,7 +204,7 @@ impl Rows for MarkdownRows {
             DocRow::Hunk(header) => hunk_header(header, at, pen),
             DocRow::Line { block, line } => {
                 let p = &theme.diff;
-                let (own, fg, sign) = line_colors(line.kind, line.moved, p);
+                let (own, fg, sign) = p.line_colors(line.kind, line.moved);
                 let bg = row_bg(own, at);
                 let row_ink = Ink::new(fg, bg);
                 let gutter = Ink::new(p.gutter_fg, bg);

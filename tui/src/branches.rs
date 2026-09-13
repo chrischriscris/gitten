@@ -23,7 +23,9 @@
 use crate::screen::{width, Ink, Pen, Screen};
 use crate::scrollbar::{self, Bar};
 use gitten_core::host::Host;
+use gitten_core::list::{self, Armed};
 use gitten_core::refs::{Branch, HeadState, RefName, RemoteBranch, Upstream};
+use gitten_core::runs::Run;
 use gitten_core::search::TextIndex;
 use gitten_core::theme::Rgb;
 use gitten_core::view::Viewport;
@@ -239,10 +241,12 @@ pub fn prepare(
     }
     Prepared {
         rows,
-        label: format!(
-            "{describe} · {} local · {} remote",
-            local.len(),
-            remotes.len()
+        label: list::label(
+            describe,
+            [
+                format!("{} local", local.len()),
+                format!("{} remote", remotes.len()),
+            ],
         ),
     }
 }
@@ -254,13 +258,13 @@ pub fn prepare(
 /// registered and still refreshes — the next successful read replaces both the
 /// rows and this sentence.
 pub fn unavailable_label(describe: &str) -> String {
-    format!("{describe} · branches unavailable")
+    list::label(describe, ["branches unavailable"])
 }
 
 /// What an armed delete asks, once, on the status line — the window's exact
 /// sentence, because the confirmation pattern is the window's too.
 pub fn delete_question(shown: &str) -> String {
-    format!("delete branch {shown}? press again to confirm")
+    list::question(&format!("delete branch {shown}"))
 }
 
 /// Whether a row's verb target is an arm's, matched by borrow — field
@@ -296,6 +300,14 @@ fn row_target(row: &Row) -> Option<Target> {
 /// verb aimed at one has nowhere to go.
 fn selectable(row: Option<&Row>) -> bool {
     !matches!(row, Some(Row::Heading { .. }))
+}
+
+impl Row {
+    /// Whether this row is furniture — the [`list::selectable`] half the
+    /// shared helpers ask for.
+    fn is_heading(&self) -> bool {
+        matches!(self, Row::Heading { .. })
+    }
 }
 
 /// The branches pane: flattened rows, a viewport, and the delete that is
@@ -337,11 +349,18 @@ pub struct Branches {
     /// every *attention* change and every change of the data under it: a
     /// cursor move, a wheel, a mouse move to another row, a prompt opening,
     /// a config reload, a refresh. Losing the keyboard alone does none of
-    /// those things.
-    armed: Option<Target>,
+    /// those things. The slot itself is the shared [`Armed`].
+    armed: Armed<Target>,
     /// How many of the rows are selectable — the status line's denominator,
     /// counted by the same pass that numbers them.
     total: usize,
+    /// A degraded read's account, parked until the wave that produced it has
+    /// landed — the loader's
+    /// [`gitten_app::acquire::LoadedBranches::warning`], carried so the shell
+    /// can hand it to the status line once, the same trade the window makes
+    /// with its notice band. `None` is a clean load, which is what makes a
+    /// take worth saying.
+    warning: Option<String>,
 }
 
 impl Branches {
@@ -371,11 +390,26 @@ impl Branches {
             cols: 0,
             bar: Bar::default(),
             marks,
-            armed: None,
+            armed: Armed::new(),
             total,
+            warning: None,
         };
         this.reindex();
         this
+    }
+
+    /// Parks a degraded read's account until the wave has landed — the
+    /// shell takes it once, for the status line. Called on every refresh,
+    /// clean ones included: parking `None` is how a stale account dies
+    /// rather than surfacing a wave late.
+    pub fn set_warning(&mut self, warning: Option<String>) {
+        self.warning = warning;
+    }
+
+    /// The parked account, drained — every take is the status line's one
+    /// chance to say it, so a second take finds nothing.
+    pub fn take_warning(&mut self) -> Option<String> {
+        self.warning.take()
     }
 
     /// How many columns the pane draws into, and how many rows it shows.
@@ -409,9 +443,7 @@ impl Branches {
     /// cursor move and every refresh, so the cursor never rests on a heading.
     fn settle(&mut self, from: usize) {
         self.view.settle(from, |i| {
-            self.visible
-                .get(i)
-                .is_some_and(|&r| selectable(self.rows.get(r)))
+            list::selectable_shown(&self.rows, &self.visible, Row::is_heading, i)
         });
     }
 
@@ -419,7 +451,7 @@ impl Branches {
     /// a row of the *filtered* list, and only the final lookup names a row of
     /// the source.
     fn row_at(&self, visual: usize) -> Option<&Row> {
-        self.rows.get(*self.visible.get(visual)?)
+        list::shown(&self.rows, &self.visible, visual)
     }
 
     /// Rebuilds the folded search texts against the rows as they stand. A
@@ -440,7 +472,7 @@ impl Branches {
     fn refilter(&mut self) {
         self.visible = match &self.query {
             Some(q) => self.search.indices(q),
-            None => Vec::from_iter(0..self.rows.len()),
+            None => list::identity(&self.rows),
         };
         self.view.set_len(self.visible.len());
     }
@@ -455,9 +487,7 @@ impl Branches {
     /// The filter while one stands, for a status line: `15/30` — hits over
     /// refs. `None` unfiltered.
     pub fn filter_note(&self) -> Option<String> {
-        self.query
-            .is_some()
-            .then(|| format!("{}/{}", self.visible.len(), self.total))
+        list::filter_note(self.query.as_deref(), self.visible.len(), self.total)
     }
 
     /// Sets the filter — once per keystroke, and never anywhere else. The
@@ -470,14 +500,14 @@ impl Branches {
     /// An armed delete dies with a result set that changed, like any other
     /// refresh: the question was about a row of yesterday's list.
     pub fn apply_query(&mut self, query: &str) {
-        let next = Some(query.trim()).filter(|q| !q.is_empty());
-        if self.query.as_deref() == next {
+        let next = list::normalize_query(query);
+        if self.query == next {
             return;
         }
         let anchored = self.row_at(self.view.cursor()).and_then(row_target);
-        self.query = next.map(str::to_string);
+        self.query = next;
         self.refilter();
-        self.armed = None;
+        self.armed.disarm();
         let cursor = anchored
             .and_then(|target| {
                 self.visible.iter().position(|&r| {
@@ -497,9 +527,8 @@ impl Branches {
         if self.query.is_none() || self.visible.is_empty() {
             return;
         }
-        let len = self.visible.len() as isize;
-        let at = (self.view.cursor() as isize + by).rem_euclid(len) as usize;
-        self.armed = None;
+        let at = list::wrap_index(self.view.cursor(), by, self.visible.len());
+        self.armed.disarm();
         self.view.go_to(at);
     }
 
@@ -520,7 +549,7 @@ impl Branches {
     /// A refresh is the repository saying things moved; an armed delete was a
     /// a promise about how they were, so it dies here first.
     pub fn replace(&mut self, rows: Vec<Row>) {
-        self.armed = None;
+        self.armed.disarm();
         let old = self.view;
         let anchored = match self.rows.get(old.cursor()) {
             Some(r) => row_target(r),
@@ -566,12 +595,7 @@ impl Branches {
     /// re-arms onto the new target and returns false again, so there is no
     /// state here a caller has to remember.
     pub fn confirm_or_arm_delete(&mut self, target: &Target) -> bool {
-        let already = self.armed.as_ref() == Some(target);
-        self.armed = match already {
-            true => None,
-            false => Some(target.clone()),
-        };
-        already
+        self.armed.confirm_or_arm(target.clone())
     }
 
     /// Drops the question, whatever it was about — what the app calls when
@@ -580,22 +604,20 @@ impl Branches {
     /// one: a round-trip across the ring leaves the question standing on the
     /// row it was asked about, the window's contract.
     pub fn disarm(&mut self) {
-        self.armed = None;
+        self.armed.disarm();
     }
 
     /// Whether a delete is waiting for its second press — the paint's tint
     /// of the row the question is about, and the tests' window on it.
     pub fn armed_row(&self) -> Option<Target> {
-        self.armed.clone()
+        self.armed.get().cloned()
     }
 
     /// The row an armed delete sits on, found per frame — the tint is a
     /// property of the question, not of the draw. By borrow: a search that
     /// runs per frame allocates nothing.
     fn armed_index(&self) -> Option<usize> {
-        self.armed
-            .as_ref()
-            .and_then(|target| self.rows.iter().position(|r| row_targets(r, target)))
+        self.armed.position_in(self.rows.iter(), row_targets)
     }
 
     // -------------------------------------------------------------- commands
@@ -607,7 +629,7 @@ impl Branches {
         let from = self.view.cursor();
         self.view.move_by(by);
         self.settle(from);
-        self.armed = None;
+        self.armed.disarm();
     }
 
     pub fn down(&mut self) {
@@ -622,26 +644,26 @@ impl Branches {
         let from = self.view.cursor();
         self.view.page(pages);
         self.settle(from);
-        self.armed = None;
+        self.armed.disarm();
     }
 
     /// Scrolls the viewport without moving the cursor — the wheel.
     /// Also a move of attention, and it disarms like one.
     pub fn scroll_y(&mut self, by: isize) {
         self.view.pan_by(by);
-        self.armed = None;
+        self.armed.disarm();
     }
 
     pub fn to_top(&mut self) {
         self.view.to_top();
         self.settle(0);
-        self.armed = None;
+        self.armed.disarm();
     }
 
     pub fn to_bottom(&mut self) {
         self.view.to_bottom();
         self.settle(self.visible.len().saturating_sub(1));
-        self.armed = None;
+        self.armed.disarm();
     }
 
     /// A press in the list: the cursor moves there. `extend` is accepted for
@@ -659,8 +681,8 @@ impl Branches {
         let from = self.view.cursor();
         self.view.go_to(index);
         self.settle(from);
-        if self.armed.is_some() && Some(self.view.cursor()) != armed_on {
-            self.armed = None;
+        if self.armed.is_armed() && Some(self.view.cursor()) != armed_on {
+            self.armed.disarm();
         }
     }
 
@@ -877,6 +899,123 @@ impl Branches {
                 pen.wash(ink);
             }
         }
+    }
+}
+
+/// The `view.*` vocabulary — the verbs themselves are the inherent methods
+/// above; this impl is what [`run_view_commands`] routes them by name.
+///
+/// [`run_view_commands`]: gitten_core::view::run_view_commands
+impl gitten_core::view::Scrollable for Branches {
+    fn down(&mut self) {
+        Branches::down(self);
+    }
+    fn up(&mut self) {
+        Branches::up(self);
+    }
+    fn page(&mut self, pages: isize) {
+        Branches::page(self, pages);
+    }
+    fn scroll_y(&mut self, rows: isize) {
+        Branches::scroll_y(self, rows);
+    }
+    fn to_top(&mut self) {
+        Branches::to_top(self);
+    }
+    fn to_bottom(&mut self) {
+        Branches::to_bottom(self);
+    }
+}
+
+/// The [`Pane`] half of the branches pane — the tenant contract over the inherent
+/// methods above. `view.*` and `search.*` come from the provided `run`;
+/// this pane has no verbs of its own to add — `take_warning` is how a degraded read reaches the status line.
+impl crate::pane::Pane for Branches {
+    fn scrollable(&mut self) -> &mut dyn gitten_core::view::Scrollable {
+        self
+    }
+
+    fn mode(&self) -> &'static str {
+        "branches"
+    }
+
+    fn set_scrolloff(&mut self, rows: usize) {
+        Branches::set_scrolloff(self, rows);
+    }
+
+    fn resize(&mut self, cols: usize, height: usize, _host: &Host) {
+        Branches::resize(self, cols, height);
+    }
+
+    fn paint(
+        &self,
+        screen: &mut Screen,
+        x: usize,
+        y: usize,
+        focused: bool,
+        host: &Host,
+        _out: &mut Vec<Run>,
+    ) {
+        Branches::paint(self, screen, x, y, focused, host);
+    }
+
+    fn status(&self, _host: &Host) -> String {
+        Branches::status(self)
+    }
+
+    fn paint_bar(
+        &self,
+        screen: &mut Screen,
+        x: usize,
+        divider: Option<usize>,
+        y: usize,
+        host: &Host,
+    ) {
+        Branches::paint_bar(self, screen, x, divider, y, host);
+    }
+
+    fn press(&mut self, col: usize, row: usize, _clicks: u8, extend: bool, host: &Host) {
+        Branches::press(self, col, row, extend, host);
+    }
+
+    fn copy_text(&self) -> String {
+        Branches::copy_text(self)
+    }
+
+    fn selection(&self) -> String {
+        Branches::selection(self)
+    }
+
+    fn select_all(&mut self) {
+        Branches::select_all(self);
+    }
+
+    fn select_none(&mut self) -> bool {
+        Branches::select_none(self)
+    }
+
+    fn search_query(&self) -> Option<&str> {
+        Branches::query(self)
+    }
+
+    fn search_note(&self) -> Option<String> {
+        Branches::filter_note(self)
+    }
+
+    fn search_edit(&mut self, query: &str) {
+        Branches::apply_query(self, query);
+    }
+
+    fn search_clear(&mut self) {
+        Branches::clear_search(self);
+    }
+
+    fn search_next(&mut self, by: isize) {
+        Branches::next_match(self, by);
+    }
+
+    fn take_warning(&mut self) -> Option<String> {
+        Branches::take_warning(self)
     }
 }
 

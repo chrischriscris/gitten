@@ -14,6 +14,7 @@ use super::{accept_deferred_scroll, vertical_scrollbar, DeferredScrollbar, Pendi
 use crate::chrome::{empty_line, list_row};
 use crate::graph::ROW_H;
 use gitten_core::host::Host;
+use gitten_core::list::{self, Armed};
 use gitten_core::refs::Stash;
 use gitten_core::theme;
 use gitten_core::view::Viewport;
@@ -88,26 +89,17 @@ pub(crate) fn prepare(stashes: &[Stash], describe: &str) -> Prepared {
 /// honest name here: dropping `stash@{0}` means *the top*, whatever it says
 /// about itself.
 pub(crate) fn drop_question(shown: &str) -> String {
-    format!("drop {shown}? press again to confirm")
+    list::question(&format!("drop {shown}"))
+}
+
+/// What a query can match: the entry's message — what it says about itself.
+/// The list is flat, so [`list::search_rows`] gets no furniture judgment.
+fn row_text(r: &Row) -> Option<&str> {
+    Some(&r.message)
 }
 
 /// The stash pane. Holds flattened rows behind an `Rc`, so a refresh swaps
 /// one refcount instead of mutating what a frame may be reading.
-/// The rows a query keeps, as indices into `rows`: a stash whose message
-/// matches. The list is flat — no headings to carry.
-fn search_rows(rows: &[Row], query: &str) -> Vec<usize> {
-    rows.iter()
-        .enumerate()
-        .filter_map(|(i, r)| matches(r.message.as_ref(), query).then_some(i))
-        .collect()
-}
-
-/// The one matcher, where the rows live: a query matches when the row's
-/// text contains it, folded — exactly what the commit list's search does.
-fn matches(haystack: &str, needle: &str) -> bool {
-    haystack.to_lowercase().contains(&needle.to_lowercase())
-}
-
 /// Dropping confirms **in this pane**, by the same mechanics as a file
 /// discard: the first press stores [`Stashes::armed`] and asks through the
 /// notice band; the second press on the same row executes; any cursor move,
@@ -132,7 +124,7 @@ pub struct Stashes {
     rendered: Rc<Cell<usize>>,
     /// The drop awaiting its second press: the index of the row that asked.
     /// One slot — arming a different row moves the question, never queues two.
-    armed: Option<usize>,
+    armed: Armed<usize>,
     /// Whether this pane holds the keyboard, as the shell last told it. A
     /// row's bar is accent only when its pane is focused, and the view cannot
     /// ask the shell during render — so the shell writes it here when focus
@@ -164,7 +156,7 @@ impl Stashes {
 
     pub(crate) fn from_prepared(prepared: Prepared) -> Self {
         let Prepared { rows, .. } = prepared;
-        let visible = Rc::new(Vec::from_iter(0..rows.len()));
+        let visible = Rc::new(list::identity(&rows));
         Self {
             data: Rc::new(rows),
             visible,
@@ -174,7 +166,7 @@ impl Stashes {
             synced: Rc::new(Cell::new(0.0)),
             pending_scroll: PendingScroll::default(),
             rendered: Rc::new(Cell::new(0)),
-            armed: None,
+            armed: Armed::new(),
             focused: false,
         }
     }
@@ -190,9 +182,7 @@ impl Stashes {
     /// last production reader.
     #[cfg(test)]
     pub fn filter_note(&self) -> Option<String> {
-        self.filter
-            .is_some()
-            .then(|| format!("{}/{}", self.visible.len(), self.data.len()))
+        list::filter_note(self.filter.as_deref(), self.visible.len(), self.data.len())
     }
 
     /// Whether the stack had nothing on it — the empty state's trigger.
@@ -211,7 +201,7 @@ impl Stashes {
     pub(crate) fn replace_prepared(&mut self, prepared: Prepared, host: &Host) {
         // A refresh is the repository saying things moved; an armed drop was
         // a promise about how they were, so it dies here first.
-        self.armed = None;
+        self.armed.disarm();
         self.reconcile(host);
         let old = self.view.get();
         // The cursor addresses the *shown* rows, so the anchor is read
@@ -227,8 +217,8 @@ impl Stashes {
         // the filter the user is looking through, and the anchor below is
         // found in this space, not in the full list's.
         self.visible = Rc::new(match &self.filter {
-            Some(q) => search_rows(&self.data, q),
-            None => Vec::from_iter(0..self.data.len()),
+            Some(q) => list::search_rows(&self.data, q, |_| false, row_text),
+            None => list::identity(&self.data),
         });
 
         let cursor = anchored
@@ -268,13 +258,13 @@ impl Stashes {
     /// the next prepaint, and writing an offset against it would clamp in
     /// the wrong place.
     pub fn apply_query(&mut self, query: &str) {
-        let next = Some(query.trim()).filter(|q| !q.is_empty());
-        if self.filter.as_deref() == next {
+        let next = list::normalize_query(query);
+        if self.filter.as_deref() == next.as_deref() {
             return;
         }
         // A changed filter can move the cursor by clamping, and a question
         // aimed at yesterday's row is the thing the arm exists to prevent.
-        self.armed = None;
+        self.armed.disarm();
         // Anchor first, named by the row's commit like every other re-anchor
         // in this file, because row numbers are about to stop meaning
         // anything.
@@ -284,10 +274,10 @@ impl Stashes {
             .and_then(|&d| self.data.get(d))
             .map(|r| r.commit.clone());
 
-        self.filter = next.map(str::to_string);
+        self.filter = next;
         self.visible = Rc::new(match &self.filter {
-            Some(q) => search_rows(&self.data, q),
-            None => Vec::from_iter(0..self.data.len()),
+            Some(q) => list::search_rows(&self.data, q, |_| false, row_text),
+            None => list::identity(&self.data),
         });
 
         let mut view = self.view.get();
@@ -356,7 +346,7 @@ impl Stashes {
         }
         // The keyboard moved — whatever was armed was armed to what the
         // keyboard used to be on.
-        self.armed = None;
+        self.armed.disarm();
         self.view.set(v);
         self.show(v);
         true
@@ -371,7 +361,7 @@ impl Stashes {
         v.go_to(index);
         // The mouse moved — whatever was armed was armed to what the mouse
         // used to be on.
-        self.armed = None;
+        self.armed.disarm();
         self.view.set(v);
         self.show(v);
     }
@@ -412,19 +402,14 @@ impl Stashes {
     /// numbers shift, and a yes addressed to yesterday's numbering is the
     /// accident the double press exists to prevent.
     pub(crate) fn confirm_or_arm_drop(&mut self, index: usize) -> bool {
-        let already = self.armed == Some(index);
-        self.armed = match already {
-            true => None,
-            false => Some(index),
-        };
-        already
+        self.armed.confirm_or_arm(index)
     }
 
     /// Whether a drop is waiting for its second press — the render's tint of
     /// the row the question is about.
     #[cfg(test)]
     pub(crate) fn armed_row(&self) -> Option<usize> {
-        self.armed
+        self.armed.get().copied()
     }
 
     /// What `copy.selection` copies here: the row the keyboard is on, as git
@@ -465,7 +450,14 @@ impl Render for Stashes {
         let scroll = self.scroll.clone();
         let synced = self.synced.clone();
         let pending_scroll = self.pending_scroll.clone();
-        let armed = self.armed;
+        // The shown position of the row an armed drop is waiting on, found
+        // once per frame through the visible index — a filter moves it like
+        // everything else it keeps.
+        let armed = self
+            .armed
+            .position_in(visible.iter().map(|&d| &data[d]), |row, index| {
+                row.index == *index
+            });
         let focused = self.focused;
         // A click on a row is the keyboard coming back — see [`Self::select_row`].
         // Built as a plain handle, not `cx.listener`: the rows are drawn in the

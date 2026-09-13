@@ -2,6 +2,7 @@ use super::{accept_deferred_scroll, vertical_scrollbar, DeferredScrollbar, Pendi
 use crate::chrome;
 use crate::graph;
 use gitten_core::host::Host;
+use gitten_core::list::{self, Armed};
 use gitten_core::search;
 use gitten_core::theme;
 use gitten_core::view::Viewport;
@@ -101,7 +102,7 @@ pub struct Commits {
     /// cursor move, wheel or refresh drops it, because a stale yes waiting
     /// on a sha the list may no longer hold is exactly the accident the
     /// double press exists to prevent.
-    armed: Option<String>,
+    armed: Armed<String>,
     /// Whether this pane holds the keyboard, as the shell last told it. A
     /// row's bar is accent only when its pane is focused, and the view cannot
     /// ask the shell during render — so the shell writes it here when focus
@@ -216,9 +217,11 @@ impl Commits {
     /// note; the old stack's headers were the last production reader.
     #[cfg(test)]
     pub fn filter_note(&self) -> Option<String> {
-        self.query
-            .is_some()
-            .then(|| format!("{}/{}", self.visible.len(), self.data.commits.len()))
+        list::filter_note(
+            self.query.as_deref(),
+            self.visible.len(),
+            self.data.commits.len(),
+        )
     }
 
     /// Meets the list where it actually is: a scrollbar drag moves the offset
@@ -269,7 +272,7 @@ impl Commits {
         // The keyboard moved — including the two scrolls above, which leave
         // the cursor but not the question's row in view. Whatever was armed
         // was armed to what the keyboard used to be on.
-        self.armed = None;
+        self.armed.disarm();
         self.view.set(v);
         self.show(v);
         true
@@ -284,7 +287,7 @@ impl Commits {
         v.go_to(index);
         // The mouse moved — whatever was armed was armed to what the mouse
         // used to be on.
-        self.armed = None;
+        self.armed.disarm();
         self.view.set(v);
         self.show(v);
     }
@@ -355,29 +358,24 @@ impl Commits {
     }
 
     fn arm(&mut self, sha: &str) -> bool {
-        let already = self.armed.as_deref() == Some(sha);
-        self.armed = match already {
-            true => None,
-            false => Some(sha.to_string()),
-        };
-        already
+        self.armed.confirm_or_arm(sha.to_string())
     }
 
     /// Whether a reset is waiting for its second press — the render's tint of
     /// the row the question is about, and the shell's signal that the
     /// question's mode ([`reset`]) is live.
     pub fn armed(&self) -> bool {
-        self.armed.is_some()
+        self.armed.is_armed()
     }
 
     /// Drops the question — what `esc` and every disarm path reach. Idempotent.
     pub fn disarm(&mut self) {
-        self.armed = None;
+        self.armed.disarm();
     }
 
     #[cfg(test)]
     pub(crate) fn armed_sha(&self) -> Option<String> {
-        self.armed.clone()
+        self.armed.get().cloned()
     }
 
     // ----------------------------------------------------------------- search
@@ -396,13 +394,13 @@ impl Commits {
     /// the next prepaint, and writing an offset against it would clamp in the
     /// wrong place.
     pub fn apply_query(&mut self, query: &str) {
-        let next = Some(query.trim()).filter(|q| !q.is_empty());
-        if self.query.as_deref() == next {
+        let next = list::normalize_query(query);
+        if self.query.as_deref() == next.as_deref() {
             return;
         }
         // A changed filter can move the cursor by clamping, and a question
         // aimed at yesterday's row is the thing the arm exists to prevent.
-        self.armed = None;
+        self.armed.disarm();
         // Anchor first: named by sha, like every other re-anchor in this file,
         // because row numbers are about to stop meaning anything.
         let anchored = self
@@ -411,10 +409,10 @@ impl Commits {
             .and_then(|i| self.data.commits.get(*i))
             .map(|c| c.sha.clone());
 
-        self.query = next.map(str::to_string);
+        self.query = next;
         self.visible = Rc::new(match &self.query {
             Some(q) => self.data.search.indices(q),
-            None => Vec::from_iter(0..self.data.commits.len()),
+            None => list::identity(&self.data.commits),
         });
 
         let mut v = self.view.get();
@@ -463,7 +461,7 @@ impl Commits {
                 .collect(),
         );
         Self {
-            visible: Rc::new(Vec::from_iter(0..data.commits.len())),
+            visible: Rc::new(list::identity(&data.commits)),
             query: None,
             data: Rc::new(data),
             ages,
@@ -476,7 +474,7 @@ impl Commits {
             rendered: Rc::new(Cell::new(0)),
             top: Rc::new(Cell::new(0)),
             load,
-            armed: None,
+            armed: Armed::new(),
             focused: false,
         }
     }
@@ -491,7 +489,7 @@ impl Commits {
     pub(crate) fn replace_prepared(&mut self, prepared: Prepared, host: &Host) {
         // A refresh is the repository saying things moved; an armed reset was
         // a promise about how they were, so it dies here first.
-        self.armed = None;
+        self.armed.disarm();
         self.reconcile(host);
         let old = self.view.get();
         let cursor_sha = self
@@ -512,7 +510,7 @@ impl Commits {
         // in this space, not in the full list's.
         let visible = Rc::new(match &self.query {
             Some(q) => data.search.indices(q),
-            None => Vec::from_iter(0..data.commits.len()),
+            None => list::identity(&data.commits),
         });
         let find = |sha: &str| visible.iter().position(|i| data.commits[*i].sha == sha);
         let cursor = cursor_sha
@@ -657,8 +655,9 @@ impl Render for Commits {
         // same tint a discard and a drop wear.
         let armed = self
             .armed
-            .as_ref()
-            .and_then(|sha| visible.iter().position(|i| data.commits[*i].sha == *sha));
+            .position_in(visible.iter().map(|&i| &data.commits[i]), |commit, sha| {
+                commit.sha == *sha
+            });
         let focused = self.focused;
         // A click on a row is the keyboard coming back — see [`Self::select_row`].
         // Built as a plain handle, not `cx.listener`: the rows are drawn in the

@@ -41,6 +41,7 @@ use crate::rows::{assemble, Frame, Layouts, Rows};
 use crate::screen::{Ink, Screen};
 use crate::scrollbar::{self, Bar};
 use gitten_core::host::Host;
+use gitten_core::list::Armed;
 use gitten_core::rows::{expand, RowRef};
 use gitten_core::runs::Run;
 use gitten_core::search::TextIndex;
@@ -73,15 +74,16 @@ pub struct Diff {
     /// Index into `order` of the widest row, which is what a horizontal scroll
     /// is bounded by.
     widest: usize,
-    /// Where each file's header landed in `order`, ascending.
-    ///
-    /// Cached because it moves only when the order table does, and finding it on
-    /// demand is a scan of `order` per file: 5,953 files against a million rows
-    /// is six billion comparisons for a keypress. One scan per reflow instead.
+    /// Where each file's header landed in `order`, ascending — collected by
+    /// [`gitten_core::rows::expand`] itself as
+    /// [`gitten_core::rows::Ordered::headers`], so this copy costs an
+    /// assignment per reflow and nothing per keypress.
     headers: Vec<usize>,
     /// Where each hunk's first row landed in `order`, ascending — the hunk
-    /// jump list, built in the same pass as the headers and under the same
-    /// rule: cached because it only moves when the order table does.
+    /// jump list, built in one pass over `order` after every rebuild for the
+    /// same reason the headers are collected there: a jump list that moves
+    /// only when the table does is a keypress's answer, not a per-keypress
+    /// scan.
     hunks: Vec<usize>,
     /// The width and wrap the rows were last expanded for. A resize that does
     /// not cross a column boundary compares equal here and stops.
@@ -116,7 +118,8 @@ pub struct Diff {
     /// The cursor an armed destructive question was asked on, when one
     /// stands. Any move of the keyboard disarms it — a yes addressed to a
     /// row that is no longer under the keyboard is not a yes. See `moved`.
-    armed: Option<usize>,
+    /// The slot itself is the shared [`Armed`].
+    armed: Armed<usize>,
     bar: Bar,
     /// The standing search's query, kept across the reflows and layout
     /// changes it survives — `None` when no search stands.
@@ -212,7 +215,7 @@ impl Diff {
             marks: None,
             marking: false,
             line_unit: false,
-            armed: None,
+            armed: Armed::new(),
             bar: Bar::default(),
             search_query: None,
             search: None,
@@ -237,7 +240,8 @@ impl Diff {
         let built = assemble(&self.files, host, &mut self.owners);
         self.order = built.ordered.order;
         self.widest = built.ordered.widest;
-        self.index_headers();
+        self.headers = built.ordered.headers;
+        self.index_hunks();
         self.file_count = built.files;
         self.intraline = built.intraline;
         self.syntax = built.syntax;
@@ -293,7 +297,8 @@ impl Diff {
         let built = expand(&self.order, &self.owners, anchor);
         self.order = built.order;
         self.widest = built.widest;
-        self.index_headers();
+        self.headers = built.headers;
+        self.index_hunks();
         // The rows moved under any standing search: the fold is stale, and
         // the query is kept — the next keystroke refolds from what stands.
         self.search = None;
@@ -310,39 +315,14 @@ impl Diff {
         }
     }
 
-    /// One pass over the order table, marking the rows that are file headers.
-    ///
-    /// A binary search per row against that owner's own header list, which is
-    /// sorted because [`gitten_core::rows::assemble`] builds it in file order.
-    /// Only the first visual row of a logical one can be a header, so a wrapped
-    /// diff costs no more than an unwrapped one.
-    fn index_headers(&mut self) {
-        let per_owner: Vec<Vec<u32>> = self
-            .owners
-            .iter()
-            .map(|o| o.files().iter().map(|f| f.row as u32).collect())
-            .collect();
-        self.headers.clear();
-        for (at, r) in self.order.iter().enumerate() {
-            if r.seg != 0 {
-                continue;
-            }
-            let Some(rows) = per_owner.get(r.owner as usize) else {
-                continue;
-            };
-            if rows.binary_search(&r.index).is_ok() {
-                self.headers.push(at);
-            }
-        }
-        self.index_hunks();
-    }
-
     /// Where every hunk's first row is, in visual rows, ascending — the jump
-    /// list `diff.next-hunk`/`diff.prev-hunk` walk. Built beside the headers
-    /// in the same pass over `order`, and the same honesty applies: a
-    /// presentation whose hunk map answers nothing offers no jumps rather
-    /// than wrong ones, and an extension's presentation needs nothing but a
-    /// [`gitten_core::rows::Flat`] with exact spans.
+    /// list `diff.next-hunk`/`diff.prev-hunk` walk. The file headers come
+    /// from [`gitten_core::rows::expand`] itself —
+    /// [`gitten_core::rows::Ordered::headers`] — and
+    /// the same honesty applies here: a presentation whose hunk map answers
+    /// nothing offers no jumps rather than wrong ones, and an extension's
+    /// presentation needs nothing but a [`gitten_core::rows::Flat`] with
+    /// exact spans.
     fn index_hunks(&mut self) {
         self.hunks.clear();
         let mut standing: Option<(u16, usize, usize)> = None;
@@ -498,7 +478,7 @@ impl Diff {
                 None => (at, at),
             });
         }
-        self.armed = None;
+        self.armed.disarm();
     }
 
     /// `select.mark`, lazygit's `v`: arm a range at the cursor, extend it by
@@ -558,17 +538,7 @@ impl Diff {
     /// the caller says so; `true` means it was answered on the same spot
     /// and the verb may run.
     pub fn confirm_or_arm_discard(&mut self) -> bool {
-        let at = self.view.cursor();
-        match self.armed {
-            Some(armed) if armed == at => {
-                self.armed = None;
-                true
-            }
-            _ => {
-                self.armed = Some(at);
-                false
-            }
-        }
+        self.armed.confirm_or_arm(self.view.cursor())
     }
 
     // ----------------------------------------------------------------- search
@@ -1124,13 +1094,14 @@ impl Diff {
         self.dragging = false;
         self.marks = None;
         self.marking = false;
-        self.armed = None;
+        self.armed.disarm();
         self.files = files;
         self.owners = self.layouts.build(self.current, host);
         let built = assemble(&self.files, host, &mut self.owners);
         self.order = built.ordered.order;
         self.widest = built.ordered.widest;
-        self.index_headers();
+        self.headers = built.ordered.headers;
+        self.index_hunks();
         self.file_count = built.files;
         self.intraline = built.intraline;
         self.syntax = built.syntax;
@@ -1301,6 +1272,156 @@ fn span(part: u16, at: &Caret, bytes: std::ops::Range<usize>) -> Selection {
         ..at.clone()
     });
     sel
+}
+
+/// The `view.*` vocabulary — the verbs are the inherent methods above; this
+/// impl is what [`run_view_commands`] routes them by name. `scroll_x` is the
+/// one override: the diff is the view with rows off the left edge.
+///
+/// [`run_view_commands`]: gitten_core::view::run_view_commands
+impl gitten_core::view::Scrollable for Diff {
+    fn down(&mut self) {
+        Diff::down(self);
+    }
+    fn up(&mut self) {
+        Diff::up(self);
+    }
+    fn page(&mut self, pages: isize) {
+        Diff::page(self, pages);
+    }
+    fn scroll_y(&mut self, rows: isize) {
+        Diff::scroll_y(self, rows);
+    }
+    fn scroll_x(&mut self, cols: isize) {
+        Diff::scroll_x(self, cols);
+    }
+    fn to_top(&mut self) {
+        Diff::to_top(self);
+    }
+    fn to_bottom(&mut self) {
+        Diff::to_bottom(self);
+    }
+}
+
+/// The [`Pane`] half of the diff — the tenant contract over the inherent
+/// methods above. `view.*` comes from the provided `run`, horizontal and
+/// all; `search.*` walks matches rather than filtering, because a filtered
+/// diff is not a diff.
+impl crate::pane::Pane for Diff {
+    fn scrollable(&mut self) -> &mut dyn gitten_core::view::Scrollable {
+        self
+    }
+
+    fn mode(&self) -> &'static str {
+        "diff"
+    }
+
+    fn set_scrolloff(&mut self, rows: usize) {
+        Diff::set_scrolloff(self, rows);
+    }
+
+    fn resize(&mut self, cols: usize, height: usize, host: &Host) {
+        Diff::resize(self, cols, height, host);
+    }
+
+    fn paint(
+        &self,
+        screen: &mut Screen,
+        x: usize,
+        y: usize,
+        focused: bool,
+        host: &Host,
+        out: &mut Vec<Run>,
+    ) {
+        Diff::paint(self, screen, x, y, focused, host, out);
+    }
+
+    fn status(&self, host: &Host) -> String {
+        Diff::status(self, host)
+    }
+
+    fn paint_bar(
+        &self,
+        screen: &mut Screen,
+        x: usize,
+        divider: Option<usize>,
+        y: usize,
+        host: &Host,
+    ) {
+        Diff::paint_bar(self, screen, x, divider, y, host);
+    }
+
+    fn press(&mut self, col: usize, row: usize, clicks: u8, extend: bool, host: &Host) {
+        Diff::press(self, col, row, clicks, extend, host);
+    }
+
+    fn drag(&mut self, col: usize, row: isize, host: &Host) {
+        Diff::drag(self, col, row, host);
+    }
+
+    fn release(&mut self) {
+        Diff::release(self);
+    }
+
+    fn copy_text(&self) -> String {
+        Diff::copy_text(self)
+    }
+
+    fn selection(&self) -> String {
+        Diff::selection(self)
+    }
+
+    fn select_all(&mut self) {
+        Diff::select_all(self);
+    }
+
+    fn select_none(&mut self) -> bool {
+        Diff::select_none(self)
+    }
+
+    fn search_query(&self) -> Option<&str> {
+        Diff::search_query(self)
+    }
+
+    fn search_note(&self) -> Option<String> {
+        Diff::match_note(self)
+    }
+
+    fn search_seed(&self, command: &str) -> Result<String, String> {
+        if !Diff::has_search_text(self) {
+            return Err(format!("{command}: the diff has no text to search"));
+        }
+        Ok(Diff::search_query(self).unwrap_or_default().to_string())
+    }
+
+    fn search_edit(&mut self, query: &str) {
+        Diff::search_edit(self, query);
+    }
+
+    fn search_clear(&mut self) {
+        Diff::search_clear(self);
+    }
+
+    fn search_next(&mut self, by: isize) {
+        Diff::search_next(self, by);
+    }
+
+    fn verbs(&mut self, command: &str, host: &Host) -> bool {
+        match command {
+            "diff.next-file" => Diff::jump_file(self, 1),
+            "diff.prev-file" => Diff::jump_file(self, -1),
+            "diff.cycle-layout" => Diff::cycle_layout(self, host),
+            "diff.cycle-wrap" => Diff::cycle_wrap(self, host),
+            "diff.next-hunk" => Diff::jump_hunk(self, 1),
+            "diff.prev-hunk" => Diff::jump_hunk(self, -1),
+            "diff.toggle-line-selection" => {
+                Diff::toggle_line_selection(self);
+            }
+            "select.mark" => Diff::select_mark(self),
+            _ => return false,
+        }
+        true
+    }
 }
 
 #[cfg(test)]

@@ -50,6 +50,7 @@ use gitten_core::command::{chord_string, Availability, Code, Key, Modes, Resolve
 use gitten_core::differ::Overrides;
 use gitten_core::edit::{Edit, Field};
 use gitten_core::host::Host;
+use gitten_core::list;
 use gitten_core::operation::{Operation, Side};
 use gitten_core::rebase::{FixupKind, Rewrite};
 use gitten_core::refs::{HeadState, RefName, ResetMode, StashId, StashScope};
@@ -62,6 +63,7 @@ use gitten_tui::diff::PatchSelection;
 use gitten_tui::files::{self, Files};
 use gitten_tui::help;
 use gitten_tui::merging;
+use gitten_tui::pane::Pane;
 use gitten_tui::patch::PatchBuilder;
 use gitten_tui::reflog::Reflog;
 use gitten_tui::remotes::Remotes;
@@ -393,6 +395,18 @@ enum Screens {
     /// staleness story.
     Worktrees {
         view: Worktrees,
+        label: String,
+        generation: Generation,
+    },
+    /// A pane nothing here wrote — a compiled-in extension's tenant, in
+    /// through the same [`Pane`] seam the built-ins answer. It carries the
+    /// same label and generation slots as every variant so the registry,
+    /// the title strip and the staleness rail treat it as a pane, not a
+    /// special case. Nothing in the tree opens one today — the variant is
+    /// the door, not a tenant.
+    #[allow(dead_code)]
+    Custom {
+        view: Box<dyn Pane>,
         label: String,
         generation: Generation,
     },
@@ -832,20 +846,45 @@ fn paint_picker(screen: &mut Screen, y: usize, height: usize, picker: &RecentPic
 }
 
 impl Screens {
+    /// The pane half of the tenant — the [`Pane`] object every generic
+    /// operation below delegates to. The one per-variant match on that
+    /// path: everything else asks this.
+    fn view(&self) -> &dyn Pane {
+        match self {
+            Screens::Commits { view, .. } => view,
+            Screens::Diff { view, .. } => view,
+            Screens::Merging { view, .. } => view,
+            Screens::Stashes { view, .. } => view,
+            Screens::Files { view, .. } => view,
+            Screens::Branches { view, .. } => view,
+            Screens::Remotes { view, .. } => view,
+            Screens::Tags { view, .. } => view,
+            Screens::Reflog { view, .. } => view,
+            Screens::Worktrees { view, .. } => view,
+            Screens::Custom { view, .. } => view.as_ref(),
+        }
+    }
+
+    /// [`view`](Self::view), mutable — for input, edits and commands.
+    fn view_mut(&mut self) -> &mut dyn Pane {
+        match self {
+            Screens::Commits { view, .. } => view,
+            Screens::Diff { view, .. } => view,
+            Screens::Merging { view, .. } => view,
+            Screens::Stashes { view, .. } => view,
+            Screens::Files { view, .. } => view,
+            Screens::Branches { view, .. } => view,
+            Screens::Remotes { view, .. } => view,
+            Screens::Tags { view, .. } => view,
+            Screens::Reflog { view, .. } => view,
+            Screens::Worktrees { view, .. } => view,
+            Screens::Custom { view, .. } => view.as_mut(),
+        }
+    }
+
     /// Which mode's bindings are live. The name the keymap and `gitten.toml` use.
     fn mode(&self) -> &'static str {
-        match self {
-            Screens::Commits { .. } => "commits",
-            Screens::Diff { .. } => "diff",
-            Screens::Merging { .. } => "merge",
-            Screens::Stashes { .. } => "stashes",
-            Screens::Files { .. } => "files",
-            Screens::Branches { .. } => "branches",
-            Screens::Remotes { .. } => "remotes",
-            Screens::Tags { .. } => "tags",
-            Screens::Reflog { .. } => "reflog",
-            Screens::Worktrees { .. } => "worktrees",
-        }
+        self.view().mode()
     }
 
     fn label(&self) -> &str {
@@ -854,12 +893,13 @@ impl Screens {
             | Screens::Diff { label, .. }
             | Screens::Merging { label, .. }
             | Screens::Stashes { label, .. }
+            | Screens::Files { label, .. }
             | Screens::Branches { label, .. }
             | Screens::Remotes { label, .. }
             | Screens::Tags { label, .. }
             | Screens::Reflog { label, .. }
-            | Screens::Worktrees { label, .. } => label,
-            Screens::Files { label, .. } => label,
+            | Screens::Worktrees { label, .. }
+            | Screens::Custom { label, .. } => label,
         }
     }
 
@@ -869,13 +909,22 @@ impl Screens {
             | Screens::Diff { generation, .. }
             | Screens::Merging { generation, .. }
             | Screens::Stashes { generation, .. }
+            | Screens::Files { generation, .. }
             | Screens::Branches { generation, .. }
             | Screens::Remotes { generation, .. }
             | Screens::Tags { generation, .. }
             | Screens::Reflog { generation, .. }
-            | Screens::Worktrees { generation, .. } => *generation,
-            Screens::Files { generation, .. } => *generation,
+            | Screens::Worktrees { generation, .. }
+            | Screens::Custom { generation, .. } => *generation,
         }
+    }
+
+    /// A degraded read's account, drained — the warning a refresh parked on
+    /// the pane until the whole wave landed. `None` for a pane with nothing
+    /// to say, and for every pane that never degrades: today only the
+    /// branches read has a decorative leg.
+    fn take_warning(&mut self) -> Option<String> {
+        self.view_mut().take_warning()
     }
 
     /// Re-acquires this tenant from the repository when a finished job has
@@ -991,30 +1040,19 @@ impl Screens {
                 generation,
                 ..
             } => {
-                // One path, two reads: the file's bytes and the stages git
-                // still holds. The read decides the label — a resolution
-                // that emptied the markers is "resolved", not the old
-                // conflict's name — and a file that has left the working
+                // One path, the loader's two reads: the file's bytes and the
+                // stages git still holds. The read decides the label — a
+                // resolution that emptied the markers is "resolved", not the
+                // old conflict's name — and a file that has left the working
                 // tree while the stages are gone with it is the resolved
                 // deletion, drawn as an empty view, never an error wave
                 // that never stops.
-                let path = view.path().as_bytes().to_vec();
-                let stages = match repo.unmerged(&path) {
-                    Ok(stages) => stages,
+                let loaded = match acquire::conflict(repo, view.path()) {
+                    Ok(loaded) => loaded,
                     Err(e) => return Some(Err(e)),
                 };
-                let file = match repo.conflict_file(&path) {
-                    Ok(file) => file,
-                    Err(_) if stages.is_empty() => {
-                        gitten_core::conflict::ConflictFile::parse(view.path().clone(), Vec::new())
-                    }
-                    Err(e) => return Some(Err(e)),
-                };
-                let source = DiffSource::Conflict {
-                    path: view.path().clone(),
-                };
-                *label = source.label();
-                view.replace(file, stages);
+                *label = loaded.label;
+                view.replace(loaded.file, loaded.stages);
                 *generation = target;
                 Some(Ok(()))
             }
@@ -1038,21 +1076,19 @@ impl Screens {
                 label,
                 generation,
             } => {
-                if *generation >= target {
-                    return None;
-                }
-                // The whole of the blocking half: one `git status`, plus the
-                // describe the label names the repository with — the same two
-                // reads the window's files refresh makes, and the same
-                // registration the pane was built from. Nothing here touches
-                // the view until the read has come back, so a failed refresh
-                // leaves the last good rows standing.
-                let status = match repo.status() {
-                    Ok(status) => status,
+                // The whole of the blocking half is the loader's two reads —
+                // one `git status`, plus the describe the label names the
+                // repository with — the same pair the window's files refresh
+                // makes, and the same registration the pane was built from.
+                // Nothing here touches the view until the read has come
+                // back, so a failed refresh leaves the last good rows
+                // standing.
+                let loaded = match acquire::files(repo) {
+                    Ok(loaded) => loaded,
                     Err(e) => return Some(Err(e)),
                 };
-                let described = repo.describe();
-                let files::Prepared { rows, label: next } = files::prepare(&status, &described);
+                let files::Prepared { rows, label: next } =
+                    files::prepare(&loaded.status, &loaded.label);
                 view.replace(rows);
                 *label = next;
                 *generation = target;
@@ -1063,30 +1099,28 @@ impl Screens {
                 label,
                 generation,
             } => {
-                // The whole of the blocking half: three ref reads, run
-                // beside each other — the same reads the pane was built
+                // The whole of the blocking half is the loader's five reads
+                // behind one spawn floor — the same reads the pane was built
                 // from, and the same registration-wide wave every other
-                // pane rides. The describe rides the same wave, since the
-                // label is spelled with it; nothing here touches the view
-                // until the reads have come back, so a failed refresh
-                // leaves the last good rows standing, at its old
-                // generation, for a later wave to retry.
-                let (reads, described) = std::thread::scope(|s| {
-                    let reads = s.spawn(|| load_branches(repo));
-                    let described = s.spawn(|| repo.describe());
-                    (join_read(reads), join_read(described))
-                });
-                if let Some(e) = reads.error {
-                    return Some(Err(e));
-                }
+                // pane rides. A failed `head` degrades to `warning` rather
+                // than taking the listings down: the pane parks it for the
+                // status line, the window's notice-band trade. Nothing here
+                // touches the view until the reads have come back, so a
+                // failed refresh leaves the last good rows standing, at its
+                // old generation, for a later wave to retry.
+                let loaded = match acquire::branches(repo) {
+                    Ok(loaded) => loaded,
+                    Err(e) => return Some(Err(e)),
+                };
                 let branches::Prepared { rows, label: next } = branches::prepare(
-                    &reads.local,
-                    &reads.remotes,
-                    reads.head.as_ref(),
-                    &described,
+                    &loaded.local,
+                    &loaded.remotes,
+                    loaded.head.as_ref(),
+                    &loaded.label,
                 );
                 *label = next;
                 view.replace(rows);
+                view.set_warning(loaded.warning);
                 *generation = target;
                 Some(Ok(()))
             }
@@ -1095,25 +1129,15 @@ impl Screens {
                 label,
                 generation,
             } => {
-                // Two reads beside each other, the branches pane's shape:
-                // the list, and the describe its label is spelled with.
-                let (loaded, described) = std::thread::scope(|s| {
-                    let remotes = s.spawn(|| repo.remotes());
-                    let described = s.spawn(|| repo.describe());
-                    (
-                        remotes
-                            .join()
-                            .unwrap_or_else(|p| std::panic::resume_unwind(p)),
-                        described.join().unwrap_or_default(),
-                    )
-                });
-                let loaded = match loaded {
-                    Ok(remotes) => remotes,
+                // The loader's two reads: the list, and the describe its
+                // label is spelled with.
+                let loaded = match acquire::remotes(repo) {
+                    Ok(loaded) => loaded,
                     Err(e) => return Some(Err(e)),
                 };
-                let count = loaded.len();
-                view.replace(loaded);
-                *label = remotes_label(&described, count);
+                let count = loaded.remotes.len();
+                view.replace(loaded.remotes);
+                *label = remotes_label(&loaded.label, count);
                 *generation = target;
                 Some(Ok(()))
             }
@@ -1122,23 +1146,15 @@ impl Screens {
                 label,
                 generation,
             } => {
-                // The same two reads: the ref namespace, and the describe
-                // its label is spelled with.
-                let (loaded, described) = std::thread::scope(|s| {
-                    let tags = s.spawn(|| repo.tags());
-                    let described = s.spawn(|| repo.describe());
-                    (
-                        tags.join().unwrap_or_else(|p| std::panic::resume_unwind(p)),
-                        described.join().unwrap_or_default(),
-                    )
-                });
-                let loaded = match loaded {
-                    Ok(tags) => tags,
+                // The same two reads, through the loader: the ref namespace,
+                // and the describe its label is spelled with.
+                let loaded = match acquire::tags(repo) {
+                    Ok(loaded) => loaded,
                     Err(e) => return Some(Err(e)),
                 };
-                let count = loaded.len();
-                view.replace(loaded);
-                *label = tags_label(&described, count);
+                let count = loaded.tags.len();
+                view.replace(loaded.tags);
+                *label = tags_label(&loaded.label, count);
                 *generation = target;
                 Some(Ok(()))
             }
@@ -1147,28 +1163,19 @@ impl Screens {
                 label,
                 generation,
             } => {
-                // The same two reads: every checkout, and the describe
-                // its label is spelled with. `here` is the canonicalized
-                // root the row guard compares against — the listing spells
-                // paths resolved, so an uncanonicalized root would match
-                // nothing and the guard would fail open to git's refusal.
-                let (loaded, described) = std::thread::scope(|s| {
-                    let worktrees = s.spawn(|| repo.worktrees());
-                    let described = s.spawn(|| repo.describe());
-                    (
-                        worktrees
-                            .join()
-                            .unwrap_or_else(|p| std::panic::resume_unwind(p)),
-                        described.join().unwrap_or_default(),
-                    )
-                });
-                let loaded = match loaded {
-                    Ok(worktrees) => worktrees,
+                // The same two reads, through the loader: every checkout,
+                // and the describe its label is spelled with. `here` is the
+                // canonicalized root the row guard compares against — the
+                // listing spells paths resolved, so an uncanonicalized root
+                // would match nothing and the guard would fail open to
+                // git's refusal.
+                let loaded = match acquire::worktrees(repo) {
+                    Ok(loaded) => loaded,
                     Err(e) => return Some(Err(e)),
                 };
-                let count = loaded.len();
-                view.replace(loaded, here);
-                *label = worktrees_label(&described, count);
+                let count = loaded.worktrees.len();
+                view.replace(loaded.worktrees, here);
+                *label = worktrees_label(&loaded.label, count);
                 *generation = target;
                 Some(Ok(()))
             }
@@ -1177,28 +1184,22 @@ impl Screens {
                 label,
                 generation,
             } => {
-                // The same two reads: where HEAD has been, and the describe
-                // its label is spelled with.
-                let (loaded, described) = std::thread::scope(|s| {
-                    let reflog = s.spawn(|| repo.reflog(REFLOG_ENTRIES));
-                    let described = s.spawn(|| repo.describe());
-                    (
-                        reflog
-                            .join()
-                            .unwrap_or_else(|p| std::panic::resume_unwind(p)),
-                        described.join().unwrap_or_default(),
-                    )
-                });
-                let loaded = match loaded {
-                    Ok(entries) => entries,
+                // The same two reads, through the loader: where HEAD has
+                // been, and the describe its label is spelled with.
+                let loaded = match acquire::reflog(repo, REFLOG_ENTRIES) {
+                    Ok(loaded) => loaded,
                     Err(e) => return Some(Err(e)),
                 };
-                let count = loaded.len();
-                view.replace(loaded);
-                *label = reflog_label(&described, count);
+                let count = loaded.entries.len();
+                view.replace(loaded.entries);
+                *label = reflog_label(&loaded.label, count);
                 *generation = target;
                 Some(Ok(()))
             }
+            // Nothing this loop reads can stale a pane nothing here read:
+            // a custom tenant refreshes by its own means, and `None` says
+            // this wave was not its to ride.
+            Screens::Custom { .. } => None,
         }
     }
 
@@ -1212,48 +1213,9 @@ impl Screens {
     /// Markdown reflow budget against the pane, because [`Diff::resize`] is
     /// handed the pane's width and passes it down to every presentation.
     fn resize_to(&mut self, rect: crate::panes::Rect, host: &Host) {
-        match self {
-            Screens::Commits { view: c, .. } => {
-                c.set_scrolloff(host.view.scrolloff);
-                c.resize(rect.width, rect.height);
-            }
-            Screens::Diff { view: d, .. } => {
-                d.set_scrolloff(host.view.scrolloff);
-                d.resize(rect.width, rect.height, host);
-            }
-            Screens::Merging { view: m, .. } => {
-                m.set_scrolloff(host.view.scrolloff);
-                m.resize(rect.width, rect.height);
-            }
-            Screens::Stashes { view: s, .. } => {
-                s.set_scrolloff(host.view.scrolloff);
-                s.resize(rect.width, rect.height);
-            }
-            Screens::Files { view: f, .. } => {
-                f.set_scrolloff(host.view.scrolloff);
-                f.resize(rect.width, rect.height);
-            }
-            Screens::Branches { view: b, .. } => {
-                b.set_scrolloff(host.view.scrolloff);
-                b.resize(rect.width, rect.height);
-            }
-            Screens::Remotes { view: r, .. } => {
-                r.set_scrolloff(host.view.scrolloff);
-                r.resize(rect.width, rect.height);
-            }
-            Screens::Tags { view: t, .. } => {
-                t.set_scrolloff(host.view.scrolloff);
-                t.resize(rect.width, rect.height);
-            }
-            Screens::Reflog { view: r, .. } => {
-                r.set_scrolloff(host.view.scrolloff);
-                r.resize(rect.width, rect.height);
-            }
-            Screens::Worktrees { view: w, .. } => {
-                w.set_scrolloff(host.view.scrolloff);
-                w.resize(rect.width, rect.height);
-            }
-        }
+        let view = self.view_mut();
+        view.set_scrolloff(host.view.scrolloff);
+        view.resize(rect.width, rect.height, host);
     }
 
     /// Paints into this pane's rectangle: `x` is the pane's first column, `y`
@@ -1267,35 +1229,11 @@ impl Screens {
         host: &Host,
         out: &mut Vec<Run>,
     ) {
-        match self {
-            Screens::Commits { view: c, .. } => c.paint(screen, x, y, focused, host),
-            Screens::Diff { view: d, .. } => d.paint(screen, x, y, focused, host, out),
-            Screens::Merging { view: m, .. } => m.paint(screen, x, y, focused, host),
-            Screens::Stashes { view: s, .. } => s.paint(screen, x, y, focused, host),
-            // The files pane needs no run-list buffer: its rows are cells,
-            // not shaped spans.
-            Screens::Files { view: f, .. } => f.paint(screen, x, y, focused, host),
-            Screens::Branches { view: b, .. } => b.paint(screen, x, y, focused, host),
-            Screens::Remotes { view: r, .. } => r.paint(screen, x, y, focused, host),
-            Screens::Tags { view: t, .. } => t.paint(screen, x, y, focused, host),
-            Screens::Reflog { view: r, .. } => r.paint(screen, x, y, focused, host),
-            Screens::Worktrees { view: w, .. } => w.paint(screen, x, y, focused, host),
-        }
+        self.view().paint(screen, x, y, focused, host, out);
     }
 
     fn status(&self, host: &Host) -> String {
-        match self {
-            Screens::Commits { view: c, .. } => c.status(),
-            Screens::Diff { view: d, .. } => d.status(host),
-            Screens::Merging { view: m, .. } => m.status(),
-            Screens::Stashes { view: s, .. } => s.status(),
-            Screens::Files { view: f, .. } => f.status(),
-            Screens::Branches { view: b, .. } => b.status(),
-            Screens::Remotes { view: r, .. } => r.status(),
-            Screens::Tags { view: t, .. } => t.status(),
-            Screens::Reflog { view: r, .. } => r.status(),
-            Screens::Worktrees { view: w, .. } => w.status(),
-        }
+        self.view().status(host)
     }
 
     /// The bar at the column the paint loop chose for it. The choice is the
@@ -1310,18 +1248,7 @@ impl Screens {
         y: usize,
         host: &Host,
     ) {
-        match self {
-            Screens::Commits { view: c, .. } => c.paint_bar(screen, x, divider, y, host),
-            Screens::Diff { view: d, .. } => d.paint_bar(screen, x, divider, y, host),
-            Screens::Merging { view: m, .. } => m.paint_bar(screen, x, divider, y, host),
-            Screens::Stashes { view: s, .. } => s.paint_bar(screen, x, divider, y, host),
-            Screens::Files { view: f, .. } => f.paint_bar(screen, x, divider, y, host),
-            Screens::Branches { view: b, .. } => b.paint_bar(screen, x, divider, y, host),
-            Screens::Remotes { view: r, .. } => r.paint_bar(screen, x, divider, y, host),
-            Screens::Tags { view: t, .. } => t.paint_bar(screen, x, divider, y, host),
-            Screens::Reflog { view: r, .. } => r.paint_bar(screen, x, divider, y, host),
-            Screens::Worktrees { view: w, .. } => w.paint_bar(screen, x, divider, y, host),
-        }
+        self.view().paint_bar(screen, x, divider, y, host);
     }
 
     /// A press in this pane's content, at `row` rows down it and `col`
@@ -1331,159 +1258,52 @@ impl Screens {
     /// type, which is what keeps the views free of `term` — a view takes
     /// already-hit-tested numbers exactly as it takes already-loaded data.
     fn press(&mut self, col: usize, row: usize, clicks: u8, extend: bool, host: &Host) {
-        match self {
-            Screens::Commits { view: c, .. } => c.press(col, row, extend, host),
-            Screens::Diff { view: d, .. } => d.press(col, row, clicks, extend, host),
-            Screens::Merging { view: m, .. } => m.press(col, row, extend, host),
-            Screens::Stashes { view: s, .. } => s.press(col, row, extend, host),
-            Screens::Files { view: f, .. } => f.press(col, row, clicks, extend, host),
-            Screens::Branches { view: b, .. } => b.press(col, row, extend, host),
-            Screens::Remotes { view: r, .. } => r.press(col, row, extend, host),
-            Screens::Tags { view: t, .. } => t.press(col, row, extend, host),
-            Screens::Reflog { view: r, .. } => r.press(col, row, extend, host),
-            Screens::Worktrees { view: w, .. } => w.press(col, row, extend, host),
-        }
+        self.view_mut().press(col, row, clicks, extend, host);
     }
 
     /// The pointer moved with the button down, in this pane's coordinates.
     /// `row` is signed: a row above the pane is negative and scrolls it.
     fn drag(&mut self, col: usize, row: isize, host: &Host) {
-        match self {
-            Screens::Commits { view: c, .. } => c.drag(row, host),
-            Screens::Diff { view: d, .. } => d.drag(col, row, host),
-            Screens::Merging { view: m, .. } => m.drag(row, host),
-            Screens::Stashes { view: s, .. } => s.drag(row, host),
-            // A list with no drag selection and an indicator bar has nothing
-            // a held button can do.
-            Screens::Files { .. }
-            | Screens::Branches { .. }
-            | Screens::Remotes { .. }
-            | Screens::Tags { .. }
-            | Screens::Reflog { .. }
-            | Screens::Worktrees { .. } => {}
-        }
+        self.view_mut().drag(col, row, host);
     }
 
     fn release(&mut self) {
-        match self {
-            Screens::Commits { view: c, .. } => c.release(),
-            Screens::Diff { view: d, .. } => d.release(),
-            Screens::Merging { view: m, .. } => m.release(),
-            Screens::Stashes { view: s, .. } => s.release(),
-            // Nothing held here either — see `drag`.
-            Screens::Files { .. }
-            | Screens::Branches { .. }
-            | Screens::Remotes { .. }
-            | Screens::Tags { .. }
-            | Screens::Reflog { .. }
-            | Screens::Worktrees { .. } => {}
-        }
+        self.view_mut().release();
     }
 
     /// What `copy.selection` copies here: the selection, or the row the cursor is
     /// on when there is none.
     fn copy_text(&self) -> String {
-        match self {
-            Screens::Commits { view: c, .. } => c.copy_text(),
-            Screens::Diff { view: d, .. } => d.copy_text(),
-            // A conflict file is not a range the verbs act on; the row's
-            // text is what the diff pane's copy is for.
-            Screens::Merging { .. } => String::new(),
-            Screens::Stashes { view: s, .. } => s.copy_text(),
-            Screens::Files { view: f, .. } => f.copy_text(),
-            Screens::Branches { view: b, .. } => b.copy_text(),
-            Screens::Remotes { view: r, .. } => r.copy_text(),
-            Screens::Tags { view: t, .. } => t.copy_text(),
-            Screens::Reflog { view: r, .. } => r.copy_text(),
-            Screens::Worktrees { view: w, .. } => w.copy_text(),
-        }
+        self.view().copy_text()
     }
 
     /// What the *mouse* has selected, and nothing else. Empty after a click, so
     /// copy-on-select can tell a gesture that selected something from one that
     /// only moved the cursor.
     fn selection(&self) -> String {
-        match self {
-            Screens::Commits { view: c, .. } => c.selection(),
-            Screens::Diff { view: d, .. } => d.selection(),
-            Screens::Merging { view: m, .. } => m.selection(),
-            Screens::Stashes { view: s, .. } => s.selection(),
-            // A file list has no drag selection, so copy-on-select has
-            // nothing to fire on here — the empty answer is the mechanism.
-            Screens::Files { view: f, .. } => f.selection(),
-            Screens::Branches { view: b, .. } => b.selection(),
-            Screens::Remotes { view: r, .. } => r.selection(),
-            Screens::Tags { view: t, .. } => t.selection(),
-            Screens::Reflog { view: r, .. } => r.selection(),
-            Screens::Worktrees { view: w, .. } => w.selection(),
-        }
+        self.view().selection()
     }
 
     fn select_all(&mut self) {
-        match self {
-            Screens::Commits { view: c, .. } => c.select_all(),
-            Screens::Diff { view: d, .. } => d.select_all(),
-            Screens::Merging { view: m, .. } => m.select_all(),
-            Screens::Stashes { view: s, .. } => s.select_all(),
-            Screens::Files { view: f, .. } => f.select_all(),
-            Screens::Branches { view: b, .. } => b.select_all(),
-            Screens::Remotes { view: r, .. } => r.select_all(),
-            Screens::Tags { view: t, .. } => t.select_all(),
-            Screens::Reflog { view: r, .. } => r.select_all(),
-            Screens::Worktrees { view: w, .. } => w.select_all(),
-        }
+        self.view_mut().select_all();
     }
 
     fn select_none(&mut self) -> bool {
-        match self {
-            Screens::Commits { view: c, .. } => c.select_none(),
-            Screens::Diff { view: d, .. } => d.select_none(),
-            Screens::Merging { view: m, .. } => m.select_none(),
-            Screens::Stashes { view: s, .. } => s.select_none(),
-            Screens::Files { view: f, .. } => f.select_none(),
-            Screens::Branches { view: b, .. } => b.select_none(),
-            Screens::Remotes { view: r, .. } => r.select_none(),
-            Screens::Tags { view: t, .. } => t.select_none(),
-            Screens::Reflog { view: r, .. } => r.select_none(),
-            Screens::Worktrees { view: w, .. } => w.select_none(),
-        }
+        self.view_mut().select_none()
     }
 
     /// The live filter count, while a search prompt stands over a list; on
     /// the diff, what the standing search found. A note is only drawn when
     /// there is one.
     fn search_note(&self) -> Option<String> {
-        match self {
-            Screens::Commits { view: c, .. } => c.filter_note(),
-            Screens::Files { view: f, .. } => f.filter_note(),
-            Screens::Branches { view: b, .. } => b.filter_note(),
-            Screens::Stashes { view: s, .. } => s.filter_note(),
-            Screens::Remotes { view: r, .. } => r.filter_note(),
-            Screens::Tags { view: t, .. } => t.filter_note(),
-            Screens::Reflog { view: r, .. } => r.filter_note(),
-            Screens::Worktrees { view: w, .. } => w.filter_note(),
-            Screens::Diff { view: d, .. } => d.match_note(),
-            // The merging view carries no standing search yet.
-            Screens::Merging { .. } => None,
-        }
+        self.view().search_note()
     }
 
     /// Whether a search stands in this pane — the filter a prompt left
     /// behind, or the diff's standing query. What puts the `search` mode on
     /// the stack, and with it `n`/`N` and the clearing `esc`.
     fn search_standing(&self) -> bool {
-        match self {
-            Screens::Commits { view: c, .. } => c.query().is_some(),
-            Screens::Files { view: f, .. } => f.query().is_some(),
-            Screens::Branches { view: b, .. } => b.query().is_some(),
-            Screens::Stashes { view: s, .. } => s.query().is_some(),
-            Screens::Remotes { view: r, .. } => r.query().is_some(),
-            Screens::Tags { view: t, .. } => t.query().is_some(),
-            Screens::Reflog { view: r, .. } => r.query().is_some(),
-            Screens::Worktrees { view: w, .. } => w.query().is_some(),
-            Screens::Diff { view: d, .. } => d.search_query().is_some(),
-            Screens::Merging { .. } => false,
-        }
+        self.view().search_standing()
     }
 
     /// Runs a command, or says it does not know it.
@@ -1496,177 +1316,7 @@ impl Screens {
     /// would be a pane command that stops working the day a second list
     /// registers.
     fn run(&mut self, command: &str, host: &Host) -> bool {
-        match self {
-            Screens::Commits { view: c, .. } => match command {
-                "view.down" => c.down(),
-                "view.up" => c.up(),
-                "view.page-down" => c.page(1),
-                "view.page-up" => c.page(-1),
-                "view.scroll-down" => c.scroll_y(host.view.rows as isize),
-                "view.scroll-up" => c.scroll_y(-(host.view.rows as isize)),
-                "view.top" => c.to_top(),
-                "view.bottom" => c.to_bottom(),
-                // A commit list has nothing off the left edge to reach.
-                "view.left" | "view.right" => {}
-                "search.next" => c.next_match(1),
-                "search.prev" => c.next_match(-1),
-                "select.mark" => c.select_mark(),
-                _ => return false,
-            },
-            Screens::Diff { view: d, .. } => match command {
-                "view.down" => d.down(),
-                "view.up" => d.up(),
-                "view.page-down" => d.page(1),
-                "view.page-up" => d.page(-1),
-                "view.scroll-down" => d.scroll_y(host.view.rows as isize),
-                "view.scroll-up" => d.scroll_y(-(host.view.rows as isize)),
-                "view.top" => d.to_top(),
-                "view.bottom" => d.to_bottom(),
-                "view.left" => d.scroll_x(-8),
-                "view.right" => d.scroll_x(8),
-                "diff.next-file" => d.jump_file(1),
-                "diff.prev-file" => d.jump_file(-1),
-                "diff.cycle-layout" => d.cycle_layout(host),
-                "diff.cycle-wrap" => d.cycle_wrap(host),
-                "search.next" => d.search_next(1),
-                "search.prev" => d.search_next(-1),
-                "diff.next-hunk" => d.jump_hunk(1),
-                "diff.prev-hunk" => d.jump_hunk(-1),
-                "diff.toggle-line-selection" => {
-                    d.toggle_line_selection();
-                }
-                "select.mark" => d.select_mark(),
-                _ => return false,
-            },
-            Screens::Merging { view: m, .. } => match command {
-                "view.down" => m.down(),
-                "view.up" => m.up(),
-                "view.page-down" => m.page(1),
-                "view.page-up" => m.page(-1),
-                "view.scroll-down" => m.scroll_y(host.view.rows as isize),
-                "view.scroll-up" => m.scroll_y(-(host.view.rows as isize)),
-                "view.top" => m.to_top(),
-                "view.bottom" => m.to_bottom(),
-                // Nothing off the left edge to reach: the file's lines
-                // clip rather than pan, like every list here.
-                "view.left" | "view.right" => {}
-                "merge.next-conflict" => m.jump_region(1),
-                "merge.prev-conflict" => m.jump_region(-1),
-                _ => return false,
-            },
-            Screens::Stashes { view: s, .. } => match command {
-                "view.down" => s.down(),
-                "view.up" => s.up(),
-                "view.page-down" => s.page(1),
-                "view.page-up" => s.page(-1),
-                "view.scroll-down" => s.scroll_y(host.view.rows as isize),
-                "view.scroll-up" => s.scroll_y(-(host.view.rows as isize)),
-                "view.top" => s.to_top(),
-                "view.bottom" => s.to_bottom(),
-                // A stack has nothing off the left edge to reach.
-                "view.left" | "view.right" => {}
-                "search.next" => s.next_match(1),
-                "search.prev" => s.next_match(-1),
-                _ => return false,
-            },
-            Screens::Files { view: f, .. } => match command {
-                "view.down" => f.down(),
-                "view.up" => f.up(),
-                "view.page-down" => f.page(1),
-                "view.page-up" => f.page(-1),
-                "view.scroll-down" => f.scroll_y(host.view.rows as isize),
-                "view.scroll-up" => f.scroll_y(-(host.view.rows as isize)),
-                "view.top" => f.to_top(),
-                "view.bottom" => f.to_bottom(),
-                // Nothing off the left edge to reach: paths clip rather
-                // than pan.
-                "view.left" | "view.right" => {}
-                "search.next" => f.next_match(1),
-                "search.prev" => f.next_match(-1),
-                _ => return false,
-            },
-            Screens::Branches { view: b, .. } => match command {
-                "view.down" => b.down(),
-                "view.up" => b.up(),
-                "view.page-down" => b.page(1),
-                "view.page-up" => b.page(-1),
-                "view.scroll-down" => b.scroll_y(host.view.rows as isize),
-                "view.scroll-up" => b.scroll_y(-(host.view.rows as isize)),
-                "view.top" => b.to_top(),
-                "view.bottom" => b.to_bottom(),
-                // Nothing off the left edge to reach: names clip rather
-                // than pan.
-                "view.left" | "view.right" => {}
-                "search.next" => b.next_match(1),
-                "search.prev" => b.next_match(-1),
-                _ => return false,
-            },
-            Screens::Remotes { view: r, .. } => match command {
-                "view.down" => r.down(),
-                "view.up" => r.up(),
-                "view.page-down" => r.page(1),
-                "view.page-up" => r.page(-1),
-                "view.scroll-down" => r.scroll_y(host.view.rows as isize),
-                "view.scroll-up" => r.scroll_y(-(host.view.rows as isize)),
-                "view.top" => r.to_top(),
-                "view.bottom" => r.to_bottom(),
-                // Nothing off the left edge to reach: names clip rather
-                // than pan.
-                "view.left" | "view.right" => {}
-                "search.next" => r.next_match(1),
-                "search.prev" => r.next_match(-1),
-                _ => return false,
-            },
-            Screens::Tags { view: t, .. } => match command {
-                "view.down" => t.down(),
-                "view.up" => t.up(),
-                "view.page-down" => t.page(1),
-                "view.page-up" => t.page(-1),
-                "view.scroll-down" => t.scroll_y(host.view.rows as isize),
-                "view.scroll-up" => t.scroll_y(-(host.view.rows as isize)),
-                "view.top" => t.to_top(),
-                "view.bottom" => t.to_bottom(),
-                // Nothing off the left edge to reach: names clip rather
-                // than pan.
-                "view.left" | "view.right" => {}
-                "search.next" => t.next_match(1),
-                "search.prev" => t.next_match(-1),
-                _ => return false,
-            },
-            Screens::Worktrees { view: w, .. } => match command {
-                "view.down" => w.down(),
-                "view.up" => w.up(),
-                "view.page-down" => w.page(1),
-                "view.page-up" => w.page(-1),
-                "view.scroll-down" => w.scroll_y(host.view.rows as isize),
-                "view.scroll-up" => w.scroll_y(-(host.view.rows as isize)),
-                "view.top" => w.to_top(),
-                "view.bottom" => w.to_bottom(),
-                // Nothing off the left edge to reach: paths clip rather
-                // than pan.
-                "view.left" | "view.right" => {}
-                "search.next" => w.next_match(1),
-                "search.prev" => w.next_match(-1),
-                _ => return false,
-            },
-            Screens::Reflog { view: r, .. } => match command {
-                "view.down" => r.down(),
-                "view.up" => r.up(),
-                "view.page-down" => r.page(1),
-                "view.page-up" => r.page(-1),
-                "view.scroll-down" => r.scroll_y(host.view.rows as isize),
-                "view.scroll-up" => r.scroll_y(-(host.view.rows as isize)),
-                "view.top" => r.to_top(),
-                "view.bottom" => r.to_bottom(),
-                // Nothing off the left edge to reach: selectors clip rather
-                // than pan.
-                "view.left" | "view.right" => {}
-                "search.next" => r.next_match(1),
-                "search.prev" => r.next_match(-1),
-                _ => return false,
-            },
-        }
-        true
+        self.view_mut().run(command, host)
     }
 }
 
@@ -2227,23 +1877,24 @@ impl App {
             remotes_read,
             tags_read,
             reflog_read,
-            status_read,
-            described,
-            branch_reads,
+            files_read,
+            branch_read,
             diff_read,
             worktrees_read,
         ) = std::thread::scope(|s| {
             // The handle as a stable borrow the `move` spawns copy: an
-            // `Arc` would be four refcount bumps for the same answer.
+            // `Arc` would be four refcount bumps for the same answer. Each
+            // loader overlaps its own describe with its read — the same
+            // floor the window's wave pays — so the one describe the wave
+            // used to share is now one per pane, all of them parallel.
             let repo = &repo;
             let stashes = s.spawn(move || acquire::stashes(repo.as_ref()));
-            let remotes = s.spawn(|| repo.remotes());
-            let tags = s.spawn(|| repo.tags());
-            let reflog = s.spawn(|| repo.reflog(REFLOG_ENTRIES));
-            let worktrees = s.spawn(|| repo.worktrees());
-            let status = s.spawn(move || repo.status());
-            let described = s.spawn(move || repo.describe());
-            let branches = s.spawn(move || load_branches(repo.as_ref()));
+            let remotes = s.spawn(|| acquire::remotes(repo.as_ref()));
+            let tags = s.spawn(|| acquire::tags(repo.as_ref()));
+            let reflog = s.spawn(|| acquire::reflog(repo.as_ref(), REFLOG_ENTRIES));
+            let worktrees = s.spawn(|| acquire::worktrees(repo.as_ref()));
+            let files = s.spawn(move || acquire::files(repo.as_ref()));
+            let branches = s.spawn(move || acquire::branches(repo.as_ref()));
             let diff = preview.as_ref().map(|commit| {
                 let source = Source::Repo {
                     path: path.clone(),
@@ -2252,15 +1903,14 @@ impl App {
                 s.spawn(move || acquire::acquire(View::Diff, &source, &host, Some(repo.as_ref())))
             });
             (
-                join_read(stashes),
-                join_read(remotes),
-                join_read(tags),
-                join_read(reflog),
-                join_read(status),
-                join_read(described),
-                join_read(branches),
-                diff.map(join_read),
-                join_read(worktrees),
+                acquire::joined(stashes),
+                acquire::joined(remotes),
+                acquire::joined(tags),
+                acquire::joined(reflog),
+                acquire::joined(files),
+                acquire::joined(branches),
+                diff.map(acquire::joined),
+                acquire::joined(worktrees),
             )
         });
         clock.stage("startup reads joined");
@@ -2274,10 +1924,10 @@ impl App {
         let mut error = None;
         if let Some(Screens::Remotes { view, label, .. }) = self.panes.get_mut("remotes") {
             match remotes_read {
-                Ok(remotes) => {
-                    let count = remotes.len();
-                    view.replace(remotes);
-                    *label = remotes_label(&described, count);
+                Ok(loaded) => {
+                    let count = loaded.remotes.len();
+                    view.replace(loaded.remotes);
+                    *label = remotes_label(&loaded.label, count);
                 }
                 Err(e) => {
                     *label = "unavailable".to_string();
@@ -2287,10 +1937,10 @@ impl App {
         }
         if let Some(Screens::Tags { view, label, .. }) = self.panes.get_mut("tags") {
             match tags_read {
-                Ok(tags) => {
-                    let count = tags.len();
-                    view.replace(tags);
-                    *label = tags_label(&described, count);
+                Ok(loaded) => {
+                    let count = loaded.tags.len();
+                    view.replace(loaded.tags);
+                    *label = tags_label(&loaded.label, count);
                 }
                 Err(e) => {
                     *label = "unavailable".to_string();
@@ -2300,8 +1950,8 @@ impl App {
         }
         if let Some(Screens::Worktrees { view, label, .. }) = self.panes.get_mut("worktrees") {
             match worktrees_read {
-                Ok(list) => {
-                    let count = list.len();
+                Ok(loaded) => {
+                    let count = loaded.worktrees.len();
                     // The row guard's `here`: canonicalized, because the
                     // listing spells every path resolved.
                     let here = std::fs::canonicalize(&path)
@@ -2309,8 +1959,8 @@ impl App {
                         .as_os_str()
                         .as_encoded_bytes()
                         .to_vec();
-                    view.replace(list, &here);
-                    *label = worktrees_label(&described, count);
+                    view.replace(loaded.worktrees, &here);
+                    *label = worktrees_label(&loaded.label, count);
                 }
                 Err(e) => {
                     *label = "unavailable".to_string();
@@ -2320,10 +1970,10 @@ impl App {
         }
         if let Some(Screens::Reflog { view, label, .. }) = self.panes.get_mut("reflog") {
             match reflog_read {
-                Ok(entries) => {
-                    let count = entries.len();
-                    view.replace(entries);
-                    *label = reflog_label(&described, count);
+                Ok(loaded) => {
+                    let count = loaded.entries.len();
+                    view.replace(loaded.entries);
+                    *label = reflog_label(&loaded.label, count);
                 }
                 Err(e) => {
                     *label = "unavailable".to_string();
@@ -2345,9 +1995,10 @@ impl App {
             }
         }
         if let Some(Screens::Files { view, label, .. }) = self.panes.get_mut("files") {
-            match &status_read {
-                Ok(status) => {
-                    let files::Prepared { rows, label: next } = files::prepare(status, &described);
+            match &files_read {
+                Ok(loaded) => {
+                    let files::Prepared { rows, label: next } =
+                        files::prepare(&loaded.status, &loaded.label);
                     view.replace(rows);
                     *label = next;
                 }
@@ -2355,35 +2006,41 @@ impl App {
                 // changes: the exact error goes to the status line below,
                 // where it can be read — stderr now sits behind the
                 // alternate screen, so the print the eager path made is gone.
-                Err(_) => *label = files::unavailable_label(&described),
+                // The describe is re-asked rather than carried, the way the
+                // window's fallback spells it.
+                Err(_) => *label = files::unavailable_label(&repo.describe()),
             }
         }
-        if let Some(e) = status_read.err() {
+        if let Err(e) = files_read {
             error.get_or_insert(e);
         }
         if let Some(Screens::Branches { view, label, .. }) = self.panes.get_mut("branches") {
-            let (rows, next) = match branch_reads.error.as_ref() {
+            match branch_read {
+                Ok(loaded) => {
+                    let branches::Prepared { rows, label: next } = branches::prepare(
+                        &loaded.local,
+                        &loaded.remotes,
+                        loaded.head.as_ref(),
+                        &loaded.label,
+                    );
+                    view.replace(rows);
+                    *label = next;
+                    // The listings stayed true: only the detached row is not
+                    // said, and the warning rides to the status line like
+                    // the errors — outranked by any of them.
+                    if let Some(warning) = loaded.warning {
+                        error.get_or_insert(warning);
+                    }
+                }
                 // The lists themselves were lost: the pane's data is not
                 // "empty", it is unread, and the label says so while the
                 // error rides to the status line.
-                Some(_) if branch_reads.local.is_empty() && branch_reads.remotes.is_empty() => {
-                    (Vec::new(), branches::unavailable_label(&described))
+                Err(e) => {
+                    view.replace(Vec::new());
+                    *label = branches::unavailable_label(&repo.describe());
+                    error.get_or_insert(e);
                 }
-                _ => {
-                    let prepared = branches::prepare(
-                        &branch_reads.local,
-                        &branch_reads.remotes,
-                        branch_reads.head.as_ref(),
-                        &described,
-                    );
-                    (prepared.rows, prepared.label)
-                }
-            };
-            if let Some(e) = &branch_reads.error {
-                error.get_or_insert(e.clone());
             }
-            view.replace(rows);
-            *label = next;
         }
         self.message = error.unwrap_or_default();
         // The operation standing re-read with the same wave that refreshed
@@ -3062,27 +2719,16 @@ impl App {
             self.message = format!("{command} is not supported here");
             return;
         }
+        // The pane names its own refusal — "not supported here" from one
+        // that cannot search, "no text" from an empty diff.
         let standing = match self.panes.get(&name) {
-            Some(Screens::Commits { view, .. }) => view.query().unwrap_or_default().to_string(),
-            Some(Screens::Files { view, .. }) => view.query().unwrap_or_default().to_string(),
-            Some(Screens::Branches { view, .. }) => view.query().unwrap_or_default().to_string(),
-            Some(Screens::Stashes { view, .. }) => view.query().unwrap_or_default().to_string(),
-            Some(Screens::Remotes { view, .. }) => view.query().unwrap_or_default().to_string(),
-            Some(Screens::Tags { view, .. }) => view.query().unwrap_or_default().to_string(),
-            Some(Screens::Reflog { view, .. }) => view.query().unwrap_or_default().to_string(),
-            Some(Screens::Worktrees { view, .. }) => view.query().unwrap_or_default().to_string(),
-            Some(Screens::Diff { view, .. }) => {
-                if !view.has_search_text() {
-                    self.message = format!("{command}: the diff has no text to search");
+            Some(pane) => match pane.view().search_seed(command) {
+                Ok(seed) => seed,
+                Err(refusal) => {
+                    self.message = refusal;
                     return;
                 }
-                view.search_query().unwrap_or_default().to_string()
-            }
-            // The merging view carries no standing search to re-open.
-            Some(Screens::Merging { .. }) => {
-                self.message = format!("{command} is not supported here");
-                return;
-            }
+            },
             None => {
                 self.message = format!("{command} is not supported here");
                 return;
@@ -4420,19 +4066,8 @@ impl App {
         }
         let pane = pane.to_string();
         let before = self.eye_of(&pane);
-        match self.panes.get_mut(&pane) {
-            Some(Screens::Commits { view, .. }) => view.apply_query(query),
-            Some(Screens::Files { view, .. }) => view.apply_query(query),
-            Some(Screens::Branches { view, .. }) => view.apply_query(query),
-            Some(Screens::Stashes { view, .. }) => view.apply_query(query),
-            Some(Screens::Remotes { view, .. }) => view.apply_query(query),
-            Some(Screens::Tags { view, .. }) => view.apply_query(query),
-            Some(Screens::Reflog { view, .. }) => view.apply_query(query),
-            Some(Screens::Worktrees { view, .. }) => view.apply_query(query),
-            Some(Screens::Diff { view, .. }) => view.search_edit(query),
-            // The merging view has no filter to apply.
-            Some(Screens::Merging { .. }) => {}
-            None => {}
+        if let Some(pane) = self.panes.get_mut(&pane) {
+            pane.view_mut().search_edit(query);
         }
         self.eye_follow(&pane, before);
     }
@@ -4472,18 +4107,8 @@ impl App {
                 // Cancel restores what stood before the search: the
                 // unfiltered list, or the diff without its standing query.
                 let before = self.eye_of(&pane);
-                match self.panes.get_mut(&pane) {
-                    Some(Screens::Commits { view, .. }) => view.apply_query(""),
-                    Some(Screens::Files { view, .. }) => view.clear_search(),
-                    Some(Screens::Branches { view, .. }) => view.clear_search(),
-                    Some(Screens::Stashes { view, .. }) => view.clear_search(),
-                    Some(Screens::Remotes { view, .. }) => view.clear_search(),
-                    Some(Screens::Tags { view, .. }) => view.clear_search(),
-                    Some(Screens::Reflog { view, .. }) => view.clear_search(),
-                    Some(Screens::Worktrees { view, .. }) => view.clear_search(),
-                    Some(Screens::Diff { view, .. }) => view.search_clear(),
-                    Some(Screens::Merging { .. }) => {}
-                    None => {}
+                if let Some(pane) = self.panes.get_mut(&pane) {
+                    pane.view_mut().search_clear();
                 }
                 self.eye_follow(&pane, before);
             }
@@ -4964,18 +4589,7 @@ impl App {
                 if !name.is_empty() {
                     let before = self.eye_of(&name);
                     if let Some(pane) = self.panes.get_mut(&name) {
-                        match pane {
-                            Screens::Commits { view, .. } => view.clear_search(),
-                            Screens::Files { view, .. } => view.clear_search(),
-                            Screens::Branches { view, .. } => view.clear_search(),
-                            Screens::Stashes { view, .. } => view.clear_search(),
-                            Screens::Remotes { view, .. } => view.clear_search(),
-                            Screens::Tags { view, .. } => view.clear_search(),
-                            Screens::Reflog { view, .. } => view.clear_search(),
-                            Screens::Worktrees { view, .. } => view.clear_search(),
-                            Screens::Diff { view, .. } => view.search_clear(),
-                            Screens::Merging { .. } => {}
-                        }
+                        pane.view_mut().search_clear();
                     }
                     self.eye_follow(&name, before);
                 }
@@ -6743,6 +6357,12 @@ impl App {
                         first = first.or(result.err());
                     }
                 }
+                // A degraded read is a warning, not an error: the pane
+                // parked it until the whole wave landed, and the status
+                // line says it once — under any error, which outranks it.
+                if let Some(warning) = pane.take_warning() {
+                    self.message = first.clone().unwrap_or(warning);
+                }
             }
         }
         first.map_or(Ok(()), Err)
@@ -8122,80 +7742,6 @@ fn discard_question(aim: &PatchSelection) -> String {
     }
 }
 
-/// The three branch reads one launch or one refresh needs, and the honest
-/// story of any that failed.
-///
-/// The reads run concurrently — `std::thread::scope`, the same shape the
-/// window's branches load uses — because three `git` subprocesses in a row on
-/// the road to the first frame are three spawn floors where one would do, and
-/// because a pane that reads them one at a time would draw a snapshot torn
-/// across the gaps. What comes back is one prepared-able snapshot or an
-/// account of which leg failed; nothing here touches a view.
-struct BranchReads {
-    local: Vec<gitten_core::refs::Branch>,
-    remotes: Vec<gitten_core::refs::RemoteBranch>,
-    head: Option<gitten_core::refs::HeadState>,
-    /// The first read that failed, in the sentence the status line says.
-    /// `None` is a clean read. The caller — not this helper — decides what a
-    /// failed leg costs: the lists are honest while they stand, and a lost
-    /// HEAD read costs the detached row alone.
-    error: Option<String>,
-}
-
-/// Runs the three ref reads beside each other and keeps what came back.
-///
-/// The describe is deliberately *not* one of these reads: every caller has
-/// one of its own already — the files pane names the repository with the
-/// same string — and a describe inside here would be a second `git`
-/// process for text already in hand. What comes back is one prepared-able
-/// snapshot or an
-/// account of which leg failed; nothing here touches a view.
-/// `git` already said the useful thing.
-fn load_branches(repo: &dyn gitten_git::Repo) -> BranchReads {
-    let (local, remotes, head) = std::thread::scope(|s| {
-        let local = s.spawn(|| repo.branches());
-        let remotes = s.spawn(|| repo.remote_branches());
-        let head = s.spawn(|| repo.head());
-        (join_read(local), join_read(remotes), join_read(head))
-    });
-    let mut error = None;
-    // The lists first: they are the pane's data, and the order of the two
-    // error arms is the order a person would read the failures in. The
-    // sentence names what failed — a bare git error beside a pane would read
-    // as a commit read's or a status read's.
-    let (local, remotes) = match (local, remotes) {
-        (Ok(local), Ok(remotes)) => (local, remotes),
-        (Err(e), _) | (_, Err(e)) => {
-            error.get_or_insert(format!("branch reads failed: {e}"));
-            (Vec::new(), Vec::new())
-        }
-    };
-    // A HEAD-only failure still leaves rows to draw. What it costs is the
-    // detached row: the current bit is not this read's to lose — it travels
-    // on each `Branch` from the same `for-each-ref` that named it, exactly
-    // the bit the window marks from — so an attached repository keeps its
-    // marking and a detached one simply has no detached row to show.
-    let head = match head {
-        Ok(head) => Some(head),
-        Err(e) => {
-            error.get_or_insert(format!("branch reads failed: {e}"));
-            None
-        }
-    };
-    BranchReads {
-        local,
-        remotes,
-        head,
-        error,
-    }
-}
-
-/// Joins a spawned read, resuming a panic on the caller's thread — the same
-/// answer the app layer gives its own spawned reads.
-fn join_read<T>(h: std::thread::ScopedJoinHandle<'_, T>) -> T {
-    h.join().unwrap_or_else(|p| std::panic::resume_unwind(p))
-}
-
 /// What to say on the status line after a copy.
 ///
 /// Lines and not bytes, because a selection is measured in what you can see.
@@ -8209,7 +7755,7 @@ fn copied(text: &str) -> String {
 /// A stash pane's label: whose repository, and how much is parked — the
 /// window's title-strip line, one cell row tall here.
 fn stash_label(describe: &str, parked: usize) -> String {
-    format!("{describe} · {parked} parked")
+    list::label(describe, [format!("{parked} parked")])
 }
 
 /// Two paths name the same repository — by their spelling, or by what the
@@ -8229,11 +7775,7 @@ fn same_repository(a: &std::path::Path, b: &std::path::Path) -> bool {
 /// one-word plural is git's own config grammar — `remote.add` — not a
 /// formatting mood.
 fn remotes_label(describe: &str, count: usize) -> String {
-    let word = match count {
-        1 => "remote",
-        _ => "remotes",
-    };
-    format!("{describe} · {count} {word}")
+    list::label(describe, [list::counted(count, "remote", "remotes")])
 }
 
 /// How many reflog entries the reflog pane reads: enough history to browse
@@ -8243,29 +7785,17 @@ const REFLOG_ENTRIES: usize = 500;
 
 /// The tags pane's header label: what repository, how many tags.
 fn tags_label(describe: &str, count: usize) -> String {
-    let word = match count {
-        1 => "tag",
-        _ => "tags",
-    };
-    format!("{describe} · {count} {word}")
+    list::label(describe, [list::counted(count, "tag", "tags")])
 }
 
 /// The worktrees pane's header label: what repository, how many checkouts.
 fn worktrees_label(describe: &str, count: usize) -> String {
-    let word = match count {
-        1 => "worktree",
-        _ => "worktrees",
-    };
-    format!("{describe} · {count} {word}")
+    list::label(describe, [list::counted(count, "worktree", "worktrees")])
 }
 
 /// The reflog pane's header label: what repository, how many entries read.
 fn reflog_label(describe: &str, count: usize) -> String {
-    let word = match count {
-        1 => "entry",
-        _ => "entries",
-    };
-    format!("{describe} · {count} {word}")
+    list::label(describe, [list::counted(count, "entry", "entries")])
 }
 
 /// Whether to report what a frame cost. `GITTEN_STATS=0` turns it off, so

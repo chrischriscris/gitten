@@ -26,7 +26,9 @@
 use crate::screen::{Ink, Screen};
 use crate::scrollbar::{self, Bar};
 use gitten_core::host::Host;
+use gitten_core::list::{self, Armed};
 use gitten_core::refs::ReflogEntry;
+use gitten_core::runs::Run;
 use gitten_core::search::TextIndex;
 use gitten_core::view::Viewport;
 
@@ -69,10 +71,10 @@ pub struct Reflog {
     cols: usize,
     bar: Bar,
     /// The recovery awaiting its second press: the selector and commit it
-    /// was asked over. One slot — arming a different row moves the
-    /// question, never queues two. Killed by any cursor move, any moving
-    /// scroll, any mouse row change and any refresh.
-    armed: Option<(String, String)>,
+    /// was asked over. One slot — the shared [`Armed`] — arming a different
+    /// row moves the question, never queues two. Killed by any cursor move,
+    /// any moving scroll, any mouse row change and any refresh.
+    armed: Armed<(String, String)>,
     dragging: bool,
 }
 
@@ -91,7 +93,7 @@ impl Reflog {
             view,
             cols: 0,
             bar: Bar::default(),
-            armed: None,
+            armed: Armed::new(),
             dragging: false,
         };
         this.reindex();
@@ -111,13 +113,13 @@ impl Reflog {
             view: Viewport::new(),
             cols: 0,
             bar: Bar::default(),
-            armed: None,
+            armed: Armed::new(),
             dragging: false,
         }
     }
 
     fn row_at(&self, visual: usize) -> Option<&Row> {
-        self.rows.get(*self.visible.get(visual)?)
+        list::shown(&self.rows, &self.visible, visual)
     }
 
     fn reindex(&mut self) {
@@ -128,7 +130,7 @@ impl Reflog {
     fn refilter(&mut self) {
         self.visible = match &self.query {
             Some(q) => self.search.indices(q),
-            None => Vec::from_iter(0..self.rows.len()),
+            None => list::identity(&self.rows),
         };
         self.view.set_len(self.visible.len());
     }
@@ -140,9 +142,7 @@ impl Reflog {
     }
 
     pub fn filter_note(&self) -> Option<String> {
-        self.query
-            .is_some()
-            .then(|| format!("{}/{}", self.visible.len(), self.rows.len()))
+        list::filter_note(self.query.as_deref(), self.visible.len(), self.rows.len())
     }
 
     /// Sets the filter — once per keystroke, never anywhere else. The
@@ -151,16 +151,16 @@ impl Reflog {
     /// not. An armed recovery dies with a result set that changed, like
     /// any other refresh.
     pub fn apply_query(&mut self, query: &str) {
-        let next = Some(query.trim()).filter(|q| !q.is_empty());
-        if self.query.as_deref() == next {
+        let next = list::normalize_query(query);
+        if self.query == next {
             return;
         }
         let anchored = self
             .row_at(self.view.cursor())
             .map(|r| (r.commit.clone(), r.message.clone()));
-        self.query = next.map(str::to_string);
+        self.query = next;
         self.refilter();
-        self.armed = None;
+        self.armed.disarm();
         let cursor = anchored
             .and_then(|(commit, message)| {
                 self.visible.iter().position(|&r| {
@@ -177,9 +177,8 @@ impl Reflog {
         if self.query.is_none() || self.visible.is_empty() {
             return;
         }
-        let len = self.visible.len() as isize;
-        let at = (self.view.cursor() as isize + by).rem_euclid(len) as usize;
-        self.armed = None;
+        let at = list::wrap_index(self.view.cursor(), by, self.visible.len());
+        self.armed.disarm();
         self.view.go_to(at);
     }
 
@@ -191,7 +190,7 @@ impl Reflog {
     /// commit and message — selectors renumber, so the cursor follows what
     /// the entry *was*. An armed recovery dies here first.
     pub fn replace(&mut self, entries: Vec<ReflogEntry>) {
-        self.armed = None;
+        self.armed.disarm();
         self.dragging = false;
         self.available = true;
         let (cursor, top) = (self.view.cursor(), self.view.top());
@@ -244,7 +243,7 @@ impl Reflog {
     }
 
     pub fn move_by(&mut self, by: isize) {
-        self.armed = None;
+        self.armed.disarm();
         self.view.move_by(by);
     }
 
@@ -257,7 +256,7 @@ impl Reflog {
     }
 
     pub fn page(&mut self, pages: isize) {
-        self.armed = None;
+        self.armed.disarm();
         self.view.page(pages);
     }
 
@@ -265,17 +264,17 @@ impl Reflog {
         let before = self.view.top();
         self.view.pan_by(by);
         if self.view.top() != before {
-            self.armed = None;
+            self.armed.disarm();
         }
     }
 
     pub fn to_top(&mut self) {
-        self.armed = None;
+        self.armed.disarm();
         self.view.to_top();
     }
 
     pub fn to_bottom(&mut self) {
-        self.armed = None;
+        self.armed.disarm();
         self.view.to_bottom();
     }
 
@@ -318,19 +317,15 @@ impl Reflog {
 
     fn disarm_if_row_moved(&mut self, index: usize) {
         let at = self
-            .visible
-            .get(index)
-            .and_then(|&r| self.rows.get(r))
+            .row_at(index)
             .map(|r| (r.selector.clone(), r.commit.clone()));
-        if self.armed.is_some() && self.armed != at {
-            self.armed = None;
-        }
+        self.armed.disarm_unless(at.as_ref());
     }
 
     /// The question standing, if one is — what the tests read to prove an
     /// arm moved, died, or stayed exactly where it was asked.
     pub fn armed(&self) -> Option<(String, String)> {
-        self.armed.clone()
+        self.armed.get().cloned()
     }
 
     /// Arms — or confirms — a recovery of the entry under the keyboard.
@@ -340,15 +335,8 @@ impl Reflog {
     /// returns false; second call on the same pair clears and returns
     /// true. A refresh disarms unconditionally.
     pub fn confirm_or_arm_recover(&mut self, selector: &str, commit: &str) -> bool {
-        let already = self
-            .armed
-            .as_ref()
-            .is_some_and(|(s, c)| s.as_str() == selector && c.as_str() == commit);
-        self.armed = match already {
-            true => None,
-            false => Some((selector.to_string(), commit.to_string())),
-        };
-        already
+        self.armed
+            .confirm_or_arm((selector.to_string(), commit.to_string()))
     }
 
     // ------------------------------------------------------- copy and selection
@@ -411,7 +399,7 @@ impl Reflog {
                     false => theme.chrome.bg,
                 };
                 let selector = Ink::new(theme.chrome.fg, bg);
-                let armed = self.armed.as_ref().is_some_and(|(s, c)| {
+                let armed = self.armed.get().is_some_and(|(s, c)| {
                     s.as_str() == r.selector.as_str() && c.as_str() == r.commit.as_str()
                 });
                 let rest = Ink::new(
@@ -458,6 +446,31 @@ impl Reflog {
     }
 }
 
+/// The `view.*` vocabulary — the verbs themselves are the inherent methods
+/// above; this impl is what [`run_view_commands`] routes them by name.
+///
+/// [`run_view_commands`]: gitten_core::view::run_view_commands
+impl gitten_core::view::Scrollable for Reflog {
+    fn down(&mut self) {
+        Reflog::down(self);
+    }
+    fn up(&mut self) {
+        Reflog::up(self);
+    }
+    fn page(&mut self, pages: isize) {
+        Reflog::page(self, pages);
+    }
+    fn scroll_y(&mut self, rows: isize) {
+        Reflog::scroll_y(self, rows);
+    }
+    fn to_top(&mut self) {
+        Reflog::to_top(self);
+    }
+    fn to_bottom(&mut self) {
+        Reflog::to_bottom(self);
+    }
+}
+
 fn flatten(entries: Vec<ReflogEntry>) -> Vec<Row> {
     entries
         .into_iter()
@@ -473,6 +486,101 @@ fn flatten(entries: Vec<ReflogEntry>) -> Vec<Row> {
             },
         )
         .collect()
+}
+/// The [`Pane`] half of the reflog pane — the tenant contract over the inherent
+/// methods above. `view.*` and `search.*` come from the provided `run`;
+/// this pane has no verbs of its own to add.
+impl crate::pane::Pane for Reflog {
+    fn scrollable(&mut self) -> &mut dyn gitten_core::view::Scrollable {
+        self
+    }
+
+    fn mode(&self) -> &'static str {
+        "reflog"
+    }
+
+    fn set_scrolloff(&mut self, rows: usize) {
+        Reflog::set_scrolloff(self, rows);
+    }
+
+    fn resize(&mut self, cols: usize, height: usize, _host: &Host) {
+        Reflog::resize(self, cols, height);
+    }
+
+    fn paint(
+        &self,
+        screen: &mut Screen,
+        x: usize,
+        y: usize,
+        focused: bool,
+        host: &Host,
+        _out: &mut Vec<Run>,
+    ) {
+        Reflog::paint(self, screen, x, y, focused, host);
+    }
+
+    fn status(&self, _host: &Host) -> String {
+        Reflog::status(self)
+    }
+
+    fn paint_bar(
+        &self,
+        screen: &mut Screen,
+        x: usize,
+        divider: Option<usize>,
+        y: usize,
+        host: &Host,
+    ) {
+        Reflog::paint_bar(self, screen, x, divider, y, host);
+    }
+
+    fn press(&mut self, col: usize, row: usize, _clicks: u8, extend: bool, host: &Host) {
+        Reflog::press(self, col, row, extend, host);
+    }
+
+    fn drag(&mut self, _col: usize, row: isize, host: &Host) {
+        Reflog::drag(self, row, host);
+    }
+
+    fn release(&mut self) {
+        Reflog::release(self);
+    }
+
+    fn copy_text(&self) -> String {
+        Reflog::copy_text(self)
+    }
+
+    fn selection(&self) -> String {
+        Reflog::selection(self)
+    }
+
+    fn select_all(&mut self) {
+        Reflog::select_all(self);
+    }
+
+    fn select_none(&mut self) -> bool {
+        Reflog::select_none(self)
+    }
+
+    fn search_query(&self) -> Option<&str> {
+        Reflog::query(self)
+    }
+
+    fn search_note(&self) -> Option<String> {
+        Reflog::filter_note(self)
+    }
+
+    fn search_edit(&mut self, query: &str) {
+        Reflog::apply_query(self, query);
+    }
+
+    fn search_clear(&mut self) {
+        Reflog::clear_search(self);
+    }
+
+    fn search_next(&mut self, by: isize) {
+        Reflog::next_match(self, by);
+    }
 }
 
 #[cfg(test)]
@@ -574,21 +682,21 @@ mod tests {
         // rows slide.
         assert!(!v.confirm_or_arm_recover("HEAD@{2}", "aaa111"));
         assert!(v.confirm_or_arm_recover("HEAD@{2}", "aaa111"));
-        assert_eq!(v.armed, None);
+        assert_eq!(v.armed.get(), None);
         // A pair that matches nothing standing re-arms and asks again —
         // it can never spend: only the exact standing pair confirms.
         assert!(!v.confirm_or_arm_recover("HEAD@{2}", "bbb222"));
         assert_eq!(
-            v.armed,
+            v.armed.get().cloned(),
             Some(("HEAD@{2}".to_string(), "bbb222".to_string())),
             "a moved row re-arms, never spends"
         );
         assert!(v.confirm_or_arm_recover("HEAD@{2}", "bbb222"));
         v.replace(vec![entry("aaa111", "HEAD@{0}", "commit: second")]);
-        assert_eq!(v.armed, None, "a refresh disarms");
+        assert_eq!(v.armed.get(), None, "a refresh disarms");
         v.confirm_or_arm_recover("HEAD@{0}", "aaa111");
         v.down();
-        assert_eq!(v.armed, None, "a keyboard move disarms");
+        assert_eq!(v.armed.get(), None, "a keyboard move disarms");
 
         assert_eq!(v.selection(), "");
         assert!(!v.select_none());
