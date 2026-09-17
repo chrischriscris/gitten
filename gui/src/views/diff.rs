@@ -265,6 +265,20 @@ pub trait Rows {
         false
     }
 
+    /// The rule a two-column presentation draws, as an x within the row —
+    /// `None` for anything single-column, which is most of them. `Diff` asks
+    /// it for the drag probe's hit test and the cursor strip, so the answer
+    /// must be where the rule is *drawn*, floors and all.
+    fn divider(&self) -> Option<f32> {
+        None
+    }
+
+    /// Re-aims the rule at a fraction of the row's drawable width. A
+    /// presentation with no rule ignores it; one with a rule clamps and
+    /// remembers it. Implementations come and go — `arrange` rebuilds them —
+    /// so `Diff` keeps the fraction and hands it to each fresh set.
+    fn set_divider(&mut self, _fraction: f32) {}
+
     /// Draws one visual row. `sel` is the part of it the mouse has selected, in
     /// the row's own byte coordinates — `None` for the overwhelming majority of
     /// rows on the overwhelming majority of frames. `state` is the row's
@@ -676,6 +690,12 @@ pub struct Diff {
     /// The width and wrap the rows were last expanded for. A resize that does
     /// not cross a character boundary compares equal here and stops.
     applied: (f32, &'static str),
+    /// The side-by-side rule's stand as a fraction of the row — remembered
+    /// here rather than on the renderer, because `arrange` hands the rows to
+    /// a *new* `SplitRows` on every layout cycle, file reload and fresh diff,
+    /// and a preference that died with the old one would snap the rule back
+    /// to the middle. Pushed into each fresh set.
+    divider: f32,
     /// The font the row tables were built against, seeded at construction with
     /// the host the renderers were arranged against — the first settled frame
     /// therefore has nothing to rebuild. `Font` is plain data deriving PartialEq,
@@ -1363,6 +1383,33 @@ impl Diff {
         cx.notify();
     }
 
+    /// The two-column rule's x within the row, while the rows are a
+    /// presentation that has one — `None` for the single-column layouts. The
+    /// drag probe's hit test and the cursor strip both read it.
+    pub fn divider(&self) -> Option<f32> {
+        self.renderers.borrow().iter().find_map(|r| r.divider())
+    }
+
+    /// A drag on the two-column rule, answered in fractions. Remembered on
+    /// the view so a layout cycle or a fresh diff does not forget it, pushed
+    /// into the live renderers, and re-wrapped in place — the same work a
+    /// window resize pays, at drag granularity.
+    pub fn set_divider(&mut self, fraction: f32, host: &Host, cx: &mut Context<Self>) {
+        if fraction == self.divider {
+            return;
+        }
+        self.divider = fraction;
+        for r in self.renderers.borrow_mut().iter_mut() {
+            r.set_divider(fraction);
+        }
+        // `reflow`'s early exit reads `applied`, which still names the last
+        // width — clearing it asks for the re-wrap the drag moved.
+        let width = self.applied.0;
+        self.applied = (0.0, "");
+        self.reflow(width, host);
+        cx.notify();
+    }
+
     /// Swaps the diff itself, keeping the presentation and the reading position.
     ///
     /// What changing the algorithm does. The rows are rebuilt from stage 3 the
@@ -1415,7 +1462,13 @@ impl Diff {
         // was a promise about how they were, so it dies here first.
         self.armed_hunk.disarm();
         self.prepared = Rc::new(prepared);
-        let built = arrange(&self.prepared, host, &self.layouts, self.current);
+        let built = arrange(
+            &self.prepared,
+            host,
+            &self.layouts,
+            self.current,
+            self.divider,
+        );
         self.order = Rc::new(built.order);
         *self.renderers.borrow_mut() = built.renderers;
         self.widest = built.widest;
@@ -1540,7 +1593,7 @@ impl Diff {
         };
         let files = Rc::new(files);
         let prepared = Rc::new(prepare_files(&files, host));
-        let built = arrange(&prepared, host, &layouts, current);
+        let built = arrange(&prepared, host, &layouts, current, super::split::SPLIT_HALF);
         // The host names the wrap this opens on, exactly as it names the layout.
         // An unknown name is reported by the config layer, which is the layer
         // that knows it came from a file somebody is editing.
@@ -1554,6 +1607,7 @@ impl Diff {
             current,
             wrap,
             applied: (0.0, ""),
+            divider: super::split::SPLIT_HALF,
             // Arranged above against this very host, so its font is already
             // on the rows — recording anything else makes the first settled
             // reflow pay a redundant second arrange.
@@ -1600,7 +1654,7 @@ impl Diff {
         // An armed discard rides the same logic: the row it was asked about
         // is about to have a different meaning.
         self.armed_hunk.disarm();
-        let built = arrange(&self.prepared, host, &self.layouts, index);
+        let built = arrange(&self.prepared, host, &self.layouts, index, self.divider);
         // Resolve-or-drop: a carried end that names no row in the new order
         // — a hole, a single-text presentation asked for a second column —
         // takes the whole selection with it rather than half a highlight.
@@ -1820,7 +1874,13 @@ struct Built {
 /// Takes the [`Prepared`] by reference on purpose: the expensive half ran once,
 /// somewhere else, and sits behind an `Rc` on the view — this is the cheap half
 /// a layout toggle pays, and it must not consume what the toggle wants kept.
-fn arrange(prepared: &Prepared, host: &Host, layouts: &Layouts, current: usize) -> Built {
+fn arrange(
+    prepared: &Prepared,
+    host: &Host,
+    layouts: &Layouts,
+    current: usize,
+    divider: f32,
+) -> Built {
     let t = std::time::Instant::now();
     let mut renderers = match layouts.0.get(current) {
         Some(layout) => (layout.build)(host),
@@ -1831,6 +1891,12 @@ fn arrange(prepared: &Prepared, host: &Host, layouts: &Layouts, current: usize) 
     // the built-in, which claims everything.
     if renderers.is_empty() {
         renderers.push(Box::new(TextRows::default()));
+    }
+    // The remembered rule goes to whichever fresh renderer draws one — a
+    // one-column set ignores it, and a two-column set draws where the pointer
+    // left it rather than back in the middle.
+    for r in &mut renderers {
+        r.set_divider(divider);
     }
     let name = layouts.names().get(current).copied().unwrap_or("custom");
     let mut order: Vec<RowRef> = Vec::new();

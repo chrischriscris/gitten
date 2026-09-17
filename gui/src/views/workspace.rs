@@ -22,7 +22,10 @@ use super::diff::Diff;
 use super::files::Section;
 use crate::input::Input;
 use gitten_core::status::PathBytes;
-use gpui::{point, px, Bounds, Entity, Pixels, Subscription, UniformListScrollHandle};
+use gpui::{
+    point, px, Bounds, Entity, Pixels, SpringAnimation, SpringConfig, Subscription,
+    UniformListScrollHandle,
+};
 use std::cell::Cell;
 
 /// The destination header's height: title, real counts, working-copy status.
@@ -46,6 +49,95 @@ pub const SIDEBAR_COMPACT_W: f32 = 225.0;
 pub const SIDEBAR_NARROW_W: f32 = 195.0;
 pub const SIDEBAR_SMALLEST_W: f32 = 152.0;
 pub const INSPECTOR_COMPACT_W: f32 = 230.0;
+
+/// The motion every rail shares: one spring, one target vocabulary — a rail
+/// is either present (`1.0`) or gone (`0.0`), and the fraction is resolved
+/// against the live width inside each animator, so a window dragged while a
+/// rail is sliding still lands on the spec's rung exactly. Slightly
+/// underdamped (ζ ≈ 0.9): quick, with a whisper of give rather than a dead
+/// stop — a rail's own width is the thing being stepped, so the same curve
+/// reads the same at 152px and at 280px.
+pub const RAIL_SPRING: SpringConfig = SpringConfig::new(280.0, 30.0, 1.0);
+
+/// A rail's spring aimed at its flag. The element the spring drives is
+/// never removed from the tree — collapsed is a width of zero, not an
+/// absent child — which is what lets a re-opened rail pick the spring's
+/// velocity up mid-flight instead of restarting, and what makes a first
+/// mount (launched, or a destination entered with the rail already hidden)
+/// start *at* the target and stay still rather than playing a slide nobody
+/// asked for.
+pub fn rail_spring(collapsed: bool) -> SpringAnimation<f32> {
+    SpringAnimation::new(RAIL_SPRING).to(if collapsed { 0.0 } else { 1.0 })
+}
+
+/// The branch timeline's spec width — History's inner rail. It lives beside
+/// the other rails' sizes so the drag helpers read one table.
+pub const TIMELINE_W: f32 = 310.0;
+
+/// The drag limits per rail. The floor is the smallest size the rail's own
+/// content is laid out for — the sidebar's spec already steps down to it on
+/// the narrowest windows — and the cap is only a sanity bound; the drawn
+/// width is further limited to half the window, so a width remembered from a
+/// bigger one can never swallow this one.
+pub const SIDEBAR_MIN_W: f32 = SIDEBAR_SMALLEST_W;
+pub const SIDEBAR_MAX_W: f32 = 460.0;
+pub const INSPECTOR_MIN_W: f32 = INSPECTOR_COMPACT_W;
+pub const INSPECTOR_MAX_W: f32 = 460.0;
+pub const TIMELINE_MIN_W: f32 = 200.0;
+pub const TIMELINE_MAX_W: f32 = 520.0;
+
+/// How many pixels of a rail's receding edge answer to a drag — the strip
+/// the cursor handle paints and the band the probe reads.
+pub const RAIL_GRAB_W: f32 = 5.0;
+
+/// A rail's drawn width from a remembered drag: the override clamped to the
+/// rail's floor and the lesser of its cap and half the window, or the spec
+/// width when nothing was dragged. The override is kept as dragged — the
+/// clamp is applied at draw time, so the preference survives the window that
+/// cannot currently afford it.
+pub fn rail_draw_width(over: Option<f32>, min: f32, max: f32, viewport_w: f32, spec: f32) -> f32 {
+    let max = max.min(viewport_w * 0.5).max(min);
+    over.unwrap_or(spec).clamp(min, max)
+}
+
+/// [`rail_draw_width`] for the left rail, on the spec's rungs.
+pub fn sidebar_draw_width(viewport_w: f32, over: Option<f32>) -> f32 {
+    rail_draw_width(
+        over,
+        SIDEBAR_MIN_W,
+        SIDEBAR_MAX_W,
+        viewport_w,
+        sidebar_width(viewport_w),
+    )
+}
+
+/// [`rail_draw_width`] for the right rail, on the spec's rungs.
+pub fn inspector_draw_width(viewport_w: f32, over: Option<f32>) -> f32 {
+    rail_draw_width(
+        over,
+        INSPECTOR_MIN_W,
+        INSPECTOR_MAX_W,
+        viewport_w,
+        inspector_width(viewport_w),
+    )
+}
+
+/// [`rail_draw_width`] for History's timeline, on its one spec size.
+pub fn timeline_draw_width(viewport_w: f32, over: Option<f32>) -> f32 {
+    rail_draw_width(over, TIMELINE_MIN_W, TIMELINE_MAX_W, viewport_w, TIMELINE_W)
+}
+
+/// One of the drag-edges the workspace exposes. The shared left rail
+/// answers to the same drag in both destinations — it is one piece of chrome
+/// — while the inspector and the timeline belong to their own. `Split` is
+/// not a rail but the diff's own rule, dragged through the same probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rail {
+    Sidebar,
+    Inspector,
+    Timeline,
+    Split,
+}
 
 /// Fixed rail widths for a viewport: the spec's five sizes, picked once at
 /// composition time — the one place a viewport read is allowed. The top step
@@ -127,6 +219,38 @@ impl LaunchHold {
 /// guard. The sidebar holds no state of its own — it draws the files pane's
 /// grouped projection under the files pane's cursor.
 pub struct Workspace {
+    /// Whether the left rail is hidden — one flag for both destinations,
+    /// because the rail is the same piece of chrome in Changes and History:
+    /// a reader who wants it gone wants it gone, not once per view. The
+    /// title strip keeps the toggle that brings it back.
+    pub sidebar_collapsed: bool,
+    /// Whether the Changes inspector is hidden. History never draws that
+    /// rail, so the flag means nothing there — it applies on the next entry.
+    /// Collapsing while a composer field holds the keyboard hands the focus
+    /// back to the root: a field in a rail nobody draws must not keep it.
+    pub inspector_collapsed: bool,
+    /// Whether History's branch timeline is hidden, leaving the commit's
+    /// detail the full width of the destination. The commits pane the
+    /// timeline projects keeps its cursor either way — the rail is a
+    /// projection, not the list itself.
+    pub timeline_collapsed: bool,
+    /// The widths the pointer last dragged each rail to — `None` is the
+    /// spec's rung for the current window, which is also what a double-click
+    /// on the edge restores. The session file remembers them; a width taken
+    /// on a bigger window is clamped by the draw helpers rather than thrown
+    /// away, so the preference survives the window that cannot afford it.
+    pub sidebar_w: Option<f32>,
+    /// See `sidebar_w` — the Changes rail the composer lives in.
+    pub inspector_w: Option<f32>,
+    /// See `sidebar_w` — History's branch timeline.
+    pub timeline_w: Option<f32>,
+    /// Where the side-by-side diff's rule stands, as a fraction of the row —
+    /// [`views::split::SPLIT_HALF`] until a drag says otherwise. A fraction
+    /// rather than a width because the share is the preference: the same 60%
+    /// is the right answer on every window. Kept here and not on the diffs
+    /// themselves because the centre and the commit detail are two entities
+    /// that should never disagree about it.
+    pub split_fraction: f32,
     /// The destination the header names and the sidebar follows.
     pub destination: Destination,
     /// The center diff: built once on first entry, re-aimed per selection —
@@ -196,6 +320,13 @@ pub struct Workspace {
 impl Default for Workspace {
     fn default() -> Self {
         Self {
+            sidebar_collapsed: false,
+            inspector_collapsed: false,
+            timeline_collapsed: false,
+            sidebar_w: None,
+            inspector_w: None,
+            timeline_w: None,
+            split_fraction: super::split::SPLIT_HALF,
             destination: Destination::Changes,
             center: None,
             blob: None,

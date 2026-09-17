@@ -2428,6 +2428,24 @@ impl Commands {
                 None,
                 false,
             ),
+            (
+                "workspace.toggle-sidebar",
+                "show or hide the workspace's left sidebar",
+                None,
+                false,
+            ),
+            (
+                "workspace.toggle-inspector",
+                "show or hide the Changes inspector",
+                None,
+                false,
+            ),
+            (
+                "workspace.toggle-timeline",
+                "show or hide the History timeline",
+                None,
+                false,
+            ),
             ("input.accept", "accept the text", None, false),
             ("input.cancel", "discard the text", None, false),
             ("pane.next", "the next list in the column", None, false),
@@ -2532,6 +2550,9 @@ mod tests {
             "workspace.changes",
             "workspace.history",
             "workspace.preview",
+            "workspace.toggle-sidebar",
+            "workspace.toggle-inspector",
+            "workspace.toggle-timeline",
             "commands.palette",
         ] {
             assert!(commands.known(name), "{name} is not registered");

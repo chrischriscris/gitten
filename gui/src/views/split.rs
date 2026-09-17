@@ -16,11 +16,13 @@
 //!
 //! # One column width for the whole diff
 //!
-//! Half of what is left after the page padding and the rule between them,
-//! whatever the diff holds and whatever the wrap is doing — so the divider is
-//! one straight vertical line from the first row to the last and it is in the
-//! same place in every diff. Per-file widths move the divider as you scroll, and
-//! a boundary that drifts is worse than one that is too far right.
+//! A remembered fraction of what is left after the page padding and the rule
+//! between them — [`SPLIT_HALF`] until a drag on the rule says otherwise —
+//! whatever the diff holds and whatever the wrap is doing. The divider is
+//! one straight vertical line from the first row to the last and it is in
+//! the same place in every diff. Per-file widths move the divider as you
+//! scroll, and a boundary that drifts is worse than one that is too far
+//! right; a boundary the pointer moves is a layout choice, not a drift.
 //!
 //! **Wrapping on**, everything fits: a line too wide for a column continues on
 //! the row below and a pair row is as tall as its taller side. **Wrapping off**,
@@ -107,6 +109,15 @@ const GUTTER_PAD: f32 = 8.0;
 const SIGN_W: f32 = 14.0;
 /// The rule between the columns.
 const RULE_W: f32 = 1.0;
+/// Where the rule stands until a drag says otherwise: the drawable width
+/// halved. A divider nobody has touched sits at the same place it always
+/// has, and a double-click on it lands it back here.
+pub const SPLIT_HALF: f32 = 0.5;
+/// The narrowest either column may be dragged to, in pixels — gutter, sign
+/// and enough text that the column still reads as a column. The bound is in
+/// pixels rather than a fraction because a fraction floor is a different
+/// width on every window.
+const SPLIT_MIN_CELL: f32 = 140.0;
 /// Slack on the measured column width, in characters.
 ///
 /// `font.advance` is an approximation by construction — it is a fraction of the
@@ -116,8 +127,8 @@ const SLACK: f32 = 2.0;
 
 /// Everything drawn besides the two columns of text: the page padding at each
 /// edge, a gutter and a sign column on each side, and the rule between them.
-/// Half of what is left is one column, which is what makes a wrapped line here
-/// break at half the width it would in the unified presentation.
+/// The tests spell a window width as `CHROME` plus a per-column share, which
+/// is the shape the arithmetic keeps.
 ///
 /// The padding is the unified view's [`PAD`] and not zero, for the same reasons
 /// that view has it: the headers this presentation shares are drawn at `PAD`,
@@ -125,6 +136,7 @@ const SLACK: f32 = 2.0;
 /// scrollbar overlays the right edge, so an unwrapped right-hand column without
 /// a right pad runs under it. The divider stays one straight line — every row
 /// loses the same two strips.
+#[cfg(test)]
 const CHROME: f32 = 2.0 * PAD + 2.0 * (GUTTER_W + SIGN_W) + RULE_W;
 
 /// One prepared line, ready to draw. Held in a flat table so that a context
@@ -187,13 +199,21 @@ pub struct SplitRows {
     /// Where each *line* breaks — indexed by line and not by row, because a pair
     /// row draws two of them and a context line is drawn by two columns.
     wrapped: Wrapped,
-    /// The budget one column got and the policy it was built with.
-    cols: usize,
+    /// The budget each column got and the policy it was built with — a
+    /// dragged rule makes them differ, and a context line, drawn by both,
+    /// wraps to the narrower so it fits whichever side it lands on.
+    cols: (usize, usize),
     wrap: &'static str,
-    /// The window, in pixels. What the columns are halves of, and therefore the
-    /// one number the divider's position and a click's column both come from —
-    /// a click that lands on the wrong side of the rule is the whole bug one
-    /// field prevents.
+    /// The rule's stand as a fraction of the drawable width — `None` is
+    /// [`SPLIT_HALF`]. Remembered as a fraction and not a pixel width so a
+    /// window drag keeps the share the pointer chose; the pixels floor each
+    /// column back to [`SPLIT_MIN_CELL`] at draw time, so a share taken on a
+    /// wide window cannot erase a column on a narrow one.
+    divider: Option<f32>,
+    /// The window, in pixels. What the columns are fractions of, and therefore
+    /// the one number the divider's position and a click's column both come
+    /// from — a click that lands on the wrong side of the rule is the whole
+    /// bug one field prevents.
     width: f32,
     /// What drawing borrows. Cleared per cell, grown once ever — see [`Scratch`].
     scratch: RefCell<Scratch>,
@@ -229,17 +249,18 @@ impl Rows for SplitRows {
     }
 
     fn reflow(&mut self, width: f32, host: &Host, wrap: &dyn Wrap) -> bool {
-        // Half of what is left over, less the slack the column already carries,
-        // because a column is drawn `SLACK` characters wider than its content.
+        // Each column's share of what is left over, less the slack the column
+        // already carries, because a column is drawn `SLACK` characters wider
+        // than its content. A dragged rule gives the two different budgets.
         let f = &host.font;
-        let cols = columns(
-            (width - CHROME) / 2.0,
-            SLACK * f.size * f.advance,
-            f.size,
-            host,
+        let (left, right) = self.cells(width);
+        let slack = SLACK * f.size * f.advance;
+        let cols = (
+            columns(left - GUTTER_W - SIGN_W, slack, f.size, host),
+            columns(right - GUTTER_W - SIGN_W, slack, f.size, host),
         );
         // The width lands whatever else is true: it is what the divider and the
-        // hit test are halves of, and a stale one puts the rule somewhere the
+        // hit test are fractions of, and a stale one puts the rule somewhere the
         // click does not agree with. No row count depends on it, which is why it
         // is not on its own a reason to rebuild the order table.
         self.width = width;
@@ -256,7 +277,21 @@ impl Rows for SplitRows {
             self.wrapped = Wrapped::default();
             return broken;
         }
-        self.wrapped = Wrapped::build(self.lines.iter().map(|l| (l.text.as_ref(), cols)), wrap);
+        // One line, one budget — the column it is drawn in. A context line is
+        // drawn by both, so it wraps to the narrower: a break it did not need
+        // in the wide column is honest, text it cannot fit in the narrow one
+        // is not.
+        self.wrapped = Wrapped::build(
+            self.lines.iter().map(|l| {
+                let cols = match l.kind {
+                    LineKind::Removed => cols.0,
+                    LineKind::Added => cols.1,
+                    LineKind::Context => cols.0.min(cols.1),
+                };
+                (l.text.as_ref(), cols)
+            }),
+            wrap,
+        );
         true
     }
 
@@ -330,18 +365,42 @@ impl Rows for SplitRows {
         }
     }
 
+    /// The rule's x within the row — what the drag probe's hit test and the
+    /// edge strip's cursor both stand on. The fraction is the remembered
+    /// preference; the x is what the window is actually drawing, floor
+    /// included, so the two cannot disagree. Before the first reflow the
+    /// answer would be the padding's x — a position nothing painted, which
+    /// is `None`'s job.
+    fn divider(&self) -> Option<f32> {
+        (self.width > 0.0).then(|| rule_x(self.width, self.divider.unwrap_or(SPLIT_HALF)))
+    }
+
+    /// A drag on the rule: remember the fraction. The reflow that follows —
+    /// the same one a window resize pays — gives each column its new budget.
+    fn set_divider(&mut self, fraction: f32) {
+        self.divider = Some(fraction.clamp(0.05, 0.95));
+    }
+
     /// A column's text and not the row's: what has to reach the edge of the
     /// window is the widest line, and the window it has to reach the edge of is
     /// one column of two.
     fn overflow(&self, index: usize, seg: usize, width: f32, host: &Host) -> f32 {
-        let text = self.width(index, seg) as f32 * host.font.char_width();
-        let room = match &self.rows[index] {
-            Row::Pair { .. } => self.col_px(width),
+        let cw = host.font.char_width();
+        match &self.rows[index] {
+            // Each side's text is answered by its own column's room: a
+            // dragged rule makes them differ, and the longer line is not
+            // always the one that runs over.
+            Row::Pair { old, new } => {
+                let (left, right) = self.cells(width);
+                let over = |l: &Option<u32>, cell: f32| {
+                    (self.chars(*l, seg) as f32 * cw - (cell - GUTTER_W - SIGN_W)).max(0.0)
+                };
+                over(old, left).max(over(new, right))
+            }
             // A header is the built-in's, drawn across the whole row behind the
             // page padding and nothing else.
-            _ => width - 2.0 * PAD,
-        };
-        (text - room).max(0.0)
+            _ => (self.width(index, seg) as f32 * cw - (width - 2.0 * PAD)).max(0.0),
+        }
     }
 
     fn report(&self) -> String {
@@ -349,8 +408,8 @@ impl Rows for SplitRows {
             return String::new();
         }
         let mut out = format!(
-            "split {} paired · {} cols · widest {}",
-            self.paired, self.cols, self.widest_chars
+            "split {} paired · {}+{} cols · widest {}",
+            self.paired, self.cols.0, self.cols.1, self.widest_chars
         );
         if self.moved > 0 {
             out.push_str(&format!(" · {} moved", self.moved));
@@ -373,7 +432,7 @@ impl Rows for SplitRows {
             Row::File { path, .. } => Some(header_hit(path, x, host, shift)),
             Row::Hunk(h) => Some(hunk_hit(h, x, host, shift)),
             Row::Pair { old, new } => {
-                let cell = PAD + self.cell_px(self.width);
+                let cell = PAD + self.cells(self.width).0;
                 let (part, from) = match x < cell + RULE_W {
                     true => (Column::Old, PAD),
                     false => (Column::New, cell + RULE_W),
@@ -453,14 +512,16 @@ impl Rows for SplitRows {
             Row::Hunk(header) => hunk_header(header, theme, sel, state, shift),
             Row::Pair { old, new } => {
                 // Page padding, then two columns of *measured* width and a
-                // fixed rule. The width is `cell_px` — the number the hit test
-                // divides clicks at — and not a flex share: as a direct child
-                // of a `uniform_list` item, two `flex_1` halves do not come out
-                // equal (the list measures its items against their content, and
-                // the distribution goes content-driven; measured, not guessed —
-                // see `list_layout_tests`). Fixed pixels cannot drift, and they
-                // make drawing and hit test the same number by construction.
-                let cell = px(self.cell_px(self.width));
+                // fixed rule. The widths are `cells` — the numbers the hit
+                // test divides clicks at — and not a flex share: as a direct
+                // child of a `uniform_list` item, two `flex_1` halves do not
+                // come out equal (the list measures its items against their
+                // content, and the distribution goes content-driven; measured,
+                // not guessed — see `list_layout_tests`). Fixed pixels cannot
+                // drift, and they make drawing and hit test the same numbers
+                // by construction. A dragged rule gives the two different
+                // widths.
+                let (cell_old, cell_new) = self.cells(self.width);
                 // The row's own background, and the bar on it: one frame, the
                 // same rule every presentation runs, so the bar and the wash
                 // cannot be decided twice.
@@ -472,7 +533,7 @@ impl Rows for SplitRows {
                 // toggling `s` does not change whether a hunk reads as a block
                 // or as a striped column. The widths are the old geometry to
                 // the pixel — `bar + left pad = PAD`, right pad = `PAD` — so
-                // `cell_px` and the hit test, which both divide clicks assuming
+                // `cells` and the hit test, which both divide clicks assuming
                 // text starts at `PAD`, do not move.
                 let old_bg = self.side_bg(*old, seg, state, theme);
                 let new_bg = self.side_bg(*new, seg, state, theme);
@@ -496,7 +557,7 @@ impl Rows for SplitRows {
                         state,
                         shift,
                         index,
-                        cell,
+                        px(cell_old),
                     ))
                     .child(
                         div()
@@ -518,7 +579,7 @@ impl Rows for SplitRows {
                         state,
                         shift,
                         index,
-                        cell,
+                        px(cell_new),
                     ))
                     .child(div().flex_none().w(px(PAD)).h(px(ROW_H)).bg(rgb(new_bg)))
                     .into_any_element()
@@ -528,22 +589,20 @@ impl Rows for SplitRows {
 }
 
 impl SplitRows {
-    /// How wide one column is, gutter and sign included: half of what is left
-    /// of the window after the page padding and the rule.
+    /// How wide each column is, gutter and sign included: the remembered
+    /// fraction of what is left of the window after the page padding and the
+    /// rule, floored at [`SPLIT_MIN_CELL`] so a share that was reasonable on
+    /// a wide window cannot starve a column on a narrow one.
     ///
     /// Shared by the drawing and the hit test so the divider is in the same place
     /// in both — the click that lands on the wrong side of it is the whole bug
     /// this one function prevents. The drawing takes it as a literal pixel
     /// width, so the divider *is* this number rather than the same arithmetic
     /// done twice.
-    fn cell_px(&self, width: f32) -> f32 {
-        ((width - 2.0 * PAD - RULE_W) / 2.0).max(0.0)
-    }
-
-    /// How wide one column's *text* is, in pixels: the column less its own gutter
-    /// and sign, which do not scroll and are not the text's to use.
-    fn col_px(&self, width: f32) -> f32 {
-        (self.cell_px(width) - GUTTER_W - SIGN_W).max(0.0)
+    fn cells(&self, width: f32) -> (f32, f32) {
+        let avail = drawable(width);
+        let left = avail * clamped(width, self.divider.unwrap_or(SPLIT_HALF));
+        (left, avail - left)
     }
 
     /// How many characters one side of a pair draws on visual row `seg`, after
@@ -692,6 +751,34 @@ impl SplitRows {
             ))
             .into_any_element()
     }
+}
+
+/// The width a row of `width` offers the two cells between the page padding
+/// and the rule — the space the remembered fraction divides.
+fn drawable(width: f32) -> f32 {
+    (width - 2.0 * PAD - RULE_W).max(0.0)
+}
+
+/// A fraction clamped to what keeps both columns drawable at this width:
+/// each keeps at least [`SPLIT_MIN_CELL`], so a share dragged wide on a
+/// large window cannot erase a column on a small one.
+fn clamped(width: f32, fraction: f32) -> f32 {
+    let lo = (SPLIT_MIN_CELL / drawable(width).max(1.0)).min(SPLIT_HALF);
+    fraction.clamp(lo, 1.0 - lo)
+}
+
+/// The rule's x within a row of `width` under `fraction` — where the drag
+/// probe's hit test and the edge strip's cursor stand. The same arithmetic
+/// `cells` draws by, spelled for callers holding a row's width rather than
+/// the presentation.
+pub fn rule_x(width: f32, fraction: f32) -> f32 {
+    PAD + drawable(width) * clamped(width, fraction)
+}
+
+/// The fraction a row-relative pointer asks the rule to take — the inverse
+/// of [`rule_x`], with the same floor.
+pub fn fraction_at(width: f32, x: f32) -> f32 {
+    clamped(width, (x - PAD) / drawable(width).max(1.0))
 }
 
 /// One column of one row: its measured half, whatever is in it.
@@ -888,8 +975,8 @@ diff --git a/a.rs b/a.rs
         let (mut r, host) = wrapped(LOPSIDED, 20);
         let f = &host.font;
         let width = super::CHROME + 2.0 * (20.0 + super::SLACK + 0.5) * f.size * f.advance;
-        let half = r.cell_px(width);
-        assert_eq!(r.cols, 20);
+        let half = r.cells(width).0;
+        assert_eq!(r.cols, (20, 20));
         let pair = (0..r.len())
             .find(|i| matches!(r.rows[*i], Row::Pair { .. }))
             .unwrap();
@@ -902,13 +989,14 @@ diff --git a/a.rs b/a.rs
             r.reflow(width, &host, off),
             "the rows did not come back together"
         );
-        assert_eq!(r.cell_px(width), half, "the divider moved with the wrap");
+        assert_eq!(r.cells(width).0, half, "the divider moved with the wrap");
         // And now the long side runs past its column's edge by however much of
         // it did not fit.
         let over = r.overflow(pair, 0, width, &host);
         assert!(over > 0.0, "a 74-character line fits a 20-character column");
         let text = r.widest_chars as f32 * host.font.char_width();
-        assert!((over - (text - r.col_px(width))).abs() < 0.001, "{over}");
+        let room = r.cells(width).0 - GUTTER_W - SIGN_W;
+        assert!((over - (text - room)).abs() < 0.001, "{over}");
     }
 
     #[test]
@@ -925,14 +1013,14 @@ diff --git a/a.rs b/a.rs
     fn the_divider_decides_which_column_a_click_is_in() {
         // The one bug this presentation can have that the others cannot: a click
         // a pixel the wrong side of the rule selects the file you were not
-        // reading. `col_px` is shared with the drawing so it cannot drift.
+        // reading. `cells` is shared with the drawing so it cannot drift.
         let host = Host::new();
         let mut r = built();
         r.reflow(900.0, &host, host.wrap.current());
         let pair = (0..r.len())
             .find(|i| matches!(r.rows[*i], Row::Pair { .. }))
             .unwrap();
-        let rule_at = PAD + r.cell_px(900.0);
+        let rule_at = PAD + r.cells(900.0).0;
 
         let left = r
             .hit(pair, 0, PAD + GUTTER_W + SIGN_W + 2.0, &host, 0.0)
@@ -1012,7 +1100,7 @@ diff --git a/a.rs b/a.rs
         assert_eq!(r.hit(pair, 0, PAD + into, &host, shift).unwrap().off, 4);
         // The right-hand column too, from its own edge — past the padding and
         // the rule — and still part 1: the divider did not move.
-        let across = PAD + r.cell_px(900.0) + RULE_W + into;
+        let across = PAD + r.cells(900.0).0 + RULE_W + into;
         let right = r.hit(pair, 0, across, &host, shift).unwrap();
         assert_eq!((right.part, right.off), (1, 4));
         // A click on a line number is the first character there is to see, not
