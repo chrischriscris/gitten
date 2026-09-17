@@ -22,10 +22,6 @@ use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use std::rc::Rc;
 
-/// The reference's timeline column: 310px at ordinary desktop widths, with
-/// the commit detail taking the rest.
-pub const TIMELINE_W: f32 = 310.0;
-
 /// One timeline row. Fixed, because `uniform_list` virtualizes one height and
 /// the reference's rows are uniform enough that the ref-tag air can live
 /// inside the slot rather than opening a variable-height list.
@@ -54,6 +50,14 @@ pub(crate) struct HistoryDeps {
     pub changed: usize,
     /// HEAD's spelling, for the detail's footer.
     pub branch: SharedString,
+    /// Whether the timeline rail is drawn at all. Collapsed leaves the
+    /// detail the destination's whole width — the commits pane keeps its
+    /// cursor either way; this only says whether its projection is up.
+    pub collapsed: bool,
+    /// The width the rail draws at: the spec's, or the remembered drag's,
+    /// resolved by the shell — the viewport read that decides it is not the
+    /// view's to make.
+    pub timeline_w: f32,
 }
 
 /// The whole destination: the 310px timeline over a hairline, then the
@@ -62,6 +66,9 @@ pub(crate) fn render_history(deps: &HistoryDeps, cx: &mut App) -> AnyElement {
     let host = crate::config::host(cx);
     let c = host.theme.chrome;
     let dim = host.theme.dim_on(Surface::Context);
+    // Copied out for the animators — `deps` is a borrow and the closures are
+    // 'static.
+    let timeline_w = deps.timeline_w;
     let cursor = deps.commits.read(cx).cursor();
     let rows = deps.commits.read(cx).rows();
     // The detail's presentation registry, read once per frame: what the picker
@@ -277,6 +284,7 @@ pub(crate) fn render_history(deps: &HistoryDeps, cx: &mut App) -> AnyElement {
         .child(SharedString::from(format!("Authored on {}", deps.branch)));
 
     let detail = div()
+        .debug_selector(|| "history-detail".to_string())
         .min_w_0()
         .min_h_0()
         .flex_grow(1.0)
@@ -288,8 +296,25 @@ pub(crate) fn render_history(deps: &HistoryDeps, cx: &mut App) -> AnyElement {
             div()
                 .min_h_0()
                 .flex_grow(1.0)
+                .relative()
                 .overflow_hidden()
-                .child(deps.diff.clone()),
+                .child(deps.diff.clone())
+                // The same drag edge the Changes centre gets: the strip
+                // paints the cursor, the shell's probe owns the drag. Only
+                // while the layout is the two-column one.
+                .when_some(deps.diff.read(cx).divider(), |d, x| {
+                    d.child(
+                        div()
+                            .id("split-edge")
+                            .debug_selector(|| "split-edge".to_string())
+                            .absolute()
+                            .top_0()
+                            .bottom_0()
+                            .left(px(x - crate::views::workspace::RAIL_GRAB_W * 0.5))
+                            .w(px(crate::views::workspace::RAIL_GRAB_W))
+                            .cursor_col_resize(),
+                    )
+                }),
         )
         .child(footer);
 
@@ -361,55 +386,95 @@ pub(crate) fn render_history(deps: &HistoryDeps, cx: &mut App) -> AnyElement {
         // root already draws it in the code font. The chrome around it — the
         // timeline, the commit's heading, the footer — names the chrome face
         // for itself, the way every other pane's furniture does.
+        //
+        // Collapsed is a spring target of zero width, not an absent child —
+        // the rail stays in the tree so a re-open keeps the spring's
+        // velocity, and the settled stub paints and hit-tests nothing. The
+        // flag still decides what counts as drawn (`pane_drawn`, the wheel);
+        // this element is only the slide. The inner column pins to the
+        // receding edge, so the timeline slides left off the detail instead
+        // of squashing its rows.
         .child(
             div()
                 .flex_none()
-                .w(px(TIMELINE_W))
                 .min_h_0()
+                .relative()
                 .flex()
                 .flex_col()
                 .overflow_hidden()
+                .items_end()
                 .font_family(host.chrome_family.clone())
-                .border_r_1()
-                .border_color(rgb(c.border))
                 .child(
                     div()
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .px(px(18.0))
-                        .pt(px(16.0))
-                        .pb(px(12.0))
-                        .text_size(px(11.0))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(c.fg))
-                        .child("Branch history")
-                        .child(chrome::icon(
-                            "gitten/branch.svg",
-                            13.0,
-                            host.theme.dim_on(Surface::Context),
-                        )),
-                )
-                .child(div().flex_none().px(px(10.0)).child(uncommitted))
-                .child(
-                    div()
-                        // The bar overlays the list, so the container is the
-                        // positioned ancestor — the same shape the rail and
-                        // every pane's strip container use.
-                        .relative()
+                        .w(px(timeline_w))
                         .min_h_0()
                         .flex_grow(1.0)
-                        .overflow_hidden()
-                        .px(px(10.0))
-                        .child(timeline)
-                        .when(host.view.scrollbar, |d| {
-                            // `direct`: the timeline's wheel writes the handle's
-                            // own offset in the platform's pixels, so nothing
-                            // is banked for a thumb drag to cancel — only the
-                            // strict request the cursor-follow scroll parks.
-                            d.child(vertical_scrollbar(&DeferredScrollbar::direct(&deps.scroll)))
-                        }),
+                        .flex()
+                        .flex_col()
+                        // The border rides the inner edge: pinned to the
+                        // receding side it sweeps with the slide, and at a
+                        // settled zero the clip takes it.
+                        .border_r_1()
+                        .border_color(rgb(c.border))
+                        .child(
+                            div()
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .px(px(18.0))
+                                .pt(px(16.0))
+                                .pb(px(12.0))
+                                .text_size(px(11.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(c.fg))
+                                .child("Branch history")
+                                .child(chrome::icon(
+                                    "gitten/branch.svg",
+                                    13.0,
+                                    host.theme.dim_on(Surface::Context),
+                                )),
+                        )
+                        .child(div().flex_none().px(px(10.0)).child(uncommitted))
+                        .child(
+                            div()
+                                // The bar overlays the list, so the container is the
+                                // positioned ancestor — the same shape the rail and
+                                // every pane's strip container use.
+                                .relative()
+                                .min_h_0()
+                                .flex_grow(1.0)
+                                .overflow_hidden()
+                                .px(px(10.0))
+                                .child(timeline)
+                                .when(host.view.scrollbar, |d| {
+                                    // `direct`: the timeline's wheel writes the handle's
+                                    // own offset in the platform's pixels, so nothing
+                                    // is banked for a thumb drag to cancel — only the
+                                    // strict request the cursor-follow scroll parks.
+                                    d.child(vertical_scrollbar(&DeferredScrollbar::direct(
+                                        &deps.scroll,
+                                    )))
+                                }),
+                        ),
+                )
+                // The drag strip on the receding edge — the probe owns the
+                // drag; this only paints the resize cursor's hitbox, and the
+                // flag retires it with the rest of the rail.
+                .child(
+                    div()
+                        .id("timeline-edge")
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .right_0()
+                        .w(px(crate::views::workspace::RAIL_GRAB_W))
+                        .when(!deps.collapsed, |d| d.cursor_col_resize()),
+                )
+                .with_spring(
+                    "history-timeline-w",
+                    crate::views::workspace::rail_spring(deps.collapsed),
+                    move |d, v| d.w(px(timeline_w * v.max(0.0))),
                 ),
         )
         .child(detail)

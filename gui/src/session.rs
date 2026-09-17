@@ -26,12 +26,22 @@
 use std::path::{Path, PathBuf};
 
 /// A place in a view, and the command it belongs to.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Session {
     /// The command that produced the view — see the note above about matching.
     pub key: String,
     /// First visible row.
     pub top: usize,
+    /// The rail widths the pointer last dragged to, remembered with the
+    /// position they were taken beside — `None` is the spec's rung for the
+    /// window at hand. Sidebar, inspector, timeline; see `views::workspace`.
+    pub sidebar_w: Option<f32>,
+    pub inspector_w: Option<f32>,
+    pub timeline_w: Option<f32>,
+    /// The side-by-side rule's share of the row — a fraction rather than a
+    /// width, because the share is what the pointer chose and a width taken
+    /// on one window is the wrong answer on another.
+    pub split: Option<f32>,
 }
 
 // The key for one invocation is `gitten_app::cli::Source::key`: it is everything
@@ -46,20 +56,54 @@ pub fn path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("target/gitten-session"))
 }
 
-/// Two lines: the key, then the row. Hand-rolled rather than TOML because this is
-/// a scratch file written every few hundred milliseconds and read once, and a
-/// format nobody hand-edits does not need a parser.
+/// Three lines: the key, then the row, then the rail widths as one
+/// comma-joined field — an empty slot is the spec's rung. Hand-rolled rather
+/// than TOML because this is a scratch file written every few hundred
+/// milliseconds and read once, and a format nobody hand-edits does not need
+/// a parser.
 pub fn encode(s: &Session) -> String {
-    format!("{}\n{}\n", s.key, s.top)
+    let w = |w: Option<f32>| w.map(|w| w.to_string()).unwrap_or_default();
+    format!(
+        "{}\n{}\n{},{},{},{}\n",
+        s.key,
+        s.top,
+        w(s.sidebar_w),
+        w(s.inspector_w),
+        w(s.timeline_w),
+        w(s.split)
+    )
 }
 
 /// `None` for anything unexpected. This file is a convenience — a corrupt or
-/// half-written one must be ignored, never an error, and never a panic.
+/// half-written one must be ignored, never an error, and never a panic. The
+/// widths line is younger than the other two, so it is also allowed to be
+/// missing or mangled — a bad width decays to the spec, not to a lost
+/// position.
 pub fn decode(text: &str) -> Option<Session> {
     let mut lines = text.lines();
     let key = lines.next()?.to_string();
     let top = lines.next()?.trim().parse().ok()?;
-    (!key.is_empty()).then_some(Session { key, top })
+    let width = |s: Option<&str>| {
+        s.and_then(|s| s.parse::<f32>().ok())
+            .filter(|w| w.is_finite() && *w > 0.0)
+    };
+    let mut widths = lines.next().unwrap_or("").split(',');
+    let (sidebar_w, inspector_w, timeline_w) = (
+        width(widths.next()),
+        width(widths.next()),
+        width(widths.next()),
+    );
+    // The rule's share is a fraction, not a width: `0 < f < 1` is the whole
+    // of what makes one valid.
+    let split = width(widths.next()).filter(|f| *f < 1.0);
+    (!key.is_empty()).then_some(Session {
+        key,
+        top,
+        sidebar_w,
+        inspector_w,
+        timeline_w,
+        split,
+    })
 }
 
 /// The saved position, if there is one *and* it belongs to this command.
@@ -96,6 +140,10 @@ mod tests {
         Session {
             key: key(View::Diff, ".", "HEAD~2..HEAD"),
             top: 431,
+            sidebar_w: Some(302.5),
+            inspector_w: None,
+            timeline_w: Some(240.0),
+            split: Some(0.62),
         }
     }
 
@@ -103,6 +151,46 @@ mod tests {
     fn a_session_survives_a_round_trip() {
         let s = session();
         assert_eq!(decode(&encode(&s)), Some(s));
+    }
+
+    #[test]
+    fn a_session_without_widths_is_older_not_corrupt() {
+        // The widths line is younger than the file: a two-line session is a
+        // position from before rails resized, and it decodes with the spec's
+        // rungs rather than failing.
+        assert_eq!(
+            decode("key\n431\n"),
+            Some(Session {
+                key: "key".into(),
+                top: 431,
+                ..Session::default()
+            })
+        );
+    }
+
+    #[test]
+    fn a_mangled_width_decays_to_the_spec_not_to_a_lost_row() {
+        // A kill mid-flush can leave half the line; each field decays on its
+        // own, and the row itself still comes back.
+        let s = decode("key\n431\n302.5,oops,\n").unwrap();
+        assert_eq!(s.top, 431);
+        assert_eq!(s.sidebar_w, Some(302.5));
+        assert_eq!(s.inspector_w, None);
+        assert_eq!(s.timeline_w, None);
+        for bad in ["key\n1\nNaN,,-4\n", "key\n1\n0,inf,\n"] {
+            let s = decode(bad).unwrap();
+            assert_eq!(
+                (s.sidebar_w, s.inspector_w, s.timeline_w),
+                (None, None, None),
+                "{bad:?} kept a width"
+            );
+        }
+        // The rule's share is a fraction: outside `0 < f < 1` it is not a
+        // share at all, and a missing slot is a three-width file — still a
+        // session, just an older one.
+        let s = decode("key\n431\n,320,,1.5\n").unwrap();
+        assert_eq!((s.inspector_w, s.split), (Some(320.0), None));
+        assert_eq!(decode("key\n431\n,320,,0.62\n").unwrap().split, Some(0.62));
     }
 
     #[test]
@@ -152,6 +240,7 @@ mod tests {
         let s = Session {
             key: "k".into(),
             top: 713_995,
+            ..Session::default()
         };
         assert_eq!(decode(&encode(&s)), Some(s));
     }

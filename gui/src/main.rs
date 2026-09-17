@@ -85,13 +85,17 @@ mod start {
 #[global_allocator]
 static ALLOC: stats::Counting = stats::Counting;
 
-// The three keys that stay GPUI actions, and why: they are the platform's.
-// Cmd-Q quits whatever Mac app you are in, Cmd-C and Cmd-A are what the Edit
-// menu exists for, and Cmd-, opens whatever Mac app's settings you are in —
-// a Mac user's fingers already know all four. The menu items below carry
-// them; their handlers call [`DevShell::run_command`] with the *named*
-// commands every other door uses — `quit`, `copy.selection`, `select.all`,
-// `settings` — so a menu item is an adapter and not a second path.
+// The keys that stay GPUI actions, and why: they spell the platform
+// modifier, which `command::Key` cannot carry. Cmd-Q quits whatever Mac app
+// you are in, Cmd-C and Cmd-A are what the Edit menu exists for, Cmd-, opens
+// whatever Mac app's settings you are in — a Mac user's fingers already know
+// all four. Cmd-B and Cmd-Opt-B are the same convention's sidebar pair —
+// Xcode owns them so thoroughly the chord *is* the word for the gesture —
+// and they dispatch to `workspace.toggle-*` like every other door: the menu
+// items below carry them, their handlers call [`DevShell::run_command`]
+// with the *named* commands every other door uses — `quit`,
+// `copy.selection`, `select.all`, `settings` — so a menu item is an adapter
+// and not a second path.
 actions!(
     gitten,
     [
@@ -100,7 +104,9 @@ actions!(
         SelectAll,
         OpenSettings,
         ShowCommands,
-        CommitStaged
+        CommitStaged,
+        ToggleSidebar,
+        ToggleSecondary
     ]
 );
 
@@ -1338,6 +1344,11 @@ struct DevShell {
     /// Which axis the wheel gesture in flight belongs to. `gpui`'s own lock,
     /// held here — the one place that sees every wheel event first.
     ongoing: Cell<OngoingScroll>,
+    /// A rail edge under the pointer: which rail, the x the grab happened at
+    /// and the width it started from, so a move is `start + (x - grab)`.
+    /// `Some` only between the edge's mouse-down and the mouse-up that ends
+    /// it — the probe on the canvas owns the whole gesture.
+    rail_drag: Option<RailDrag>,
     /// The project menu's rows, loaded when the menu opens and read while it
     /// stands — never per frame, because reading them is file I/O and the
     /// render path does none. Most-recent first; the current repository is
@@ -4041,6 +4052,10 @@ impl DevShell {
                 &session::Session {
                     key: self.session_key.clone(),
                     top,
+                    sidebar_w: self.workspace.sidebar_w,
+                    inspector_w: self.workspace.inspector_w,
+                    timeline_w: self.workspace.timeline_w,
+                    split: Some(self.workspace.split_fraction),
                 },
                 &self.session_path,
             );
@@ -4068,7 +4083,12 @@ impl DevShell {
         // ordinary rails; scheduling here would aim at the old cursor.
         if self.has_column {
             let host = config::host(cx);
-            let view = cx.new(|cx| views::diff::Diff::new(Vec::new(), host, cx));
+            let view = cx.new(|cx| views::diff::Diff::new(Vec::new(), host.clone(), cx));
+            // A rebuilt entity opens in the middle; the workspace's
+            // remembered fraction is what it should stand at — the same
+            // carry-over the rail widths get on a switch.
+            let split = self.workspace.split_fraction;
+            view.update(cx, |v, cx| v.set_divider(split, &host, cx));
             self.main = Screen::diff(view, None, self.generation, "");
         }
         *self.head.borrow_mut() = None;
@@ -4092,7 +4112,16 @@ impl DevShell {
             .map(|s| s.key(view))
             .unwrap_or_else(|| format!("{}:{}:", self.which, path.to_string_lossy()));
         self.session_key = key.clone();
-        self.pending_restore = session::restore(&key, &self.session_path).map(|r| r.top);
+        if let Some(session) = session::restore(&key, &self.session_path) {
+            self.pending_restore = Some(session.top);
+            // The remembered rail widths belong to the session as much as
+            // the row does — a repository that has one gets its layout back
+            // whole, not just its scroll position.
+            self.workspace.sidebar_w = session.sidebar_w;
+            self.workspace.inspector_w = session.inspector_w;
+            self.workspace.timeline_w = session.timeline_w;
+            self.set_split(session.split.unwrap_or(views::split::SPLIT_HALF), cx);
+        }
         gitten_app::projects::record(&path);
         self.refresh_stale(cx);
         let (dir, name) = repo_title(&path, home());
@@ -4353,6 +4382,12 @@ impl DevShell {
             // same honest sentence an unknown command gets.
             "workspace.changes" => self.enter_workspace(cx),
             "workspace.history" => self.enter_history(cx),
+            // The three rails' toggles: the strip button, the header button,
+            // the View menu and `cmd-b`/`cmd-alt-b` all arrive here, so a
+            // rail can never drift into a second behavior per door.
+            "workspace.toggle-sidebar" => self.toggle_sidebar(cx),
+            "workspace.toggle-inspector" => self.toggle_inspector(cx),
+            "workspace.toggle-timeline" => self.toggle_timeline(cx),
             // A pick, not a poll: a row click dispatches this after moving
             // the cursor, and choosing a file spends the launch hold even
             // when it names the file the cursor already sat on.
@@ -4603,15 +4638,27 @@ impl DevShell {
             views::workspace::Destination::History => "commits",
             _ => "files",
         };
-        let mut stops = vec![Stop::List];
+        // Only stops that are painted: a collapsed rail's list is not one —
+        // its pane is the panel's business while it is focused — and the
+        // composer fields leave the window with the inspector, so tabbing to
+        // one would aim the keyboard at nothing.
+        let inspector_drawn = self.workspace.destination == views::workspace::Destination::Changes
+            && !self.workspace.inspector_collapsed;
+        let mut stops = Vec::new();
+        if self.pane_drawn(list) {
+            stops.push(Stop::List);
+        }
         if self.main_diff().is_some() {
             stops.push(Stop::Center);
         }
-        if self.workspace.summary.is_some() {
+        if inspector_drawn && self.workspace.summary.is_some() {
             stops.push(Stop::Summary);
         }
-        if self.workspace.description.is_some() {
+        if inspector_drawn && self.workspace.description.is_some() {
             stops.push(Stop::Description);
+        }
+        if stops.is_empty() {
+            return;
         }
         let current = match self.workspace_field_focused(window, cx) {
             Some(true) => stops.iter().position(|s| matches!(s, Stop::Description)),
@@ -4733,11 +4780,18 @@ impl DevShell {
     /// Whether the workspace's current destination draws the named pane —
     /// `files` in the Changes rail, `commits` on the History timeline. The
     /// registry holds panes no destination draws; [`DevShell::panel`] is how
-    /// one of them shows.
+    /// one of them shows. A collapsed rail draws nothing, which makes its
+    /// tenant indistinguishable from a pane no destination ever draws — the
+    /// frame's answer to both is the panel, which is exactly how a focused
+    /// list survives its rail being hidden.
     fn pane_drawn(&self, name: &str) -> bool {
         match self.workspace.destination {
-            views::workspace::Destination::Changes => name == "files",
-            views::workspace::Destination::History => name == "commits",
+            views::workspace::Destination::Changes => {
+                name == "files" && !self.workspace.sidebar_collapsed
+            }
+            views::workspace::Destination::History => {
+                name == "commits" && !self.workspace.timeline_collapsed
+            }
         }
     }
 
@@ -4821,14 +4875,27 @@ impl DevShell {
     /// The panel's way out, run by `esc` and the close button alike: the
     /// keyboard goes back to the list this destination draws — which is also
     /// the only thing that un-derives the panel, since it stands exactly
-    /// while focus sits on an undrawn pane.
+    /// while focus sits on an undrawn pane. "Draws" is the word that matters:
+    /// a pane whose rail is collapsed has no slot to go back to, so it is no
+    /// home either — offering it would reopen the panel this just closed.
     fn close_panel(&mut self, cx: &mut Context<Self>) {
         let home = match self.workspace.destination {
             views::workspace::Destination::Changes => ["files", "commits"],
             views::workspace::Destination::History => ["commits", "files"],
         };
         for name in home {
-            if self.panes.position(name).is_some() {
+            // A home must be a pane some destination can draw: `files`
+            // stands in the Changes rail and `commits` on the History
+            // timeline, and a collapsed rail is no slot. `focus_named`
+            // crosses to the drawing destination on its own, so asking for
+            // "commits" from Changes lands on the timeline — asking for one
+            // whose rail is hidden would only reopen the panel.
+            let housed = match name {
+                "files" => !self.workspace.sidebar_collapsed,
+                "commits" => !self.workspace.timeline_collapsed,
+                _ => false,
+            };
+            if self.panes.position(name).is_some() && housed {
                 self.focus_named(name, cx);
                 return;
             }
@@ -5153,7 +5220,15 @@ impl DevShell {
         // `diff <repo> <revspec>` made its pick on the command line, so the
         // files pane has not chosen what the centre shows.
         if self.panes.position("files").is_some() && !self.workspace.launch.held() {
-            self.focus_named("files", cx);
+            // The rail is the files pane's home — collapsed, the centre is
+            // the honest place to land: the pane is still one `files.focus`
+            // away, where it stands as the panel over a destination that has
+            // no slot for it.
+            if self.workspace.sidebar_collapsed {
+                self.set_spot(Spot::Main, cx);
+            } else {
+                self.focus_named("files", cx);
+            }
         }
         self.sync_workspace_preview(cx);
     }
@@ -5166,9 +5241,64 @@ impl DevShell {
     fn enter_history(&mut self, cx: &mut Context<Self>) {
         self.workspace.destination = views::workspace::Destination::History;
         if self.panes.position("commits").is_some() {
-            self.focus_named("commits", cx);
+            // The timeline is the commits pane's home — collapsed, the
+            // detail keeps the keyboard rather than stranding it on a list
+            // no rail draws.
+            if self.workspace.timeline_collapsed {
+                self.set_spot(Spot::Main, cx);
+            } else {
+                self.focus_named("commits", cx);
+            }
         }
         self.sync_main_diff(cx);
+        cx.notify();
+    }
+
+    /// `workspace.toggle-sidebar`: the left rail's one flag, shared by both
+    /// destinations — a reader who wants it gone wants it gone, not once per
+    /// view. The title strip keeps the button that brings it back, so the
+    /// rail is the only thing hiding it costs.
+    fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        let was_drawn = self.pane_drawn(self.panes.focused_name());
+        self.workspace.sidebar_collapsed = !self.workspace.sidebar_collapsed;
+        self.settle_rail_focus(was_drawn, cx);
+    }
+
+    /// `workspace.toggle-inspector`: the Changes rail the composer lives in.
+    /// History never draws it, so the flag applies on the next entry — a
+    /// toggle there is a preference, not an error.
+    fn toggle_inspector(&mut self, cx: &mut Context<Self>) {
+        let was_drawn = self.pane_drawn(self.panes.focused_name());
+        self.workspace.inspector_collapsed = !self.workspace.inspector_collapsed;
+        if self.workspace.inspector_collapsed {
+            // The composer fields stay mounted for the slide — clipped, not
+            // gone — so a field holding the keyboard still holds a live
+            // handle in the tree. Clear the record: a field in a rail nobody
+            // sees must not keep the keystrokes.
+            self.reclaim_focus();
+        }
+        self.settle_rail_focus(was_drawn, cx);
+    }
+
+    /// `workspace.toggle-timeline`: the branch timeline — the commits pane's
+    /// projection in History — gone, so the commit's detail takes the whole
+    /// width. Changes never draws it; the flag applies on the next entry.
+    fn toggle_timeline(&mut self, cx: &mut Context<Self>) {
+        let was_drawn = self.pane_drawn(self.panes.focused_name());
+        self.workspace.timeline_collapsed = !self.workspace.timeline_collapsed;
+        self.settle_rail_focus(was_drawn, cx);
+    }
+
+    /// The rail toggles' shared tail: the keyboard cannot stay on a pane
+    /// whose draw slot just left, so it lands on the diff — the one region
+    /// every destination paints. Only a pane the rail was drawing a moment
+    /// ago is stranded: a panel already standing is the panel's business,
+    /// and expanding a rail never moves the keyboard at all — the pane's own
+    /// click or `focus` command is the way back in.
+    fn settle_rail_focus(&mut self, was_drawn: bool, cx: &mut Context<Self>) {
+        if was_drawn && self.spot == Spot::List && !self.pane_drawn(self.panes.focused_name()) {
+            self.set_spot(Spot::Main, cx);
+        }
         cx.notify();
     }
 
@@ -5183,7 +5313,9 @@ impl DevShell {
         let host = config::host(cx);
         let center = cx.new(|cx| views::diff::Diff::new(Vec::new(), host.clone(), cx));
         let weak = cx.entity().downgrade();
-        center.update(cx, |v, _| {
+        let split = self.workspace.split_fraction;
+        center.update(cx, |v, cx| {
+            v.set_divider(split, &host, cx);
             v.set_focused(self.spot == Spot::Main);
             v.hunk_action = Some(Rc::new(move |row, cx| {
                 _ = weak.update(cx, |this, cx| {
@@ -6110,21 +6242,51 @@ impl DevShell {
             ev.touch_phase,
         );
         self.ongoing.set(ongoing);
-        // The branch timeline first, and by its own painted box: it is a list
-        // on its own handle, so the wheel is its own pixels there, exactly
-        // like the rail's.
-        if self.workspace.destination == views::workspace::Destination::History
-            && views::workspace::list_bounds(&self.workspace.history_scroll).contains(&ev.position)
-        {
+        // Regions are named by geometry alone; each rail's flag then decides
+        // who owns its box. A drawn rail's list answers for it; a departing
+        // one is already dead UI — its region is becoming the centre's, so
+        // the gesture is spent on the diff and stopped before the mid-slide
+        // stub's own list can take the event natively.
+        let vp = window.viewport_size();
+        let in_band = f32::from(ev.position.y) >= TITLE_H
+            && f32::from(ev.position.y) < f32::from(vp.height) - chrome::STATUS_H;
+        let over_timeline = self.workspace.destination == views::workspace::Destination::History
+            && views::workspace::list_bounds(&self.workspace.history_scroll).contains(&ev.position);
+        if over_timeline && !self.workspace.timeline_collapsed {
+            // The branch timeline by its own painted box: it is a list on
+            // its own handle, so the wheel is its own pixels there, exactly
+            // like the rail's.
             self.wheel_list(self.workspace.history_scroll.clone(), delta, cx);
             return;
         }
+        // The sidebar rail's rect mirrors `workspace_body`'s geometry — the
+        // spec width rule on the left — and the inspector's mirrors it on
+        // the right. Both are read in Changes and in History: the region is
+        // the same box either way; the flags below name its owner.
+        let rail =
+            views::workspace::sidebar_draw_width(f32::from(vp.width), self.workspace.sidebar_w);
+        let over_rail =
+            in_band && f32::from(ev.position.x) >= 0.0 && f32::from(ev.position.x) < rail;
+        let over_inspector = in_band
+            && self.workspace.destination == views::workspace::Destination::Changes
+            && f32::from(ev.position.x)
+                >= f32::from(vp.width)
+                    - views::workspace::inspector_draw_width(
+                        f32::from(vp.width),
+                        self.workspace.inspector_w,
+                    );
         // The center's diff: the selected file's in Changes, the selected
         // commit's in History. One body, because the wheel's contract is the
         // same list arithmetic in both — `Diff` owns the model either way.
+        // Its region is its own bounds plus whatever a departing rail still
+        // paints: the slide lags the flag, and the gesture belongs to the
+        // surface the rail is uncovering.
         let center = self.main_diff();
+        let centre_owns = (over_rail && self.workspace.sidebar_collapsed)
+            || (over_inspector && self.workspace.inspector_collapsed)
+            || over_timeline;
         if let Some(center) = center {
-            if center.read(cx).list_bounds().contains(&ev.position) {
+            if centre_owns || center.read(cx).list_bounds().contains(&ev.position) {
                 let mut moved = false;
                 if !delta.x.is_zero() {
                     moved |= center.read(cx).pan_pixels(-f32::from(delta.x));
@@ -6151,26 +6313,258 @@ impl DevShell {
         // center's do: a rail row is 30px and the platform reports points,
         // so a row is not a unit either side has. Changes is the destination
         // that draws it; in History the rail is the branch note, and a glance
-        // there scrolls nothing.
-        //
-        // The rect mirrors `workspace_body`'s geometry — title bar and
-        // destination header above, status bar below, the spec width
-        // rule on the left — the one place besides composition that
-        // names those numbers.
-        let vp = window.viewport_size();
-        let rail = views::workspace::sidebar_width(f32::from(vp.width));
-        let in_sidebar = self.workspace.destination == views::workspace::Destination::Changes
-            && f32::from(ev.position.x) >= 0.0
-            && f32::from(ev.position.x) < rail
-            && f32::from(ev.position.y) >= TITLE_H
-            && f32::from(ev.position.y) < f32::from(vp.height) - chrome::STATUS_H;
-        if in_sidebar {
+        // there scrolls nothing. A departing rail's region already went to
+        // the centre above.
+        if over_rail
+            && !self.workspace.sidebar_collapsed
+            && self.workspace.destination == views::workspace::Destination::Changes
+        {
             self.wheel_list(self.workspace.sidebar_scroll.clone(), delta, cx);
         }
-        // The inspector, the destination header and the chrome scroll
-        // natively or not at all: falling through would scroll rows
-        // nobody sees. Returning unconsumed leaves text inputs their
+        // The inspector while it stands, the destination header and the
+        // chrome scroll natively or not at all: falling through would scroll
+        // rows nobody sees. Returning unconsumed leaves text inputs their
         // own pan.
+    }
+
+    /// The rail edge under a point, if any. Regions are the same geometry
+    /// `on_wheel` routes by — a few pixels straddling the rail's receding
+    /// side — and a rail answers only while it is drawn: a mid-slide rail is
+    /// dead UI even where the clip has not reached yet. The sidebar's strip
+    /// runs the whole band; the inspector's and the timeline's begin below
+    /// the header, because above it their edge is the header's own pixels.
+    /// The split's rule answers inside the drawn diff's box.
+    fn rail_edge_at(
+        &self,
+        position: Point<Pixels>,
+        window: &Window,
+        cx: &App,
+    ) -> Option<views::workspace::Rail> {
+        use views::workspace::{Destination, Rail};
+        let vp = window.viewport_size();
+        let (x, y) = (f32::from(position.x), f32::from(position.y));
+        let vp_w = f32::from(vp.width);
+        let in_band = y >= TITLE_H && y < f32::from(vp.height) - chrome::STATUS_H;
+        if !in_band {
+            return None;
+        }
+        // The painted handle sits inside the rail; the probe forgives a
+        // pixel past the border either way.
+        let at_right = |edge: f32| x >= edge - views::workspace::RAIL_GRAB_W && x <= edge + 1.0;
+        let at_left = |edge: f32| x >= edge - 1.0 && x <= edge + views::workspace::RAIL_GRAB_W;
+        let w = &self.workspace;
+        let side = views::workspace::sidebar_draw_width(vp_w, w.sidebar_w);
+        if !w.sidebar_collapsed && at_right(side) {
+            return Some(Rail::Sidebar);
+        }
+        let below_header = y >= TITLE_H + views::workspace::HEADER_H;
+        if below_header {
+            match w.destination {
+                Destination::Changes if !w.inspector_collapsed => {
+                    if at_left(vp_w - views::workspace::inspector_draw_width(vp_w, w.inspector_w)) {
+                        return Some(Rail::Inspector);
+                    }
+                }
+                // The timeline stands at the sidebar's drawn edge — zero when
+                // the rail is away, since the flags move before the paint does.
+                Destination::History if !w.timeline_collapsed => {
+                    let side_drawn = if w.sidebar_collapsed { 0.0 } else { side };
+                    if at_right(
+                        side_drawn + views::workspace::timeline_draw_width(vp_w, w.timeline_w),
+                    ) {
+                        return Some(Rail::Timeline);
+                    }
+                }
+                _ => {}
+            }
+            // The diff's own rule, while the centre is the two-column
+            // presentation: the list's height narrowed to the rule's few
+            // pixels, read off the bounds it was last painted with.
+            if let Some(center) = self.main_diff() {
+                let center = center.read(cx);
+                let b = center.list_bounds();
+                if let Some(rule) = center.divider() {
+                    let at = f32::from(b.left()) + rule;
+                    if y >= f32::from(b.top())
+                        && y < f32::from(b.bottom())
+                        && (x - at).abs() <= views::workspace::RAIL_GRAB_W
+                    {
+                        return Some(Rail::Split);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// The width a rail draws at — a drag's baseline. For the split it is
+    /// the rule's x within its row: the drag moves a position, not a width.
+    fn rail_width(&self, rail: views::workspace::Rail, window: &Window, cx: &App) -> f32 {
+        use views::workspace::Rail;
+        let vp_w = f32::from(window.viewport_size().width);
+        match rail {
+            Rail::Sidebar => views::workspace::sidebar_draw_width(vp_w, self.workspace.sidebar_w),
+            Rail::Inspector => {
+                views::workspace::inspector_draw_width(vp_w, self.workspace.inspector_w)
+            }
+            Rail::Timeline => {
+                views::workspace::timeline_draw_width(vp_w, self.workspace.timeline_w)
+            }
+            Rail::Split => self
+                .main_diff()
+                .and_then(|d| d.read(cx).divider())
+                .unwrap_or(0.0),
+        }
+    }
+
+    /// A drag's answer: the override, clamped by the same helper the paint
+    /// reads, so the strip never reports a width the window will not draw.
+    fn set_rail_width(&mut self, rail: views::workspace::Rail, w: f32, window: &Window) {
+        use views::workspace::Rail;
+        let vp_w = f32::from(window.viewport_size().width);
+        let clamped = match rail {
+            Rail::Sidebar => views::workspace::sidebar_draw_width(vp_w, Some(w)),
+            Rail::Inspector => views::workspace::inspector_draw_width(vp_w, Some(w)),
+            Rail::Timeline => views::workspace::timeline_draw_width(vp_w, Some(w)),
+            Rail::Split => return,
+        };
+        match rail {
+            Rail::Sidebar => self.workspace.sidebar_w = Some(clamped),
+            Rail::Inspector => self.workspace.inspector_w = Some(clamped),
+            Rail::Timeline => self.workspace.timeline_w = Some(clamped),
+            Rail::Split => {}
+        }
+    }
+
+    /// The split rule's stand, remembered on the workspace and pushed into
+    /// both diffs — the centre's and the commit detail's are two entities
+    /// that must never disagree about one preference.
+    fn set_split(&mut self, fraction: f32, cx: &mut Context<Self>) {
+        self.workspace.split_fraction = fraction;
+        let host = config::host(cx);
+        let mut diffs = Vec::new();
+        if let Some(d) = &self.workspace.center {
+            diffs.push(d.clone());
+        }
+        if let Screen::Diff { view, .. } = &self.main {
+            diffs.push(view.clone());
+        }
+        for d in diffs {
+            d.update(cx, |d, cx| d.set_divider(fraction, &host, cx));
+        }
+    }
+
+    /// A press on a live rail's edge: a drag, or — the second click of a
+    /// pair — the rail handed back to the spec. Either is consumed here: a
+    /// gesture on the chrome is not a click on whatever row lies under it.
+    fn on_rail_press(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        use views::workspace::Rail;
+        if ev.button != MouseButton::Left {
+            return;
+        }
+        let Some(rail) = self.rail_edge_at(ev.position, window, cx) else {
+            return;
+        };
+        if ev.click_count >= 2 {
+            match rail {
+                Rail::Sidebar => self.workspace.sidebar_w = None,
+                Rail::Inspector => self.workspace.inspector_w = None,
+                Rail::Timeline => self.workspace.timeline_w = None,
+                Rail::Split => self.set_split(views::split::SPLIT_HALF, cx),
+            }
+        } else {
+            self.rail_drag = Some(RailDrag {
+                rail,
+                grab_x: f32::from(ev.position.x),
+                start_w: self.rail_width(rail, window, cx),
+            });
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    /// A move while a rail drag is live. The edge follows the pointer,
+    /// clamped to the rail's floor and cap; the spring sits at its expanded
+    /// target the whole time, so the override *is* the drawn width and the
+    /// two never fight. A move without the button means the release was
+    /// missed — the gesture drops rather than dragging on hover. The split's
+    /// rule takes the same delta and answers it in fractions.
+    fn on_rail_drag(&mut self, ev: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
+        use views::workspace::Rail;
+        let Some(drag) = self.rail_drag else { return };
+        if !ev.dragging() {
+            self.rail_drag = None;
+            cx.notify();
+            return;
+        }
+        let x = f32::from(ev.position.x);
+        if drag.rail == Rail::Split {
+            let Some(center) = self.main_diff() else {
+                return;
+            };
+            let w = f32::from(center.read(cx).list_bounds().size.width);
+            let f = views::split::fraction_at(w, drag.start_w + (x - drag.grab_x));
+            self.set_split(f, cx);
+        } else {
+            let w = match drag.rail {
+                Rail::Sidebar | Rail::Timeline => drag.start_w + (x - drag.grab_x),
+                Rail::Inspector => drag.start_w + (drag.grab_x - x),
+                Rail::Split => unreachable!(),
+            };
+            self.set_rail_width(drag.rail, w, window);
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    /// The drag's end: the release is consumed whether or not it lands over
+    /// the edge — whatever is under the pointer never saw the press and must
+    /// not see the release.
+    fn on_rail_release(&mut self, _ev: &MouseUpEvent, cx: &mut Context<Self>) {
+        if self.rail_drag.take().is_some() {
+            cx.stop_propagation();
+            cx.notify();
+        }
+    }
+}
+
+/// One rail's presence in the destination header: which edge of the window
+/// it stands on, whether it is drawn, and the command that toggles it. The
+/// header owns the button; the command owns the act — the same shape every
+/// other mouse control in the strip keeps.
+struct RailToggle {
+    /// `true` for a rail on the window's left (the branch timeline),
+    /// `false` for one on the right (the inspector).
+    left: bool,
+    /// Whether the rail is hidden right now — the glyph names the verb the
+    /// button performs, so it flips with the state.
+    collapsed: bool,
+    /// The named command a click dispatches — `run_command`'s table owns
+    /// what it does.
+    command: &'static str,
+}
+
+/// A rail-resize gesture in flight: the rail, the x it was grabbed at and
+/// the width it started from. Held on the shell rather than the rail because
+/// the pointer outruns the strip the moment the drag starts — the probe's
+/// window-level listeners finish what the edge's mouse-down began.
+#[derive(Clone, Copy)]
+struct RailDrag {
+    rail: views::workspace::Rail,
+    grab_x: f32,
+    start_w: f32,
+}
+
+impl RailToggle {
+    /// The library's panel glyph, read as the verb the button performs:
+    /// `close` while the rail stands, `open` once it is hidden.
+    fn icon(&self) -> &'static str {
+        match (self.left, self.collapsed) {
+            (true, false) => "icons/panel-left-close.svg",
+            (true, true) => "icons/panel-left-open.svg",
+            (false, false) => "icons/panel-right-close.svg",
+            (false, true) => "icons/panel-right-open.svg",
+        }
     }
 }
 
@@ -6182,7 +6576,14 @@ impl DevShell {
     /// The 76px destination band: a 19px title over dim counts on the left,
     /// the working-copy sentence on the right. One function because Changes
     /// and History differ only in what they name, and two copies would drift.
-    fn destination_header(&self, host: &Host, title: &'static str, sub: SharedString) -> Div {
+    fn destination_header(
+        &self,
+        host: &Host,
+        title: &'static str,
+        sub: SharedString,
+        rail: Option<RailToggle>,
+        cx: &mut Context<Self>,
+    ) -> Div {
         let c = host.theme.chrome;
         div()
             .flex_none()
@@ -6232,17 +6633,48 @@ impl DevShell {
                             .rounded_full()
                             .bg(rgb(c.accent)),
                     )
-                    .child("Working copy"),
+                    .child("Working copy")
+                    // The rail's own mouse door, inside the header that spans
+                    // the column it belongs to. The button names the command;
+                    // the command does the hiding, so the door, the key and
+                    // the menu item cannot disagree.
+                    .children(rail.map(|rail| {
+                        div()
+                            .id("rail-toggle")
+                            .debug_selector(|| "rail-toggle".to_string())
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .size(px(CHIP_H))
+                            .ml(chrome::gap_m(&host.font))
+                            .rounded(px(chrome::RADIUS))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(c.raised)))
+                            .on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    this.run_command(rail.command, cx)
+                                }),
+                            )
+                            .child(chrome::icon(
+                                rail.icon(),
+                                15.0,
+                                host.theme.dim_on(theme::Surface::Title),
+                            ))
+                            .into_any_element()
+                    })),
             )
     }
 
     /// The History destination: the branch timeline beside the selected
     /// commit's diff. The sidebar is already built by the caller with its
-    /// CURRENT BRANCH note; this owns the header and the two-pane centre.
+    /// CURRENT BRANCH note — a collapsed rail is a 0px spring stub, not an
+    /// absent child — and this owns the header and the two-pane centre.
     fn history_body(
         &mut self,
         host: &Host,
         sidebar: impl IntoElement,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let dim = host.theme.dim_on(theme::Surface::Context);
@@ -6325,6 +6757,11 @@ impl DevShell {
             changes,
             changed,
             branch: branch.clone(),
+            collapsed: self.workspace.timeline_collapsed,
+            timeline_w: views::workspace::timeline_draw_width(
+                f32::from(window.viewport_size().width),
+                self.workspace.timeline_w,
+            ),
         };
         let history = views::history::render_history(&deps, cx);
         let total = commits.read(cx).total();
@@ -6332,6 +6769,15 @@ impl DevShell {
             host,
             "History",
             SharedString::from(format!("{branch} \u{00b7} {total} recent commits")),
+            // The timeline is the rail this destination owns; the header
+            // spans exactly the columns below it, so its toggle reads as
+            // theirs and not the strip's sidebar.
+            Some(RailToggle {
+                left: true,
+                collapsed: self.workspace.timeline_collapsed,
+                command: "workspace.toggle-timeline",
+            }),
+            cx,
         );
 
         div()
@@ -6365,8 +6811,8 @@ impl DevShell {
         let host = config::host(cx);
         let c = host.theme.chrome;
         let viewport_w = f32::from(window.viewport_size().width);
-        let side_w = views::workspace::sidebar_width(viewport_w);
-        let insp_w = views::workspace::inspector_width(viewport_w);
+        let side_w = views::workspace::sidebar_draw_width(viewport_w, self.workspace.sidebar_w);
+        let insp_w = views::workspace::inspector_draw_width(viewport_w, self.workspace.inspector_w);
 
         let Some(files_screen) = self.panes.get("files").cloned() else {
             // A launch with no working tree still owns its diff:
@@ -6471,35 +6917,83 @@ impl DevShell {
             // rail is sized here, so the flag is spelled here too.
             compact: side_w <= views::workspace::SIDEBAR_SMALLEST_W,
         };
+        // The rail never leaves the tree: collapsed is a spring target of
+        // zero width, not an absent child. Staying mounted is what lets a
+        // re-opened rail keep the spring's velocity — a mid-flight reversal
+        // is continuous instead of restarting — and a first mount starts at
+        // the target, so launch draws no slide. The settled stub is a 0px
+        // flex item that paints and hit-tests nothing; the flag still
+        // decides what *counts* as drawn (focus, wheel, `pane_drawn`) — this
+        // element is only the slide.
         let sidebar = div()
             .id("workspace-sidebar")
             .debug_selector(|| "workspace-sidebar".to_string())
             .flex_none()
-            .w(px(side_w))
             .min_h_0()
+            .relative()
             .flex()
             .flex_col()
             .overflow_hidden()
-            .border_r_1()
-            .border_color(rgb(c.border))
+            // The column pins its content to the receding edge, so a closing
+            // rail slides left with its border instead of squashing its rows.
+            .items_end()
             // A click anywhere here is the keyboard coming back to the
             // pane this destination reads: the files cursor in Changes,
             // the commits cursor in History. Capture phase, so the row's
             // own handler still stages the row the keyboard is already on.
             .capture_any_mouse_down(cx.listener(|this, _, _, cx| {
+                // Mid-slide the rail is dead UI — a glance meant for it
+                // belongs to the centre it is uncovering.
+                if this.workspace.sidebar_collapsed {
+                    return;
+                }
                 let pane = match this.workspace.destination {
                     views::workspace::Destination::Changes => "files",
                     views::workspace::Destination::History => "commits",
                 };
                 this.focus_named(pane, cx);
             }))
-            .child(views::sidebar::render_sidebar(&deps, cx));
+            // The column's contents keep their full width and are clipped
+            // at the animated edge — a rail's rows slide, they never wrap.
+            // The border rides the inner edge: pinned to the receding side
+            // it sweeps with the slide, and at a settled zero the clip takes
+            // it — no hairline left standing at the window's edge.
+            .child(
+                div()
+                    .w(px(side_w))
+                    .min_h_0()
+                    .flex_grow(1.0)
+                    .border_r_1()
+                    .border_color(rgb(c.border))
+                    .child(views::sidebar::render_sidebar(&deps, cx)),
+            )
+            // The drag strip: a few pixels of the rail's own edge painted
+            // over the border so the cursor names the gesture. The probe
+            // owns the drag itself — this only holds the hitbox and the
+            // resize cursor, and it dies with the flag like the rest of the
+            // rail.
+            .child(
+                div()
+                    .id("sidebar-edge")
+                    .debug_selector(|| "sidebar-edge".to_string())
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .right_0()
+                    .w(px(views::workspace::RAIL_GRAB_W))
+                    .when(!self.workspace.sidebar_collapsed, |d| d.cursor_col_resize()),
+            )
+            .with_spring(
+                "workspace-sidebar-w",
+                views::workspace::rail_spring(self.workspace.sidebar_collapsed),
+                move |d, v| d.w(px(side_w * v.max(0.0))),
+            );
 
         // The History destination is a different centre — a timeline beside
         // the commit's diff — so it leaves through its own assembly before
         // any of the working-tree pieces are built.
         if self.workspace.destination == views::workspace::Destination::History {
-            return self.history_body(&host, sidebar, cx);
+            return self.history_body(&host, sidebar, window, cx);
         }
 
         // The center: breadcrumb, Unified/Split toggle, status and totals
@@ -6695,6 +7189,30 @@ impl DevShell {
                 "+ Stage hunk"
             }
         });
+        // One slot, three bodies: the blob pane when the selection is a file
+        // with no lines to show, the rendered document when the reader asked
+        // for one and the file has one to draw, the diff's rows otherwise.
+        // The choice is made here rather than inside the diff view, because
+        // it is the *selection* that decides and the shell is what owns the
+        // selection — and each pane stands itself down when it is handed a
+        // file it cannot draw.
+        let blob = self
+            .workspace
+            .blob
+            .clone()
+            .filter(|blob| blob.read(cx).is_showing());
+        let document = self
+            .workspace
+            .document
+            .clone()
+            .filter(|pane| pane.read(cx).is_showing());
+        // The split's rule is a drag edge too: the strip over it paints the
+        // resize cursor while the probe owns the drag. It stands only while
+        // the diff — not a blob or a document — is the body, and only while
+        // the layout is the two-column one.
+        let split_edge = (blob.is_none() && document.is_none())
+            .then(|| center.read(cx).divider())
+            .flatten();
         let center_pane = div()
             .id("workspace-center")
             .debug_selector(|| "workspace-center".to_string())
@@ -6710,34 +7228,28 @@ impl DevShell {
                 div()
                     .min_h_0()
                     .flex_grow(1.0)
+                    .relative()
                     .overflow_hidden()
-                    // One slot, three bodies: the blob pane when the selection
-                    // is a file with no lines to show, the rendered document
-                    // when the reader asked for one and the file has one to
-                    // draw, the diff's rows otherwise. The choice is made here
-                    // rather than inside the diff view, because it is the
-                    // *selection* that decides and the shell is what owns the
-                    // selection — and each pane stands itself down when it is
-                    // handed a file it cannot draw.
-                    .child(
-                        match self
-                            .workspace
-                            .blob
-                            .clone()
-                            .filter(|blob| blob.read(cx).is_showing())
-                        {
-                            Some(blob) => blob.into_any_element(),
-                            None => match self
-                                .workspace
-                                .document
-                                .clone()
-                                .filter(|pane| pane.read(cx).is_showing())
-                            {
-                                Some(pane) => pane.into_any_element(),
-                                None => center.clone().into_any_element(),
-                            },
+                    .child(match blob {
+                        Some(blob) => blob.into_any_element(),
+                        None => match document {
+                            Some(pane) => pane.into_any_element(),
+                            None => center.clone().into_any_element(),
                         },
-                    ),
+                    })
+                    .when_some(split_edge, |d, x| {
+                        d.child(
+                            div()
+                                .id("split-edge")
+                                .debug_selector(|| "split-edge".to_string())
+                                .absolute()
+                                .top_0()
+                                .bottom_0()
+                                .left(px(x - views::workspace::RAIL_GRAB_W * 0.5))
+                                .w(px(views::workspace::RAIL_GRAB_W))
+                                .cursor_col_resize(),
+                        )
+                    }),
             );
 
         // The inspector's rail: staged summary, drafts and commit, drawn
@@ -6775,18 +7287,51 @@ impl DevShell {
             commit_note,
             dispatch: inspect_dispatch,
         };
+        // Same contract as the rail: the flag is a spring target, not an
+        // absent child. The fields and the draft outlive the slide — they
+        // are what makes re-opening a reveal rather than a rebuild. The
+        // inner column pins to the *moving* left edge (default `items_start`),
+        // so this rail slides right, off its side of the window — its border
+        // on that edge, clipped away with the rest of it at zero.
         let inspector = div()
             .id("workspace-inspector")
             .debug_selector(|| "workspace-inspector".to_string())
             .flex_none()
-            .w(px(insp_w))
             .min_h_0()
+            .relative()
             .flex()
             .flex_col()
             .overflow_hidden()
-            .border_l_1()
-            .border_color(rgb(c.border))
-            .child(views::inspector::render_inspector(&inspector_deps, cx));
+            .child(
+                div()
+                    .w(px(insp_w))
+                    .min_h_0()
+                    .flex_grow(1.0)
+                    .border_l_1()
+                    .border_color(rgb(c.border))
+                    .child(views::inspector::render_inspector(&inspector_deps, cx)),
+            )
+            // The rail's edge strip — same contract as the sidebar's: the
+            // probe owns the drag, this holds the cursor, and the moving
+            // left edge is the side it rides.
+            .child(
+                div()
+                    .id("inspector-edge")
+                    .debug_selector(|| "inspector-edge".to_string())
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left_0()
+                    .w(px(views::workspace::RAIL_GRAB_W))
+                    .when(!self.workspace.inspector_collapsed, |d| {
+                        d.cursor_col_resize()
+                    }),
+            )
+            .with_spring(
+                "workspace-inspector-w",
+                views::workspace::rail_spring(self.workspace.inspector_collapsed),
+                move |d, v| d.w(px(insp_w * v.max(0.0))),
+            );
 
         // The destination header: the reference's 76px band, shared with the
         // History destination so the two cannot drift.
@@ -6797,6 +7342,14 @@ impl DevShell {
                 views::workspace::Destination::History => "History",
             },
             SharedString::from(status_line.clone()),
+            // The inspector is the rail this destination owns — right edge,
+            // so the header's toggle glyph faces it.
+            Some(RailToggle {
+                left: false,
+                collapsed: self.workspace.inspector_collapsed,
+                command: "workspace.toggle-inspector",
+            }),
+            cx,
         );
 
         // The confirmation standing over the workspace: branch, message and
@@ -7153,21 +7706,64 @@ impl Render for DevShell {
             )
             .on_action(
                 cx.listener(|this, _: &CommitStaged, _, cx| this.native("workspace.commit", cx)),
-            );
+            )
+            .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
+                this.native("workspace.toggle-sidebar", cx)
+            }))
+            // The destination's second rail, one chord for whichever stands:
+            // the inspector in Changes, the branch timeline in History.
+            .on_action(cx.listener(|this, _: &ToggleSecondary, _, cx| {
+                this.native(
+                    match this.workspace.destination {
+                        views::workspace::Destination::Changes => "workspace.toggle-inspector",
+                        views::workspace::Destination::History => "workspace.toggle-timeline",
+                    },
+                    cx,
+                )
+            }));
 
         // The wheel, heard first: capture phase on a paint-time probe, the same
         // trick the diff view's old one used, moved up to where the mode stack
-        // and the keymap live.
+        // and the keymap live. The rail-edge drag rides the same probe — a
+        // pointer grabbed on a border outruns the strip the moment it moves,
+        // so press, move and release are all heard here rather than on the
+        // handle element, which only carries the cursor.
         {
             let me = cx.entity().downgrade();
             root = root.child(
                 canvas(
                     |_, _, _| {},
-                    move |_, _, window, _cx| {
-                        let me = me.clone();
+                    move |_, _, window, cx| {
+                        // A live drag keeps its cursor wherever the pointer
+                        // strays — a window-wide request outranks the hitbox
+                        // styles anything under it asks for.
+                        if me
+                            .update(cx, |this, _| this.rail_drag.is_some())
+                            .unwrap_or(false)
+                        {
+                            window.set_window_cursor_style(CursorStyle::ResizeColumn);
+                        }
+                        let wheel = me.clone();
                         window.on_mouse_event(move |ev: &ScrollWheelEvent, phase, window, cx| {
                             if phase == DispatchPhase::Capture {
-                                _ = me.update(cx, |this, cx| this.on_wheel(ev, window, cx));
+                                _ = wheel.update(cx, |this, cx| this.on_wheel(ev, window, cx));
+                            }
+                        });
+                        let press = me.clone();
+                        window.on_mouse_event(move |ev: &MouseDownEvent, phase, window, cx| {
+                            if phase == DispatchPhase::Capture {
+                                _ = press.update(cx, |this, cx| this.on_rail_press(ev, window, cx));
+                            }
+                        });
+                        let drag = me.clone();
+                        window.on_mouse_event(move |ev: &MouseMoveEvent, phase, window, cx| {
+                            if phase == DispatchPhase::Capture {
+                                _ = drag.update(cx, |this, cx| this.on_rail_drag(ev, window, cx));
+                            }
+                        });
+                        window.on_mouse_event(move |ev: &MouseUpEvent, phase, _, cx| {
+                            if phase == DispatchPhase::Capture {
+                                _ = me.update(cx, |this, cx| this.on_rail_release(ev, cx));
                             }
                         });
                     },
@@ -7179,20 +7775,31 @@ impl Render for DevShell {
             );
         }
 
+        // The strip's left inset is the rail's drawn width — read here, at
+        // composition, the same place the rail's own width is read, drag
+        // override included.
+        let strip_rail_w = views::workspace::sidebar_draw_width(
+            f32::from(window.viewport_size().width),
+            self.workspace.sidebar_w,
+        );
         root = root
             .child(
                 div()
                     .flex_none()
+                    .relative()
                     .flex()
                     .items_center()
                     .gap(chrome::gap_l(&host.font))
                     .h(px(TITLE_H))
                     // The window has no titlebar of its own any more, so the
                     // traffic lights are drawn *into* this strip and the title
-                    // has to start after them.
-                    .pl(px(views::workspace::sidebar_width(f32::from(
-                        window.viewport_size().width,
-                    ))))
+                    // has to start after them. The padding is the rail's
+                    // drawn width because the title aligns with the content
+                    // column — it rides the sidebar's own spring below, so the
+                    // title tracks the sliding edge instead of jumping to the
+                    // end state. A settled collapsed rail leaves the strip's
+                    // toggle as the thing to clear instead.
+                    // (Set by `.with_spring` at the end of the chain.)
                     .pr(px((ch * 1.7).round()))
                     .bg(rgb(c.title_bg))
                     .border_b_1()
@@ -7208,6 +7815,45 @@ impl Render for DevShell {
                     // right edge — which is what a strip of `flex_none`
                     // children and no `min_w_0` did — is a control that no
                     // longer exists.
+                    .child(
+                        // The left rail's mouse door, and the only sidebar
+                        // control that survives the rail itself: absolute,
+                        // after the lights, because the strip's flow padding
+                        // is the rail's width — which is gone when the rail
+                        // is. `cmd-b`, the View menu item and this button all
+                        // name `workspace.toggle-sidebar`; the command is the
+                        // one place the act lives.
+                        div()
+                            .id("sidebar-toggle")
+                            .debug_selector(|| "sidebar-toggle".to_string())
+                            .absolute()
+                            .left(px(LIGHTS_W + 8.0))
+                            .top(px((TITLE_H - CHIP_H) / 2.0))
+                            .size(px(CHIP_H))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(chrome::RADIUS))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(c.raised)))
+                            .on_click({
+                                let me = me.clone();
+                                move |_, _, cx| {
+                                    _ = me.update(cx, |this, cx| {
+                                        this.run_command("workspace.toggle-sidebar", cx)
+                                    });
+                                }
+                            })
+                            .child(chrome::icon(
+                                if self.workspace.sidebar_collapsed {
+                                    "icons/panel-left-open.svg"
+                                } else {
+                                    "icons/panel-left-close.svg"
+                                },
+                                15.0,
+                                host.theme.dim_on(theme::Surface::Title),
+                            )),
+                    )
                     .child(
                         div()
                             .id("project-title")
@@ -7312,7 +7958,20 @@ impl Render for DevShell {
                     .child(div().flex_grow(1.0))
                     .child(theme_button)
                     .child(commands_button)
-                    .children(push_button),
+                    .children(push_button)
+                    // The strip's left inset is the rail's drawn width: same
+                    // spring, same target, so the two step in lockstep and the
+                    // title never leaves the column it names. The collapsed end
+                    // is the toggle's width — the control the rail leaves
+                    // behind is the thing the title must clear.
+                    .with_spring(
+                        "title-strip-inset",
+                        views::workspace::rail_spring(self.workspace.sidebar_collapsed),
+                        move |d, v| {
+                            let collapsed = LIGHTS_W + CHIP_H + 16.0;
+                            d.pl(px(collapsed + (strip_rail_w - collapsed) * v.max(0.0)))
+                        },
+                    ),
             )
             // The middle is the workspace — header, grouped sidebar,
             // file diff, inspector slot — composed once here at the viewport
@@ -7841,6 +8500,12 @@ fn open_main_window(launch: Launch, cx: &mut App) {
         // binding this map could have spelled.
         KeyBinding::new("cmd-k", ShowCommands, None),
         KeyBinding::new("cmd-enter", CommitStaged, None),
+        // The sidebar pair: cmd-b hides the left rail, cmd-alt-b the
+        // destination's second rail — the inspector in Changes, the branch
+        // timeline in History — so one chord always means "the rail beside
+        // the diff I am reading".
+        KeyBinding::new("cmd-b", ToggleSidebar, None),
+        KeyBinding::new("cmd-alt-b", ToggleSecondary, None),
     ]);
 
     // Open the window here and now, not from a spawned task: the task only
@@ -7862,6 +8527,12 @@ fn open_main_window(launch: Launch, cx: &mut App) {
             // before the first frame so you never see row 0 flash past.
             let resume = session::restore(&session_key, &session_path);
             start::mark("session restored");
+            // The remembered rule goes to every diff this launch builds —
+            // the same way the rail widths go to the workspace below.
+            let split = resume
+                .as_ref()
+                .and_then(|s| s.split)
+                .unwrap_or(views::split::SPLIT_HALF);
             #[allow(clippy::type_complexity)]
             // The saved row is applied to the views above, and the periodic
             // task below reads the live row off the shell — so the
@@ -7898,6 +8569,7 @@ fn open_main_window(launch: Launch, cx: &mut App) {
                 }
                 Some(Data::Diff(files)) => {
                     let e = cx.new(|cx| views::diff::Diff::new(files, host.clone(), cx));
+                    e.update(cx, |v, cx| v.set_divider(split, &host, cx));
                     let v = e.read(cx);
                     if let Some(r) = &resume {
                         v.scroll_to(r.top, &host);
@@ -7957,6 +8629,7 @@ fn open_main_window(launch: Launch, cx: &mut App) {
                     }
                     View::Diff => {
                         let e = cx.new(|cx| views::diff::Diff::new(Vec::new(), host.clone(), cx));
+                        e.update(cx, |v, cx| v.set_divider(split, &host, cx));
                         let v = e.read(cx);
                         (
                             Screen::diff(
@@ -7984,6 +8657,7 @@ fn open_main_window(launch: Launch, cx: &mut App) {
             let main_screen = match &screen {
                 Screen::Commits { .. } => {
                     let e = cx.new(|cx| views::diff::Diff::new(Vec::new(), host.clone(), cx));
+                    e.update(cx, |v, cx| v.set_divider(split, &host, cx));
                     Screen::diff(e, None, Generation::default(), "")
                 }
                 other => other.clone(),
@@ -8278,6 +8952,12 @@ fn open_main_window(launch: Launch, cx: &mut App) {
                         }
                         _ => views::workspace::LaunchHold::Off,
                     },
+                    // The rails' remembered widths ride the same file the
+                    // row does: a session that matched its key restores both.
+                    sidebar_w: resume.as_ref().and_then(|s| s.sidebar_w),
+                    inspector_w: resume.as_ref().and_then(|s| s.inspector_w),
+                    timeline_w: resume.as_ref().and_then(|s| s.timeline_w),
+                    split_fraction: split,
                     ..Default::default()
                 },
                 drafts: std::collections::HashMap::new(),
@@ -8299,6 +8979,7 @@ fn open_main_window(launch: Launch, cx: &mut App) {
                 focus,
                 focused: None,
                 ongoing: Cell::default(),
+                rail_drag: None,
                 projects: Vec::new(),
                 session_key: session_key.clone(),
                 session_path: session_path.clone(),
@@ -8396,16 +9077,25 @@ fn open_main_window(launch: Launch, cx: &mut App) {
             // Persist as you scroll, so any kind of death keeps the position:
             // `dev.sh` kills the process, and nothing runs on the way out.
             // Only on change, so an idle window writes nothing at all. The
-            // key and the row are read off the shell per tick rather than
-            // held from startup, so one task serves every repository a
-            // switch puts under the window — and dies with it.
+            // key, the row and the rail widths are read off the shell per
+            // tick rather than held from startup, so one task serves every
+            // repository a switch puts under the window — and dies with it.
             {
                 let path = session_path.clone();
                 let weak = shell.downgrade();
                 cx.spawn(async move |cx: &mut AsyncApp| {
                     let mut last = weak
                         .update(cx, |shell, cx| {
-                            (shell.session_key.clone(), shell.session_top(cx))
+                            (
+                                shell.session_key.clone(),
+                                shell.session_top(cx),
+                                (
+                                    shell.workspace.sidebar_w,
+                                    shell.workspace.inspector_w,
+                                    shell.workspace.timeline_w,
+                                    shell.workspace.split_fraction,
+                                ),
+                            )
                         })
                         .unwrap_or_default();
                     loop {
@@ -8413,15 +9103,36 @@ fn open_main_window(launch: Launch, cx: &mut App) {
                             .timer(Duration::from_millis(400))
                             .await;
                         let now = weak.update(cx, |shell, cx| {
-                            (shell.session_key.clone(), shell.session_top(cx))
+                            (
+                                shell.session_key.clone(),
+                                shell.session_top(cx),
+                                (
+                                    shell.workspace.sidebar_w,
+                                    shell.workspace.inspector_w,
+                                    shell.workspace.timeline_w,
+                                    shell.workspace.split_fraction,
+                                ),
+                            )
                         });
                         let Ok(now) = now else {
                             break;
                         };
                         if now != last {
                             last = now.clone();
-                            if let (key, Some(top)) = now {
-                                session::save(&session::Session { key, top }, &path);
+                            if let (key, Some(top), (sidebar_w, inspector_w, timeline_w, split)) =
+                                now
+                            {
+                                session::save(
+                                    &session::Session {
+                                        key,
+                                        top,
+                                        sidebar_w,
+                                        inspector_w,
+                                        timeline_w,
+                                        split: Some(split),
+                                    },
+                                    &path,
+                                );
                             }
                         }
                     }
@@ -8474,6 +9185,18 @@ fn open_main_window(launch: Launch, cx: &mut App) {
             items: vec![
                 MenuItem::action("Copy", CopySelection),
                 MenuItem::action("Select All", SelectAll),
+            ],
+            disabled: false,
+        },
+        // Where the rails' toggles live for the user who goes looking:
+        // cmd-b is a convention nobody reads a help screen for, so the menu
+        // is how it is found. Both items are the same adapters the strip
+        // buttons are.
+        Menu {
+            name: "View".into(),
+            items: vec![
+                MenuItem::action("Toggle Sidebar", ToggleSidebar),
+                MenuItem::action("Toggle Second Rail", ToggleSecondary),
             ],
             disabled: false,
         },
@@ -8674,6 +9397,7 @@ mod tests {
         GitError, Notice, Open, Pane, Refresh, Screen, Writes,
     };
     use crate::views::commits::Commits;
+    use crate::views::workspace;
     use gitten_app::cli::{Source, View};
     use gitten_app::jobs::{Event as JobEvent, Generation, Job, Runner, Submitter};
     use gitten_core::host::Host;
@@ -9107,6 +9831,7 @@ mod tests {
                 focus: cx.focus_handle(),
                 focused: None,
                 ongoing: Cell::default(),
+                rail_drag: None,
                 projects: Vec::new(),
                 session_key: String::new(),
                 session_path: std::path::PathBuf::new(),
@@ -10100,6 +10825,1038 @@ A paragraph with **bolder** and [a link](https://example.com/y).
         );
     }
 
+    /// A collapsed rail is a width of zero, not an absent child: the spring
+    /// stays mounted and settles at 0, leaving the centre flush with the
+    /// window's edge — and the same for the inspector on the right.
+    /// Expanding puts them both back. `reduce_motion` makes the spring's
+    /// settle immediate, so every bound read below is the end state.
+    #[gpui::test]
+    fn collapsing_the_rails_gives_their_width_to_the_centre(cx: &mut TestAppContext) {
+        let mut tree = Status::default();
+        tree.unstaged.push(gitten_core::status::UnstagedEntry {
+            path: "a.txt".into(),
+            change: gitten_core::status::Change::Modified,
+            kind: gitten_core::status::Kind::File,
+            submodule: Default::default(),
+        });
+        let (shell, _repo, mut cx) = rail_window(cx, tree);
+        cx.update(|_, cx| cx.set_reduce_motion(true));
+
+        let sidebar = cx.debug_bounds("workspace-sidebar").expect("no rail drawn");
+        let inspector = cx
+            .debug_bounds("workspace-inspector")
+            .expect("no inspector drawn");
+        let center = cx
+            .debug_bounds("workspace-center")
+            .expect("no centre drawn");
+        assert_eq!(
+            center.left(),
+            sidebar.right(),
+            "the centre starts at the rail"
+        );
+        assert_eq!(
+            inspector.left(),
+            center.right(),
+            "the inspector starts at the centre"
+        );
+
+        shell.update(&mut cx, |shell, cx| {
+            shell.run_command("workspace.toggle-sidebar", cx)
+        });
+        cx.run_until_parked();
+        let rail_w = cx
+            .debug_bounds("workspace-sidebar")
+            .map(|b| b.size.width)
+            .unwrap_or(gpui::px(0.0));
+        assert!(
+            rail_w <= gpui::px(0.5),
+            "a collapsed rail still has width {rail_w:?}"
+        );
+        let center = cx
+            .debug_bounds("workspace-center")
+            .expect("no centre drawn");
+        assert_eq!(
+            center.left(),
+            gpui::px(0.0),
+            "the centre did not take the rail's width"
+        );
+
+        shell.update(&mut cx, |shell, cx| {
+            shell.run_command("workspace.toggle-inspector", cx)
+        });
+        cx.run_until_parked();
+        let inspector_w = cx
+            .debug_bounds("workspace-inspector")
+            .map(|b| b.size.width)
+            .unwrap_or(gpui::px(0.0));
+        assert!(
+            inspector_w <= gpui::px(0.5),
+            "a collapsed inspector still has width {inspector_w:?}"
+        );
+        let center = cx
+            .debug_bounds("workspace-center")
+            .expect("no centre drawn");
+        assert_eq!(
+            center.right(),
+            gpui::px(1200.0),
+            "the centre did not take the inspector's width"
+        );
+
+        shell.update(&mut cx, |shell, cx| {
+            shell.run_command("workspace.toggle-sidebar", cx);
+            shell.run_command("workspace.toggle-inspector", cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            cx.debug_bounds("workspace-sidebar").map(|b| b.size.width),
+            Some(sidebar.size.width),
+            "the rail did not come back at its width"
+        );
+        assert_eq!(
+            cx.debug_bounds("workspace-inspector").map(|b| b.size.width),
+            Some(inspector.size.width),
+            "the inspector did not come back at its width"
+        );
+    }
+
+    /// A collapse is a slide, not a cut: with motion on, the rail is still
+    /// in the tree the frame after its toggle — mid-shrink — while the flag
+    /// has already moved the semantics (the pane reads as undrawn, the
+    /// wheel is the centre's). The paint follows; the meaning does not wait.
+    #[gpui::test]
+    fn a_toggle_slides_the_rail_rather_than_dropping_it(cx: &mut TestAppContext) {
+        let mut tree = Status::default();
+        tree.unstaged.push(gitten_core::status::UnstagedEntry {
+            path: "a.txt".into(),
+            change: gitten_core::status::Change::Modified,
+            kind: gitten_core::status::Kind::File,
+            submodule: Default::default(),
+        });
+        let (shell, _repo, mut cx) = rail_window(cx, tree);
+        let full = cx
+            .debug_bounds("workspace-sidebar")
+            .expect("no rail drawn")
+            .size
+            .width;
+
+        shell.update(&mut cx, |shell, cx| {
+            shell.run_command("workspace.toggle-sidebar", cx)
+        });
+        cx.run_until_parked();
+        // The frame after the toggle still paints the rail — the spring has
+        // barely stepped — while `pane_drawn` already answers false.
+        let rail = cx
+            .debug_bounds("workspace-sidebar")
+            .expect("the rail left the tree mid-slide");
+        assert!(
+            rail.size.width > gpui::px(0.0),
+            "a collapse cut the rail instead of sliding it"
+        );
+        shell.read_with(&cx, |shell, _| {
+            assert!(
+                !shell.pane_drawn("files"),
+                "the flag moved before the paint"
+            );
+            assert!(
+                rail.size.width <= full,
+                "a collapsing rail grew: {:?} past {:?}",
+                rail.size.width,
+                full
+            );
+        });
+    }
+
+    /// The History destination has two rails and they collapse alone: the
+    /// timeline gives its width to the commit detail, and the outer rail's
+    /// collapse leaves the detail flush with the window's edge.
+    #[gpui::test]
+    fn the_history_destination_collapses_its_own_rails(cx: &mut TestAppContext) {
+        let shell = commits_shell(cx);
+        shell.update(cx, |shell, cx| {
+            let files = cx.new(|_| {
+                crate::views::files::Files::from_prepared(crate::views::files::prepare(
+                    Status::default(),
+                    "gitten (main)",
+                    Default::default(),
+                ))
+            });
+            shell.panes.register(
+                "files",
+                Screen::files(files, Generation::default(), "files"),
+            );
+            shell.run_command("workspace.history", cx);
+        });
+        let observed = shell.clone();
+        let window = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.set_global(config::Active(Rc::new(Host::new())));
+            cx.open_window(
+                gpui::WindowOptions {
+                    window_bounds: Some(gpui::WindowBounds::Windowed(gpui::Bounds {
+                        origin: Default::default(),
+                        size: gpui::size(gpui::px(1200.0), gpui::px(800.0)),
+                    })),
+                    ..Default::default()
+                },
+                move |_, _| observed,
+            )
+            .unwrap()
+        });
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        // Settled bounds, not mid-slide ones: the springs snap under
+        // reduce_motion, so every measurement below is the end state.
+        cx.update(|_, cx| cx.set_reduce_motion(true));
+        cx.run_until_parked();
+
+        let detail = cx
+            .debug_bounds("history-detail")
+            .expect("no commit detail drawn");
+        let timeline_w = shell.read_with(&cx, |shell, _| {
+            workspace::list_bounds(&shell.workspace.history_scroll)
+                .size
+                .width
+        });
+        assert!(
+            timeline_w > gpui::px(0.0),
+            "the timeline was not drawn to collapse"
+        );
+
+        shell.update(&mut cx, |shell, cx| {
+            shell.run_command("workspace.toggle-timeline", cx)
+        });
+        cx.run_until_parked();
+        let grown = cx
+            .debug_bounds("history-detail")
+            .expect("no commit detail drawn");
+        assert!(
+            grown.size.width - detail.size.width >= timeline_w,
+            "the detail did not take the timeline's width"
+        );
+        // The commits pane's rail went — the keyboard could not stay on it.
+        shell.read_with(&cx, |shell, _| {
+            assert_eq!(
+                shell.spot,
+                super::Spot::Main,
+                "the keyboard stayed on a rail that is gone"
+            );
+        });
+
+        shell.update(&mut cx, |shell, cx| {
+            shell.run_command("workspace.toggle-sidebar", cx)
+        });
+        cx.run_until_parked();
+        let rail_w = cx
+            .debug_bounds("workspace-sidebar")
+            .map(|b| b.size.width)
+            .unwrap_or(gpui::px(0.0));
+        assert!(
+            rail_w <= gpui::px(0.5),
+            "a collapsed rail still has width {rail_w:?}"
+        );
+        let grown = cx
+            .debug_bounds("history-detail")
+            .expect("no commit detail drawn");
+        assert_eq!(
+            grown.left(),
+            gpui::px(0.0),
+            "the detail did not take the rail's width"
+        );
+    }
+
+    /// A hidden rail cannot take a glance — and neither can one still
+    /// sliding out: the timeline's painted bounds stay behind on its
+    /// handle, and mid-slide its list still hit-tests, so the wheel picks
+    /// its region by the flag and not by whichever box still answers — the
+    /// same rule the destination check serves. The gesture the dead rail
+    /// cannot have is spent on the detail it is uncovering.
+    #[gpui::test]
+    fn a_collapsed_timeline_cannot_take_the_wheel(cx: &mut TestAppContext) {
+        let shell = commits_shell(cx);
+        shell.update(cx, |shell, cx| {
+            let files = cx.new(|_| {
+                crate::views::files::Files::from_prepared(crate::views::files::prepare(
+                    Status::default(),
+                    "gitten (main)",
+                    Default::default(),
+                ))
+            });
+            shell.panes.register(
+                "files",
+                Screen::files(files, Generation::default(), "files"),
+            );
+        });
+        install_center(&shell, ONE_HUNK, cx);
+        let observed = shell.clone();
+        let window = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.set_global(config::Active(Rc::new(Host::new())));
+            cx.open_window(
+                gpui::WindowOptions {
+                    window_bounds: Some(gpui::WindowBounds::Windowed(gpui::Bounds {
+                        origin: Default::default(),
+                        size: gpui::size(gpui::px(1200.0), gpui::px(800.0)),
+                    })),
+                    ..Default::default()
+                },
+                move |_, _| observed,
+            )
+            .unwrap()
+        });
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+        shell.update(&mut cx, |shell, cx| {
+            shell.run_command("workspace.history", cx)
+        });
+        cx.run_until_parked();
+
+        // The rail's box while it stood — the stale answer the handle keeps.
+        let at = shell
+            .read_with(&cx, |shell, _| {
+                workspace::list_bounds(&shell.workspace.history_scroll)
+            })
+            .center();
+        shell.update(&mut cx, |shell, cx| {
+            shell.run_command("workspace.toggle-timeline", cx)
+        });
+        cx.run_until_parked();
+        shell.read_with(&cx, |shell, _| {
+            assert!(
+                shell.workspace.timeline_collapsed,
+                "the toggle did not land"
+            );
+        });
+
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: at,
+            delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.0), gpui::px(-45.0))),
+            modifiers: Default::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        let offset = shell.read_with(&cx, |shell, _| {
+            f32::from(
+                shell
+                    .workspace
+                    .history_scroll
+                    .0
+                    .borrow()
+                    .base_handle
+                    .offset()
+                    .y,
+            )
+        });
+        assert_eq!(offset, 0.0, "a rail that is gone still took the wheel");
+    }
+
+    /// A rail's edge is a drag strip: grabbed inside its last pixels, the
+    /// rail follows the pointer — clamped to its floor and the half-window
+    /// cap — and the centre takes the difference. The override is the state
+    /// the draw reads, so the release ends the gesture and a later move
+    /// touches nothing.
+    #[gpui::test]
+    fn dragging_a_rails_edge_resizes_it(cx: &mut TestAppContext) {
+        let mut tree = Status::default();
+        tree.unstaged.push(gitten_core::status::UnstagedEntry {
+            path: "a.txt".into(),
+            change: gitten_core::status::Change::Modified,
+            kind: gitten_core::status::Kind::File,
+            submodule: Default::default(),
+        });
+        let (shell, _repo, mut cx) = rail_window(cx, tree);
+        let edge = cx
+            .debug_bounds("workspace-sidebar")
+            .expect("no rail drawn")
+            .right();
+        let grab = gpui::point(edge - gpui::px(2.0), gpui::px(400.0));
+
+        cx.simulate_mouse_down(grab, gpui::MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_move(
+            gpui::point(edge + gpui::px(38.0), gpui::px(400.0)),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+        cx.simulate_mouse_up(
+            gpui::point(edge + gpui::px(38.0), gpui::px(400.0)),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+        let w = cx
+            .debug_bounds("workspace-sidebar")
+            .expect("no rail drawn")
+            .size
+            .width;
+        assert_eq!(w, edge + gpui::px(40.0), "the rail did not follow the drag");
+        assert_eq!(
+            cx.debug_bounds("workspace-center")
+                .expect("no centre drawn")
+                .left(),
+            edge + gpui::px(40.0),
+            "the centre did not give the drag's width"
+        );
+
+        // Past the floor the rail clamps — it does not collapse.
+        cx.simulate_mouse_down(
+            gpui::point(edge + gpui::px(38.0), gpui::px(400.0)),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+        cx.simulate_mouse_move(
+            gpui::point(gpui::px(30.0), gpui::px(400.0)),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+        cx.simulate_mouse_up(
+            gpui::point(gpui::px(30.0), gpui::px(400.0)),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+        let w = cx
+            .debug_bounds("workspace-sidebar")
+            .expect("no rail drawn")
+            .size
+            .width;
+        assert_eq!(
+            w,
+            gpui::px(workspace::SIDEBAR_MIN_W),
+            "the rail did not stop at its floor"
+        );
+
+        // And the cap is the lesser of the rail's own and half the window.
+        cx.simulate_mouse_down(
+            gpui::point(
+                gpui::px(workspace::SIDEBAR_MIN_W) - gpui::px(2.0),
+                gpui::px(400.0),
+            ),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+        cx.simulate_mouse_move(
+            gpui::point(gpui::px(5000.0), gpui::px(400.0)),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+        cx.simulate_mouse_up(
+            gpui::point(gpui::px(5000.0), gpui::px(400.0)),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+        let w = cx
+            .debug_bounds("workspace-sidebar")
+            .expect("no rail drawn")
+            .size
+            .width;
+        assert_eq!(
+            w,
+            gpui::px(workspace::SIDEBAR_MAX_W),
+            "the rail did not stop at its cap"
+        );
+        shell.read_with(&cx, |shell, _| {
+            assert_eq!(
+                shell.workspace.sidebar_w,
+                Some(workspace::SIDEBAR_MAX_W),
+                "the override did not keep the drag's width"
+            );
+            assert!(shell.rail_drag.is_none(), "the release left a drag live");
+        });
+    }
+
+    /// The second click of a pair on an edge is not a drag: it hands the
+    /// rail back to the spec's rung, whatever width it was dragged to.
+    #[gpui::test]
+    fn a_double_click_on_the_edge_returns_the_rail_to_the_spec(cx: &mut TestAppContext) {
+        let mut tree = Status::default();
+        tree.unstaged.push(gitten_core::status::UnstagedEntry {
+            path: "a.txt".into(),
+            change: gitten_core::status::Change::Modified,
+            kind: gitten_core::status::Kind::File,
+            submodule: Default::default(),
+        });
+        let (shell, _repo, mut cx) = rail_window(cx, tree);
+        let edge = cx
+            .debug_bounds("workspace-sidebar")
+            .expect("no rail drawn")
+            .right();
+        let grab = gpui::point(edge - gpui::px(2.0), gpui::px(400.0));
+        cx.simulate_mouse_down(grab, gpui::MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_move(
+            gpui::point(edge + gpui::px(40.0), gpui::px(400.0)),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+        cx.simulate_mouse_up(
+            gpui::point(edge + gpui::px(40.0), gpui::px(400.0)),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+        shell.read_with(&cx, |shell, _| {
+            assert!(shell.workspace.sidebar_w.is_some(), "no drag landed");
+        });
+
+        // `click_count` is the platform's count, which the mouse helpers do
+        // not simulate — the event is spelled whole instead. The edge stands
+        // two pixels past the pointer's landing — the grab was inside it.
+        let new_edge = edge + gpui::px(42.0);
+        cx.simulate_event(gpui::MouseDownEvent {
+            button: gpui::MouseButton::Left,
+            position: gpui::point(new_edge - gpui::px(2.0), gpui::px(400.0)),
+            modifiers: Default::default(),
+            click_count: 2,
+            first_mouse: false,
+        });
+        cx.run_until_parked();
+        shell.read_with(&cx, |shell, _| {
+            assert_eq!(
+                shell.workspace.sidebar_w, None,
+                "a double-click left the drag's width"
+            );
+        });
+        assert_eq!(
+            cx.debug_bounds("workspace-sidebar")
+                .expect("no rail drawn")
+                .size
+                .width,
+            edge,
+            "the rail did not return to the spec"
+        );
+    }
+
+    /// The right rail's edge is its left: dragging the pointer left widens
+    /// it, and the window's edge never moves.
+    #[gpui::test]
+    fn the_inspector_grows_leftward_from_its_edge(cx: &mut TestAppContext) {
+        let mut tree = Status::default();
+        tree.unstaged.push(gitten_core::status::UnstagedEntry {
+            path: "a.txt".into(),
+            change: gitten_core::status::Change::Modified,
+            kind: gitten_core::status::Kind::File,
+            submodule: Default::default(),
+        });
+        let (shell, _repo, mut cx) = rail_window(cx, tree);
+        let left = cx
+            .debug_bounds("workspace-inspector")
+            .expect("no inspector drawn")
+            .left();
+        let grab = gpui::point(left + gpui::px(2.0), gpui::px(400.0));
+        cx.simulate_mouse_down(grab, gpui::MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_move(
+            gpui::point(left - gpui::px(38.0), gpui::px(400.0)),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+        cx.simulate_mouse_up(
+            gpui::point(left - gpui::px(38.0), gpui::px(400.0)),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+        let inspector = cx
+            .debug_bounds("workspace-inspector")
+            .expect("no inspector drawn");
+        assert_eq!(
+            inspector.left(),
+            left - gpui::px(40.0),
+            "the inspector's edge did not follow the drag"
+        );
+        assert_eq!(
+            inspector.right(),
+            gpui::px(1200.0),
+            "the inspector's window edge moved"
+        );
+        shell.read_with(&cx, |shell, _| {
+            assert!(
+                shell.workspace.inspector_w.is_some(),
+                "the inspector kept no override"
+            );
+        });
+    }
+
+    /// The History destination's inner rail drags the same way — the
+    /// timeline's edge is `sidebar + timeline`, and the detail takes what
+    /// the drag gives back.
+    #[gpui::test]
+    fn the_timeline_resizes_the_same_way(cx: &mut TestAppContext) {
+        let shell = commits_shell(cx);
+        shell.update(cx, |shell, cx| {
+            let files = cx.new(|_| {
+                crate::views::files::Files::from_prepared(crate::views::files::prepare(
+                    Status::default(),
+                    "gitten (main)",
+                    Default::default(),
+                ))
+            });
+            shell.panes.register(
+                "files",
+                Screen::files(files, Generation::default(), "files"),
+            );
+            shell.run_command("workspace.history", cx);
+        });
+        let observed = shell.clone();
+        let window = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.set_global(config::Active(Rc::new(Host::new())));
+            cx.open_window(
+                gpui::WindowOptions {
+                    window_bounds: Some(gpui::WindowBounds::Windowed(gpui::Bounds {
+                        origin: Default::default(),
+                        size: gpui::size(gpui::px(1200.0), gpui::px(800.0)),
+                    })),
+                    ..Default::default()
+                },
+                move |_, _| observed,
+            )
+            .unwrap()
+        });
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+
+        let edge = cx
+            .debug_bounds("history-detail")
+            .expect("no commit detail drawn")
+            .left();
+        let grab = gpui::point(edge - gpui::px(2.0), gpui::px(400.0));
+        cx.simulate_mouse_down(grab, gpui::MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_move(
+            gpui::point(edge + gpui::px(50.0), gpui::px(400.0)),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+        cx.simulate_mouse_up(
+            gpui::point(edge + gpui::px(50.0), gpui::px(400.0)),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+        let detail = cx
+            .debug_bounds("history-detail")
+            .expect("no commit detail drawn");
+        assert_eq!(
+            detail.left(),
+            edge + gpui::px(52.0),
+            "the timeline's edge did not follow the drag"
+        );
+        shell.read_with(&cx, |shell, _| {
+            assert!(
+                shell.workspace.timeline_w.is_some(),
+                "the timeline kept no override"
+            );
+        });
+    }
+
+    /// A dragged width is the rail's resting width: collapsing slides to
+    /// zero and re-opening lands back on the override, not the rung.
+    #[gpui::test]
+    fn a_resized_width_survives_its_rails_collapse(cx: &mut TestAppContext) {
+        let mut tree = Status::default();
+        tree.unstaged.push(gitten_core::status::UnstagedEntry {
+            path: "a.txt".into(),
+            change: gitten_core::status::Change::Modified,
+            kind: gitten_core::status::Kind::File,
+            submodule: Default::default(),
+        });
+        let (shell, _repo, mut cx) = rail_window(cx, tree);
+        cx.update(|_, cx| cx.set_reduce_motion(true));
+        let edge = cx
+            .debug_bounds("workspace-sidebar")
+            .expect("no rail drawn")
+            .right();
+        let grab = gpui::point(edge - gpui::px(2.0), gpui::px(400.0));
+        cx.simulate_mouse_down(grab, gpui::MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_move(
+            gpui::point(edge + gpui::px(40.0), gpui::px(400.0)),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+        cx.simulate_mouse_up(
+            gpui::point(edge + gpui::px(40.0), gpui::px(400.0)),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+
+        shell.update(&mut cx, |shell, cx| {
+            shell.run_command("workspace.toggle-sidebar", cx)
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("workspace-sidebar")
+                .map(|b| b.size.width)
+                .unwrap_or(gpui::px(0.0))
+                <= gpui::px(0.5),
+            "a collapsed rail still has width"
+        );
+        shell.update(&mut cx, |shell, cx| {
+            shell.run_command("workspace.toggle-sidebar", cx)
+        });
+        cx.run_until_parked();
+        // Grabbed two pixels inside the edge, the pointer's travel is the
+        // rail's growth: +40 lands on +42.
+        assert_eq!(
+            cx.debug_bounds("workspace-sidebar")
+                .expect("no rail drawn")
+                .size
+                .width,
+            edge + gpui::px(42.0),
+            "re-opening lost the dragged width"
+        );
+    }
+
+    /// A rail that is gone grabs nothing: the edge strip dies with the flag,
+    /// so a press where the rail's border was does not start a drag — and
+    /// cannot resurrect the rail by width.
+    #[gpui::test]
+    fn a_collapsed_rails_edge_does_not_grab(cx: &mut TestAppContext) {
+        let mut tree = Status::default();
+        tree.unstaged.push(gitten_core::status::UnstagedEntry {
+            path: "a.txt".into(),
+            change: gitten_core::status::Change::Modified,
+            kind: gitten_core::status::Kind::File,
+            submodule: Default::default(),
+        });
+        let (shell, _repo, mut cx) = rail_window(cx, tree);
+        cx.update(|_, cx| cx.set_reduce_motion(true));
+        let edge = cx
+            .debug_bounds("workspace-sidebar")
+            .expect("no rail drawn")
+            .right();
+        shell.update(&mut cx, |shell, cx| {
+            shell.run_command("workspace.toggle-sidebar", cx)
+        });
+        cx.run_until_parked();
+
+        cx.simulate_mouse_down(
+            gpui::point(edge - gpui::px(2.0), gpui::px(400.0)),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+        cx.simulate_mouse_move(
+            gpui::point(edge + gpui::px(80.0), gpui::px(400.0)),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+        cx.simulate_mouse_up(
+            gpui::point(edge + gpui::px(80.0), gpui::px(400.0)),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+        shell.read_with(&cx, |shell, _| {
+            assert!(
+                shell.rail_drag.is_none(),
+                "a dead rail's edge started a drag"
+            );
+            assert_eq!(
+                shell.workspace.sidebar_w, None,
+                "a dead rail's edge set a width"
+            );
+        });
+    }
+
+    /// The diff's own rule is a drag edge like the rails': the probe owns
+    /// the gesture, the workspace keeps the fraction, and the strip follows
+    /// the pointer. The centre has to be in the two-column layout first —
+    /// `s` cycles it, through the same command the key reaches.
+    #[gpui::test]
+    fn the_splits_rule_follows_a_drag(cx: &mut TestAppContext) {
+        let mut tree = Status::default();
+        tree.unstaged.push(gitten_core::status::UnstagedEntry {
+            path: "a.txt".into(),
+            change: gitten_core::status::Change::Modified,
+            kind: gitten_core::status::Kind::File,
+            submodule: Default::default(),
+        });
+        let (shell, repo, mut cx) = rail_window(cx, tree);
+        cx.update(|_, cx| cx.set_reduce_motion(true));
+        center_diff(&shell, &repo, &mut cx);
+        shell.update(&mut cx, |shell, cx| {
+            shell.set_spot(super::Spot::Main, cx);
+            shell.run_command("diff.cycle-layout", cx);
+        });
+        settle_center(&mut cx);
+
+        let strip = cx
+            .debug_bounds("split-edge")
+            .expect("no rule strip in a two-column diff");
+        let at = strip.left() + strip.size.width * 0.5;
+        let mid = strip.top() + strip.size.height * 0.5;
+        cx.simulate_mouse_down(
+            gpui::point(at, mid),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+        cx.simulate_mouse_move(
+            gpui::point(at + gpui::px(60.0), mid),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+        cx.simulate_mouse_up(
+            gpui::point(at + gpui::px(60.0), mid),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+
+        let moved = cx.debug_bounds("split-edge").expect("rule strip gone");
+        assert!(
+            f32::from(moved.left()) - f32::from(strip.left()) > 40.0,
+            "the rule did not follow the drag"
+        );
+        shell.read_with(&cx, |shell, _| {
+            assert!(
+                shell.workspace.split_fraction > crate::views::split::SPLIT_HALF,
+                "the drag kept no fraction"
+            );
+        });
+    }
+
+    /// The fraction is the view's, not the renderer's: a layout cycle builds
+    /// a fresh `SplitRows`, and the rule lands where the pointer left it
+    /// rather than back in the middle.
+    #[gpui::test]
+    fn a_dragged_rule_survives_a_layout_cycle(cx: &mut TestAppContext) {
+        let mut tree = Status::default();
+        tree.unstaged.push(gitten_core::status::UnstagedEntry {
+            path: "a.txt".into(),
+            change: gitten_core::status::Change::Modified,
+            kind: gitten_core::status::Kind::File,
+            submodule: Default::default(),
+        });
+        let (shell, repo, mut cx) = rail_window(cx, tree);
+        cx.update(|_, cx| cx.set_reduce_motion(true));
+        center_diff(&shell, &repo, &mut cx);
+        shell.update(&mut cx, |shell, cx| {
+            shell.set_spot(super::Spot::Main, cx);
+            shell.run_command("diff.cycle-layout", cx);
+        });
+        settle_center(&mut cx);
+
+        let strip = cx.debug_bounds("split-edge").expect("no rule strip");
+        let at = strip.left() + strip.size.width * 0.5;
+        let mid = strip.top() + strip.size.height * 0.5;
+        cx.simulate_mouse_down(
+            gpui::point(at, mid),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+        cx.simulate_mouse_move(
+            gpui::point(at + gpui::px(80.0), mid),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+        cx.simulate_mouse_up(
+            gpui::point(at + gpui::px(80.0), mid),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+        let dragged = cx
+            .debug_bounds("split-edge")
+            .expect("rule strip gone")
+            .left();
+        assert!(
+            dragged > strip.left(),
+            "the drag did not move the rule — the rest proves nothing"
+        );
+
+        // Away and back: the one-column layout draws no rule at all, and the
+        // two-column one returns to the dragged stand.
+        shell.update(&mut cx, |shell, cx| {
+            shell.run_command("diff.cycle-layout", cx)
+        });
+        settle_center(&mut cx);
+        assert!(
+            cx.debug_bounds("split-edge").is_none(),
+            "a one-column presentation still draws a rule strip"
+        );
+        shell.update(&mut cx, |shell, cx| {
+            shell.run_command("diff.cycle-layout", cx)
+        });
+        settle_center(&mut cx);
+        assert_eq!(
+            cx.debug_bounds("split-edge")
+                .expect("no rule strip back")
+                .left(),
+            dragged,
+            "a layout cycle forgot the dragged rule"
+        );
+    }
+
+    /// The same reset the rails get: two clicks on the rule hand it back to
+    /// the middle.
+    #[gpui::test]
+    fn a_double_click_on_the_rule_returns_it_to_the_middle(cx: &mut TestAppContext) {
+        let mut tree = Status::default();
+        tree.unstaged.push(gitten_core::status::UnstagedEntry {
+            path: "a.txt".into(),
+            change: gitten_core::status::Change::Modified,
+            kind: gitten_core::status::Kind::File,
+            submodule: Default::default(),
+        });
+        let (shell, repo, mut cx) = rail_window(cx, tree);
+        cx.update(|_, cx| cx.set_reduce_motion(true));
+        center_diff(&shell, &repo, &mut cx);
+        shell.update(&mut cx, |shell, cx| {
+            shell.set_spot(super::Spot::Main, cx);
+            shell.run_command("diff.cycle-layout", cx);
+        });
+        settle_center(&mut cx);
+
+        let strip = cx.debug_bounds("split-edge").expect("no rule strip");
+        let at = strip.left() + strip.size.width * 0.5;
+        let mid = strip.top() + strip.size.height * 0.5;
+        cx.simulate_mouse_down(
+            gpui::point(at, mid),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+        cx.simulate_mouse_move(
+            gpui::point(at + gpui::px(80.0), mid),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+        cx.simulate_mouse_up(
+            gpui::point(at + gpui::px(80.0), mid),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+        let dragged = cx.debug_bounds("split-edge").unwrap().left();
+        assert!(dragged > strip.left(), "the drag did not move the rule");
+
+        cx.simulate_event(gpui::MouseDownEvent {
+            button: gpui::MouseButton::Left,
+            position: gpui::point(dragged + gpui::px(2.0), mid),
+            modifiers: Default::default(),
+            click_count: 2,
+            first_mouse: false,
+        });
+        cx.run_until_parked();
+        shell.read_with(&cx, |shell, _| {
+            assert_eq!(
+                shell.workspace.split_fraction,
+                crate::views::split::SPLIT_HALF,
+                "a double-click did not return the rule to the middle"
+            );
+        });
+    }
+
+    /// One column means no rule: a press in the middle of a unified diff is
+    /// a selection's business, not the probe's.
+    #[gpui::test]
+    fn a_one_column_layout_has_no_rule_to_grab(cx: &mut TestAppContext) {
+        let mut tree = Status::default();
+        tree.unstaged.push(gitten_core::status::UnstagedEntry {
+            path: "a.txt".into(),
+            change: gitten_core::status::Change::Modified,
+            kind: gitten_core::status::Kind::File,
+            submodule: Default::default(),
+        });
+        let (shell, repo, mut cx) = rail_window(cx, tree);
+        cx.update(|_, cx| cx.set_reduce_motion(true));
+        center_diff(&shell, &repo, &mut cx);
+        assert!(
+            cx.debug_bounds("split-edge").is_none(),
+            "the unified layout still draws a rule strip"
+        );
+        let center = cx
+            .debug_bounds("workspace-center")
+            .expect("no centre drawn");
+        cx.simulate_mouse_down(
+            gpui::point(
+                center.left() + center.size.width * 0.5,
+                center.top() + gpui::px(120.0),
+            ),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+        cx.simulate_mouse_up(
+            gpui::point(
+                center.left() + center.size.width * 0.5,
+                center.top() + gpui::px(120.0),
+            ),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+        shell.read_with(&cx, |shell, _| {
+            assert!(
+                shell.rail_drag.is_none(),
+                "a click in a one-column diff started a drag"
+            );
+        });
+    }
+
+    /// The focus half of a collapse: the keyboard cannot stay on a pane
+    /// whose rail just left — it lands on the diff — and asking for that
+    /// pane again is the panel's business, the same slot branches and
+    /// stashes have always drawn through.
+    #[gpui::test]
+    fn collapsing_the_focused_rail_moves_the_keyboard_and_focus_still_reaches_the_pane(
+        cx: &mut TestAppContext,
+    ) {
+        let (shell, _repo, _handle) = files_shell(cx);
+        shell.update(cx, |shell, cx| shell.run_command("workspace.changes", cx));
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(shell.spot, super::Spot::List);
+            assert_eq!(shell.panes.focused_name(), "files");
+        });
+
+        shell.update(cx, |shell, cx| {
+            shell.run_command("workspace.toggle-sidebar", cx)
+        });
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.workspace.sidebar_collapsed);
+            assert_eq!(
+                shell.spot,
+                super::Spot::Main,
+                "the keyboard stayed on a rail that is gone"
+            );
+        });
+
+        // `files.focus` still reaches the pane — it draws as the panel over
+        // a destination that has no slot for it.
+        shell.update(cx, |shell, cx| shell.run_command("files.focus", cx));
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(shell.spot, super::Spot::List);
+            assert_eq!(shell.panes.focused_name(), "files");
+            assert!(
+                !shell.pane_drawn("files"),
+                "a hidden rail's tenant should read as undrawn"
+            );
+        });
+
+        // `esc` is the way out, and the pane it lands on must be drawn
+        // somewhere — the commits timeline, one destination over.
+        shell.update(cx, |shell, cx| shell.back(cx));
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(
+                shell.workspace.destination,
+                crate::views::workspace::Destination::History
+            );
+            assert_eq!(shell.panes.focused_name(), "commits");
+            assert_eq!(shell.spot, super::Spot::List);
+        });
+    }
+
+    /// Entering a destination whose rail is collapsed lands the keyboard on
+    /// the diff, not on a list no rail draws — and the inspector's toggle in
+    /// Changes is the preference a later entry honours, not an error.
+    #[gpui::test]
+    fn entering_a_destination_whose_rail_is_collapsed_lands_on_the_diff(cx: &mut TestAppContext) {
+        let shell = commits_shell(cx);
+        shell.update(cx, |shell, cx| {
+            // Toggled in Changes, where the timeline is never drawn: the
+            // flag is a preference History applies on entry.
+            shell.run_command("workspace.toggle-timeline", cx);
+            shell.run_command("workspace.history", cx);
+        });
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(
+                shell.workspace.destination,
+                crate::views::workspace::Destination::History
+            );
+            assert!(shell.workspace.timeline_collapsed);
+            assert_eq!(
+                shell.spot,
+                super::Spot::Main,
+                "the keyboard landed on a rail that is not drawn"
+            );
+            // The pane itself is untouched: a collapse hides a projection,
+            // it does not close a list.
+            assert!(shell.panes.position("commits").is_some());
+        });
+    }
+
     #[gpui::test]
     fn files_focus_reaches_the_registered_pane_and_says_so_when_there_is_none(
         cx: &mut TestAppContext,
@@ -10364,6 +12121,44 @@ A paragraph with **bolder** and [a link](https://example.com/y).
         shell.read_with(cx, |shell, _| {
             assert!(shell.input.is_some(), "the files pane answers, too");
         });
+    }
+
+    /// Put real rows in the centre through the door the preview uses — the
+    /// recording repo answers `a.txt`'s unstaged diff and the sync lands it —
+    /// because `install_center`'s entity swap does not survive the next
+    /// preview pass, which re-aims the centre at whatever the cursor names.
+    fn center_diff(
+        shell: &gpui::Entity<DevShell>,
+        repo: &Arc<RecordingRepo>,
+        cx: &mut gpui::VisualTestContext,
+    ) {
+        *repo.unstaged.lock().unwrap() = vec![Pair {
+            path: "a.txt".into(),
+            old_path: None,
+            status: 'M',
+            old: vec![Arc::from("alpha"), Arc::from("beta"), Arc::from("gamma")],
+            new: vec![Arc::from("alpha"), Arc::from("BETA"), Arc::from("gamma")],
+            old_oid: None,
+            new_oid: None,
+            old_final_newline: true,
+            new_final_newline: true,
+            binary: false,
+        }];
+        shell.update(cx, |shell, cx| shell.sync_workspace_preview(cx));
+        cx.run_until_parked();
+    }
+
+    /// Let the centre's pipeline settle far enough that its painted frame can
+    /// be asserted on: the width probe measures on one draw, the renderers
+    /// reflow on the next, and the frame after is the first that can read
+    /// where the rule stands. One `update` draws once — the dirty flag a
+    /// probe's notify raises is picked up by the *next* flush — so the count
+    /// is three, spelled out rather than looped into something blurrier.
+    fn settle_center(cx: &mut gpui::VisualTestContext) {
+        for _ in 0..3 {
+            cx.update(|_, cx| cx.refresh_windows());
+        }
+        cx.run_until_parked();
     }
 
     /// Install the fixture diff into the workspace center instead of the
