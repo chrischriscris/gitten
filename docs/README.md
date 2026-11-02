@@ -12,6 +12,9 @@ which numbers those decisions rest on, and the diagrams.
 | [architecture.md](architecture.md) | crates, the boundary, what flows where |
 | [clients.md](clients.md) | writing one: what is shared, what is yours, keys and commands |
 | [diff-pipeline.md](diff-pipeline.md) | raw diff → rows on screen, stage by stage |
+| [diff-rules.md](diff-rules.md) | differs, layouts and wrapping: what is wrong in the plausible direction |
+| [gpui-notes.md](gpui-notes.md) | what GPUI does that you would not guess — read before touching `gui/` |
+| [features.md](features.md) | every command, its keys, and where each client answers it (generated) |
 | [syntax-highlighting.md](syntax-highlighting.md) | the scanner, the tables, the routing |
 | [theming.md](theming.md) | colour as data, surfaces, contrast resolution |
 | [commit-graph.md](commit-graph.md) | lane assignment, hues, the cap, the drawing |
@@ -35,6 +38,10 @@ the first: an agent that cannot see the window cannot check its own work on it.
 | [agent-mcp.md](agent-mcp.md) | the same tools over MCP |
 | [agent-web.md](agent-web.md) | the loopback HTTP API |
 | [agent-perf.md](agent-perf.md) | the perf gate: is it slower, without fooling yourself |
+
+`tools/lint.sh` (`./dev lint`) holds the `AGENTS.md` rules a grep can check,
+and both the pre-commit hook and `./check.sh` run it. `./dev features`
+regenerates [features.md](features.md), and `./check.sh` fails when it is stale.
 
 ## Decisions
 

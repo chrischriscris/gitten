@@ -12,5 +12,6 @@
 # deliberately, say so: git commit --no-verify.
 set -e
 cd "$(git rev-parse --show-toplevel)"
+tools/lint.sh
 cargo fmt --check
 cargo clippy -q --workspace --all-targets -- -D warnings

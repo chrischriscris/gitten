@@ -41,6 +41,19 @@ trap '[ -f "$STASH/log.txt" ] && /bin/cp -f "$STASH/log.txt" fixtures/log.txt
 [ -f fixtures/log.txt ]  && /bin/cp -f fixtures/log.txt  "$STASH/"
 [ -f fixtures/big.diff ] && /bin/cp -f fixtures/big.diff "$STASH/"
 
+echo "── lint ────────────────────────────────────────────────"
+# The AGENTS.md rules a grep can hold — see tools/lint.sh. First, because it is
+# the cheapest thing here and a failure names the line and the fix.
+if ! tools/lint.sh; then
+  FAILED="$FAILED lint"
+fi
+# The feature map is generated; a stale one sends an agent to the wrong file.
+if ! cargo run -q -p gitten-core --example features | diff -q - docs/features.md >/dev/null; then
+  echo "docs/features.md is stale → ./dev features"
+  FAILED="$FAILED features"
+fi
+
+echo
 echo "── correctness ─────────────────────────────────────────"
 report core cargo test -q -p gitten-core
 # The shared startup: the config file, the command line, acquisition. Every

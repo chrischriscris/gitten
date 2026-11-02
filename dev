@@ -9,6 +9,8 @@
 #   ./dev verify -s 'key j' -s 'shot j' -- diff .  the window, headless: steps,
 #                                                  PNGs and state, no focus taken
 #   ./dev check                                    everything headless
+#   ./dev lint                                     the AGENTS.md rules a grep holds
+#   ./dev features                                 regenerate docs/features.md
 #   ./dev config                                   a starting gitten.toml
 #   ./dev bundle                                   target/gitten.app, icon and all
 #   ./dev export                                   build prod and install to PATH
@@ -260,6 +262,18 @@ PLIST
 
   check)
     exec ./check.sh
+    ;;
+
+  lint)
+    exec tools/lint.sh
+    ;;
+
+  features)
+    # Every command, its keys and where each client answers it — generated,
+    # because a hand-kept map is wrong by the second feature. check.sh fails
+    # when the checked-in copy differs from this.
+    cargo run -q -p gitten-core --example features > docs/features.md \
+      && echo "docs/features.md: $(grep -c '^| `' docs/features.md) commands"
     ;;
 
   verify)

@@ -45,8 +45,9 @@ is what you are testing.
 | A given palette | `GITTEN_QA_THEME=github-dark ./dev verify …` |
 | A given window size | `GITTEN_QA_GEOM=900x700 ./dev verify …` |
 
-Run `./dev verify -s 'key cmd-k' -s 'shot palette'` for the full command list,
-or read `Commands::builtin()` in `core/src/command.rs`.
+Every command name, and which file in `gui/` answers it, is in
+`docs/features.md`. A `—` in its gui column means the window probably can't do
+it at all, which is worth knowing before writing steps for it.
 
 **For writes, use a scratch repository.** Never stage, commit or reset in the
 user's checkout:
