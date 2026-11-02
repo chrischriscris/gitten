@@ -22,6 +22,20 @@ which numbers those decisions rest on, and the diagrams.
 | [roadmap.md](roadmap.md) | build order from viewer to product, one block at a time |
 | [competition.md](competition.md) | what else is out there, what to steal and when |
 
+## Agents
+
+The doors an agent works through, each with the command it runs. Start with
+the first: an agent that cannot see the window cannot check its own work on it.
+
+| | |
+|---|---|
+| [agent-verify.md](agent-verify.md) | the window, driven and photographed headless — no focus taken |
+| [agent-inspect.md](agent-inspect.md) | `gitten inspect` / `dispatch`: rows, meta and keys as data |
+| [agent-json.md](agent-json.md) | the `--json` contract every headless tool shares |
+| [agent-mcp.md](agent-mcp.md) | the same tools over MCP |
+| [agent-web.md](agent-web.md) | the loopback HTTP API |
+| [agent-perf.md](agent-perf.md) | the perf gate: is it slower, without fooling yourself |
+
 ## Decisions
 
 [decisions/](decisions/) — one file per decision, newest last. Read these before

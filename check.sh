@@ -149,6 +149,33 @@ for layout in unified split; do
 done
 
 echo
+echo "── window frames (headless) ────────────────────────────"
+# The desktop window, launched, driven and photographed through `./dev
+# verify` — GPUI's test platform with its offscreen renderer, so nothing
+# appears and nothing takes focus. A panic on the road to a first frame, or a
+# renderer that stopped producing one, fails here rather than in a person's
+# hands. Its own target directory: the first run builds GPUI once more.
+# GITTEN_VERIFY_CHECK=0 skips it.
+if [ "${GITTEN_VERIFY_CHECK:-1}" = "0" ]; then
+  echo "  skipped (GITTEN_VERIFY_CHECK=0)"
+else
+  shots=$(mktemp -d)
+  for launch in "diff --fixtures" "commits ."; do
+    # shellcheck disable=SC2086
+    if out=$(./dev verify --json -o "$shots" -s 'shot frame' -s state -- $launch 2>/dev/null) \
+       && printf '%s' "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert all(s["ok"] for s in d["steps"])' \
+       && [ -s "$shots/frame.png" ]; then
+      printf '  %-16s ok\n' "$launch"
+    else
+      FAILED="$FAILED verify:$launch"
+      printf '  ✗ %s: no frame — run ./dev verify -s "shot x" -- %s\n' "$launch" "$launch"
+    fi
+    rm -f "$shots/frame.png"
+  done
+  rm -rf "$shots"
+fi
+
+echo
 echo "── perf gate (advisory) ────────────────────────────────"
 # The hermetic regression harness on the committed small fixtures: no network,
 # no $HOME, median of interleaved rounds as JSON. Advisory on purpose: it

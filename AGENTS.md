@@ -274,6 +274,8 @@ table — so a `Wrap` decides where a line breaks and nothing else.
 ./dev dump    commits ~/src 600     one frame on stdout, timing on stderr.
                                     COLS, ROWS, LAYOUT, WRAP, THEME, AT, FRAMES
 ./dev check                         everything headless
+./dev verify -s 'shot x' -- diff .  the window, headless: driven, photographed,
+                                    and no focus taken — docs/agent-verify.md
 ./dev config > gitten.toml           a complete, correct starting file
 ./dev bundle                        target/gitten.app — icon, name, a real app
 
@@ -322,6 +324,14 @@ the keyboard. Say it's ready and
 hand over the command. The terminal frontend's `dump` example is the exception
 and exists for it — a frame on stdout interrupts nobody, so look at a colour or
 a glyph there rather than asking someone to open something.
+
+**`./dev verify` is the window's `dump`, and it is how a change to the window
+is checked before anyone else looks at it.** The real launch, on GPUI's test
+platform with the offscreen renderer: steps in, PNGs and state out, and no
+window anywhere for focus to go to. A desktop change is not done when it
+compiles; it is done when a shot of it says so. What the run cannot tell you —
+timing, IME, the platform's own chrome — is in `docs/agent-verify.md`; say so
+rather than claiming it.
 
 **A window's state is reproducible from the environment, because a hand is not.**
 `GITTEN_QA_GEOM=1280x800`, `GITTEN_QA_VIEW=history`, `GITTEN_QA_DIALOG=commands`

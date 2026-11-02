@@ -215,7 +215,7 @@ impl Commits {
     /// `"12/4173"`. `None` unfiltered — the label then stays exactly what
     /// acquisition named it. Test-only: the workspace reads the files pane's
     /// note; the old stack's headers were the last production reader.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "verify"))]
     pub fn filter_note(&self) -> Option<String> {
         list::filter_note(
             self.query.as_deref(),

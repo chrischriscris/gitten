@@ -13,6 +13,11 @@ mod settings;
 mod settings_window;
 mod stats;
 mod theme_picker;
+// Compiled into the tests as well, so its parser is tested and its use of
+// GPUI's test platform keeps compiling when nobody is running it.
+#[cfg(any(test, feature = "verify"))]
+#[cfg_attr(not(feature = "verify"), allow(dead_code))]
+mod verify;
 mod views;
 
 use gitten_app::acquire::Data;
@@ -646,8 +651,9 @@ impl Screen {
     }
 
     /// Which mode's bindings were live. Test-only since the keymap driving
-    /// went away; the workspace destinations name themselves.
-    #[cfg(test)]
+    /// went away; the workspace destinations name themselves. A verify run
+    /// reports it too.
+    #[cfg(any(test, feature = "verify"))]
     fn mode(&self) -> &'static str {
         match self {
             Screen::Commits { .. } => "commits",
@@ -662,8 +668,8 @@ impl Screen {
     /// Spelled for tests only: the old stack's pane headers read this, and
     /// nothing in the workspace does — the destinations name themselves.
     /// Kept (not deleted) because the filter-count and extension-label tests
-    /// pin real pane logic through it.
-    #[cfg(test)]
+    /// pin real pane logic through it, and a verify run reports it.
+    #[cfg(any(test, feature = "verify"))]
     fn label(&self, cx: &App) -> String {
         match self {
             Screen::Commits { view, label, .. } => {
@@ -8276,7 +8282,10 @@ fn main() {
     // or, with no history at all, one is offered to pick. Anything explicit
     // keeps the window-first path and its in-window answer to a repository
     // that will not open.
-    if let Some(view) = bare {
+    // A verify run never takes the bare road: there is no person to offer a
+    // picker to, and a recent repository is not the one the steps were
+    // written against. It goes through the ordinary parse and fails there.
+    if let Some(view) = bare.filter(|_| !verifying()) {
         if gitten_git::open(std::path::Path::new("."))
             .status()
             .is_err()
@@ -8301,6 +8310,10 @@ fn main() {
     };
     match launch {
         Ok(launch) => {
+            #[cfg(feature = "verify")]
+            if verify::requested() {
+                verify::run(launch);
+            }
             let app = gpui_platform::application().with_assets(assets::Assets::default());
             start::mark("gpui application up; entering run");
             app.run(move |cx| open_main_window(launch, cx));
@@ -9041,6 +9054,8 @@ fn open_main_window(launch: Launch, cx: &mut App) {
                     // on History and never on a frame of Changes.
                     shell.apply_doors(&doors, cx);
                 });
+                #[cfg(feature = "verify")]
+                verify::adopt(&shell, cx);
             }
             {
                 let shell = shell.downgrade();
@@ -9215,6 +9230,15 @@ fn open_main_window(launch: Launch, cx: &mut App) {
 /// is not this: a repository launch defers its acquisition past the window
 /// and answers a repository that will not open in the window's error band,
 /// and a fixture or patch fails on stderr as it always has.
+/// Whether this process is a headless verify run — see `verify`. Always
+/// false in a build without the feature, which is every build a person runs.
+fn verifying() -> bool {
+    #[cfg(feature = "verify")]
+    return verify::requested();
+    #[cfg(not(feature = "verify"))]
+    false
+}
+
 fn bare_launch_view(args: &[String]) -> Option<View> {
     match gitten_app::cli::parse(args, View::Commits) {
         Request::Open { view, source } => match source {

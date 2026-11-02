@@ -180,7 +180,7 @@ impl Stashes {
     /// `"1/3"`. `None` unfiltered — the header then stays exactly what
     /// acquisition named it. Test-only: the old stack's headers were the
     /// last production reader.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "verify"))]
     pub fn filter_note(&self) -> Option<String> {
         list::filter_note(self.filter.as_deref(), self.visible.len(), self.data.len())
     }
