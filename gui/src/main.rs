@@ -6877,7 +6877,10 @@ impl DevShell {
                 }),
             )
         };
-        let mut status_line = format!("{changed} files changed");
+        let mut status_line = match changed {
+            1 => "1 file changed".to_string(),
+            n => format!("{n} files changed"),
+        };
         if let Some(note) = &filter_note {
             status_line = format!("{status_line} \u{00b7} {note}");
         }

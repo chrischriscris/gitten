@@ -99,14 +99,14 @@ pub(crate) fn render_sidebar(deps: &SidebarDeps, cx: &mut App) -> AnyElement {
     };
     let row_h = ws_row_h(&host.font);
     let face = host.chrome_family.clone();
-    // The staged/total hunk sentence for the rail's footer, summed from
-    // the refresh's own per-path map — the same numbers the inspector
-    // spells, read here as refcounts and never recomputed.
-    let (hunks_staged, hunks_total) = {
-        let f = deps.files.read(cx);
-        f.counts()
-            .values()
-            .fold((0u32, 0u32), |(s, t), (a, b)| (s + a, t + b))
+    // The rail's footer: how many hunks are staged, from the refresh's own
+    // per-path map, the same number the inspector spells. Never "n of m":
+    // the map only counts files with something staged, so a total from it
+    // leaves out every file that is still all unstaged.
+    let footer = match deps.files.read(cx).staged_hunks() {
+        0 => SharedString::from("Nothing staged"),
+        1 => SharedString::from("1 hunk staged"),
+        n => SharedString::from(format!("{n} hunks staged")),
     };
 
     // One file row: leading stage checkbox, selectable filename, trailing
@@ -601,9 +601,8 @@ pub(crate) fn render_sidebar(deps: &SidebarDeps, cx: &mut App) -> AnyElement {
         })
         .when(deps.history_note.is_none(), |d| {
             d.child(
-                // The rail's footer: the staged/total hunk sentence over a
-                // hairline — the reference's list-foot, reading the same map
-                // the inspector spells.
+                // The rail's footer: the staged hunk sentence over a
+                // hairline, the reference's list-foot.
                 div()
                     .flex_none()
                     .flex()
@@ -614,9 +613,7 @@ pub(crate) fn render_sidebar(deps: &SidebarDeps, cx: &mut App) -> AnyElement {
                     .border_color(rgb(host.theme.chrome.border))
                     .text_size(px((host.font.size * 0.72).round()))
                     .text_color(rgb(host.theme.dim_on(Surface::Context)))
-                    .child(SharedString::from(format!(
-                        "{hunks_staged} of {hunks_total} hunks staged"
-                    ))),
+                    .child(footer),
             )
         })
         .children(deps.history_note.clone().map(|branch| {
