@@ -10,6 +10,32 @@
 
 use notify::{EventKind, RecursiveMode, Watcher};
 use std::path::PathBuf;
+use std::time::{Duration, SystemTime};
+
+/// How far back a path's mtime is believed. Delivery lags a write by
+/// milliseconds; a file older than this was put there with its time kept
+/// (`cp -p`, `rsync -t`, an archive) and is news *now*.
+const LAG: Duration = Duration::from_secs(1);
+
+/// When the change an event reports happened: the newest mtime among its
+/// paths, as long as it falls in the last [`LAG`]. Anything else is `now`
+/// (a path that is gone, a time from the future or from long ago), which can
+/// only cost a refresh, never miss one.
+fn changed_at(paths: &[PathBuf], now: SystemTime) -> SystemTime {
+    let believed = |at: SystemTime| match now.duration_since(at) {
+        Ok(ago) if ago <= LAG => at,
+        _ => now,
+    };
+    paths
+        .iter()
+        .map(|p| {
+            std::fs::symlink_metadata(p)
+                .and_then(|m| m.modified())
+                .map_or(now, believed)
+        })
+        .max()
+        .unwrap_or(now)
+}
 
 /// A live repository watch.
 ///
@@ -42,11 +68,18 @@ pub struct RepoWatch {
 /// cost; a missed `target/` event would be a feature, a missed source file a
 /// bug, and the filter cannot tell them apart.
 ///
-/// `on_change` runs on notify's own thread: stamp a flag and return, exactly
-/// as [`crate::config::watch`]'s callback does.
+/// `on_change` gets *when* the repository changed, which is not when it is
+/// called: an event arrives some milliseconds after the write it reports,
+/// and a client that reads the repository in between has already read the
+/// change. Stamped with the delivery time instead, a write's own index
+/// rename lands just after the refresh it triggered has started and buys a
+/// second, identical one. See [`changed_at`].
+///
+/// It runs on notify's own thread: stamp a flag and return, exactly as
+/// [`crate::config::watch`]'s callback does.
 pub fn repo(
     root: &std::path::Path,
-    mut on_change: impl FnMut() + Send + 'static,
+    mut on_change: impl FnMut(SystemTime) + Send + 'static,
 ) -> notify::Result<RepoWatch> {
     let targets = gitten_git::watch_targets(root)
         .ok_or_else(|| notify::Error::generic("not a repository"))?;
@@ -82,7 +115,7 @@ pub fn repo(
             }
         });
         if moved {
-            on_change();
+            on_change(changed_at(&event.paths, SystemTime::now()));
         }
     })?;
     for dir in &state {
@@ -158,7 +191,7 @@ mod tests {
         let root = scratch("filter");
         let calls = Arc::new(AtomicUsize::new(0));
         let counted = calls.clone();
-        let _watch = repo(&root, move || {
+        let _watch = repo(&root, move |_| {
             counted.fetch_add(1, Ordering::Relaxed);
         })
         .expect("a repository watches");
@@ -196,6 +229,27 @@ mod tests {
             "objects churn or a lock fired the callback"
         );
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_change_is_dated_by_its_file_when_the_file_is_recent() {
+        let root = scratch("dated");
+        let file = root.join("f.txt");
+        std::fs::write(&file, b"x").expect("a write");
+        let written = std::fs::metadata(&file)
+            .and_then(|m| m.modified())
+            .expect("an mtime");
+        // Heard a little late: dated by the write, not the hearing.
+        let later = written + Duration::from_millis(30);
+        let paths = [file];
+        assert_eq!(changed_at(&paths, later), written);
+        // A file whose time was kept from long ago is news now.
+        let much_later = written + Duration::from_secs(60);
+        assert_eq!(changed_at(&paths, much_later), much_later);
+        // And a path that is gone is news now too.
+        let now = SystemTime::now();
+        assert_eq!(changed_at(&[root.join("gone")], now), now);
         let _ = std::fs::remove_dir_all(root);
     }
 }

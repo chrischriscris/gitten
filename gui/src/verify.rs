@@ -614,15 +614,10 @@ impl DevShell {
     /// refresh wave, a main-view load.
     ///
     /// A change the watcher stamped and no wave has read yet is not counted.
-    /// A write's own wave is what puts it on screen, and the stamp its
-    /// index rename leaves behind is heard a few milliseconds after the
-    /// write finishes, which here is after that wave began. It buys a
-    /// second, identical wave once the watcher's two-second floor passes, in
-    /// real time, and waiting for that costs every write step two seconds
-    /// to photograph nothing new. Worse, it hid a write whose own refresh
-    /// was skipped: the settle sat out the watcher's catch-up and the shot
-    /// looked right. If the echo wave starts during a later step, that
-    /// step's settle waits for it like any other wave.
+    /// A write's own wave is what puts the write on screen, and waiting on
+    /// the watcher once hid a write whose own refresh was skipped: the
+    /// settle sat out the watcher's catch-up and the shot looked right.
+    /// [`DevShell::owed`] is the half `sh` waits for.
     fn busy(&self) -> bool {
         self.running.is_some() || self.refresh_pending > 0 || self.loading.get()
     }
