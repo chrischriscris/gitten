@@ -246,8 +246,11 @@ type Rediff = Rc<dyn Fn(&Host, &Overrides, &str) -> Result<Vec<FileDiff>, String
 /// Milliseconds since the epoch, for the watcher's flag — its callback runs
 /// on notify's thread, where an `Instant` cannot be stamped atomically.
 fn epoch_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    epoch_of(std::time::SystemTime::now())
+}
+
+fn epoch_of(at: std::time::SystemTime) -> u64 {
+    at.duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
@@ -1202,21 +1205,22 @@ struct DevShell {
     /// the wave lands under a newer generation, which must read as spent
     /// rather than suppress the very re-aim the record was waiting for.
     queued_write: Option<u64>,
-    /// When the repository last changed on disk, stamped by the watcher's
-    /// callback as epoch milliseconds — an `AtomicU64` because that callback
-    /// runs on notify's thread, not ours. Window activation stamps it too:
-    /// coming back to the window is the same question as a file event. Zero
-    /// until anything fires.
+    /// When the repository last changed on disk, as epoch milliseconds: the
+    /// watcher dates each event by the file it reports, not by when notify
+    /// delivered it (`watch::repo` says why), and the newest date wins. An
+    /// `AtomicU64` because that callback runs on notify's thread, not ours.
+    /// Window activation stamps it too: coming back to the window is the
+    /// same question as a file event. Zero until anything fires.
     repo_changed: Arc<AtomicU64>,
     /// The stamp [`DevShell::note_repo_event`] last turned into a wave — the
     /// flag is read as `repo_changed > repo_seen`, never cleared, so an
     /// event that lands while a wave is in flight is still owed one.
     repo_seen: u64,
-    /// The flag's value at the moment the in-flight wave began. An event is
-    /// stamped after its write completed, so everything stamped before a
-    /// wave's loads spawned is read by that wave — including the churn our
-    /// own writes leave in the flag, which would otherwise buy a second,
-    /// identical wave 250ms after every one. When the wave lands,
+    /// The moment the in-flight wave began, as epoch milliseconds less one.
+    /// A change dated before a wave's loads spawned is read by that wave,
+    /// however late its event arrives — which is what keeps a write's own
+    /// index rename, heard a few milliseconds after the write's wave has
+    /// started, from buying a second, identical one. When the wave lands,
     /// `repo_seen` ratchets up to this.
     refresh_since: u64,
     /// The live watcher, and the root it points at. Held because dropping it
@@ -3284,7 +3288,9 @@ impl DevShell {
             return;
         };
         self.invalidate_refresh();
-        self.refresh_since = self.repo_changed.load(Ordering::Relaxed);
+        // Less one: a change in the very millisecond the loads spawn may
+        // have missed them, and it stays owed.
+        self.refresh_since = epoch_ms().saturating_sub(1);
         let refresh_id = self.refresh_id;
         let host = config::host(cx);
         let target = self.generation;
@@ -3425,8 +3431,8 @@ impl DevShell {
             self.repo_watch_path = Some(path.clone());
             self.repo_watch = {
                 let flag = self.repo_changed.clone();
-                match gitten_app::watch::repo(&path, move || {
-                    flag.store(epoch_ms(), Ordering::Relaxed)
+                match gitten_app::watch::repo(&path, move |at| {
+                    flag.fetch_max(epoch_of(at), Ordering::Relaxed);
                 }) {
                     Ok(watch) => Some(watch),
                     Err(e) => {
@@ -9011,7 +9017,7 @@ fn open_main_window(launch: Launch, cx: &mut App) {
                     // the wave so the same debounce and rate floor decide.
                     let sub = cx.observe_window_activation(window, |this, window, _| {
                         if window.is_window_active() {
-                            this.repo_changed.store(epoch_ms(), Ordering::Relaxed);
+                            this.repo_changed.fetch_max(epoch_ms(), Ordering::Relaxed);
                         }
                     });
                     shell._window_subs.push(sub);
@@ -10310,15 +10316,17 @@ mod tests {
             shell.note_repo_event(cx);
             assert_eq!(shell.refresh_pending, 1, "a consumed stamp fired again");
 
-            // And a stamp that lands inside the wave stays owed — stamping
+            // And a change dated after the wave began stays owed — stamping
             // it here, before the wave is parked home.
-            shell.repo_changed.store(
-                (epoch_ms() - 1_000).max(shell.repo_seen + 1),
-                Ordering::Relaxed,
-            );
+            shell
+                .repo_changed
+                .fetch_max(shell.refresh_since + 1, Ordering::Relaxed);
         });
         cx.run_until_parked();
         assert_eq!(calls.load(Ordering::Relaxed), 1, "one stamp, one load");
+        // Past the debounce, which reads that fresh stamp as a burst still
+        // landing.
+        std::thread::sleep(Duration::from_millis(260));
 
         shell.update(cx, |shell, cx| {
             assert_eq!(shell.refresh_pending, 0);
@@ -10332,6 +10340,11 @@ mod tests {
                 shell.refresh_pending >= 1,
                 "an event inside a wave was lost with it"
             );
+            // A write's own echo: the index rename it made before this wave
+            // began, heard only now that the wave is running.
+            shell
+                .repo_changed
+                .fetch_max(shell.refresh_since, Ordering::Relaxed);
         });
         cx.run_until_parked();
         assert_eq!(
@@ -10339,11 +10352,12 @@ mod tests {
             2,
             "the owed stamp got its wave"
         );
+        std::thread::sleep(Duration::from_millis(260));
 
         shell.update(cx, |shell, cx| {
-            // And that wave consumed the stamp that raised it: floor out of
-            // the way, a quiet tick still raises nothing — which is also why
-            // a write's own churn costs no second wave.
+            // And that wave covered both the stamp that raised it and the
+            // echo heard while it ran: floor and debounce out of the way, a
+            // quiet tick still raises nothing.
             shell.repo_wave_at = Instant::now() - Duration::from_secs(10);
             shell.note_repo_event(cx);
             assert_eq!(shell.refresh_pending, 0, "a covered stamp fired again");

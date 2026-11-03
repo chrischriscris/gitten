@@ -92,12 +92,10 @@ also why `wait MS` cannot stand in for it: `wait` moves the simulated clock,
 and 3000 simulated milliseconds pass in a fraction of a real second.
 
 A change the watcher has stamped but not yet turned into a wave is not waited
-for. A write leaves one behind: its index rename is heard a few milliseconds
-after it finishes, and a run pumps the finish faster than that, so the stamp
-lands after the write's own wave began and buys a second, identical one about
-two seconds later. If that wave starts during a later step, the step's settle waits
-for it, so `generation` in `state` can read one higher than the writes alone
-explain.
+for, except after `sh`, which is the one step whose change arrives that way. A
+write's own index rename is heard a few milliseconds after the write's wave has
+started, but it is dated by the file and not by the hearing, so that wave covers
+it and no second one follows.
 
 The config is the user's `gitten.toml`, so shots match what they see. Set
 `GITTEN_CONFIG` to a file of your own when a run has to be independent of it. The
