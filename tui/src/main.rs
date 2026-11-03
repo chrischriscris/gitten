@@ -1416,8 +1416,8 @@ struct App {
     jobs: Runner,
     /// The cloneable end of [`App::jobs`], handed out to whatever submits.
     submitter: Submitter,
-    /// The generation the queue has advanced to, and so the one every pane
-    /// was last refreshed against.
+    /// This client's repository epoch, advanced by every finished write and
+    /// every switch, and so the one every pane was last refreshed against.
     generation: Generation,
     /// What this client runs, beside the shared registry — the one contract
     /// the help panel and the dispatch refusal both read. Built once from
@@ -6264,28 +6264,19 @@ impl App {
         while let Some(event) = self.jobs.try_next() {
             match event {
                 JobEvent::Started { name } => self.message = format!("running {name}"),
-                JobEvent::Finished {
-                    outcome,
-                    generation,
-                    done,
-                    ..
-                } => {
+                JobEvent::Finished { outcome, done, .. } => {
                     let write = outcome.err();
-                    let mut refresh = None;
                     // A plan is a window of shas, and the write that just
                     // landed may have rewritten every one of them. Running
                     // it afterwards would aim at objects nobody can see any
                     // more, so the screen closes rather than silently
                     // retargeting — the editing is cheap to do again, and a
                     // rewrite aimed at the wrong commits is not.
-                    let mut closed = false;
-                    if generation > self.generation {
-                        self.generation = generation;
-                        refresh = self.refresh_stale(generation).err();
-                        if self.todo.take().is_some() {
-                            self.sync_modes();
-                            closed = true;
-                        }
+                    self.generation = self.generation.advance();
+                    let refresh = self.refresh_stale(self.generation).err();
+                    let closed = self.todo.take().is_some();
+                    if closed {
+                        self.sync_modes();
                     }
                     self.message = match (write, refresh) {
                         (Some(write), Some(refresh)) => format!("{write} · {refresh}"),

@@ -1,4 +1,5 @@
-//! Serial background jobs and repository invalidation generations.
+//! Serial background jobs, and the generation a client counts its
+//! repository invalidations in.
 //!
 //! A job is I/O, so this lives in `gitten-app`, never `core`. The runner knows
 //! nothing about git or a UI: it executes extension and built-in jobs through
@@ -50,12 +51,15 @@ impl Submitter {
     }
 }
 
-/// How many writes have come back from the queue.
+/// A client's repository epoch: how many times everything on screen has been
+/// made stale. Every screen records the one it was acquired at, and a refresh
+/// wave re-reads each screen below the target.
 ///
-/// A success moved the repository for certain; a refusal only *may* have —
-/// git can answer nonzero with work already left behind, a conflicted
-/// revert being the case that proves it. Both advance the count, because
-/// both are reasons for every pane holding repository state to read again.
+/// The client owns the only counter, and every invalidation advances it: a
+/// finished write, a repository switch, an outside change the watcher saw.
+/// The worker does not count. It used to, and a client compared its count
+/// against its own epoch, which a switch or a watcher wave had already moved
+/// past, so the next write's finish read as old news and skipped its refresh.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Generation(u64);
 
@@ -64,21 +68,19 @@ impl Generation {
         self.0
     }
 
-    /// A repository switch re-reads every pane without a write having
-    /// happened — the same invalidation a finished write causes, from a
-    /// different reason. Every screen's generation compares below the new
-    /// target, so the next refresh wave re-acquires all of them.
+    /// The next epoch. Every screen's generation compares below it, so the
+    /// next refresh wave re-acquires all of them.
     pub fn advance(self) -> Self {
-        self.next()
-    }
-
-    fn next(self) -> Self {
         Self(self.0.saturating_add(1))
     }
 }
 
-/// A worker lifecycle event. Every finish carries the finish count — a
-/// refusal as much as a success, for the reason [`Generation`] gives.
+/// A worker lifecycle event.
+///
+/// Every finish is a reason to re-read the repository, a refusal as much as
+/// a success: git can answer nonzero with work already left behind, a
+/// conflicted revert being the case that proves it. A client advances its
+/// [`Generation`] on each one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     Started {
@@ -86,7 +88,6 @@ pub enum Event {
     },
     Finished {
         name: String,
-        generation: Generation,
         outcome: Result<(), String>,
         /// The job's own [`confirmation`](Job::confirmation), read off it
         /// before it ran and forwarded verbatim. A client decides what to do
@@ -143,7 +144,6 @@ impl Drop for Runner {
 }
 
 fn worker(commands: Receiver<Message>, events: Sender<Event>) {
-    let mut generation = Generation::default();
     while let Ok(message) = commands.recv() {
         let Message::Run(job) = message else { break };
         let name = job.name().to_string();
@@ -154,13 +154,8 @@ fn worker(commands: Receiver<Message>, events: Sender<Event>) {
             Ok(Err(error)) => Err(error),
             Err(payload) => Err(format!("job panicked: {}", panic_text(&payload))),
         };
-        // Counted either way: the client cannot tell a clean refusal from
-        // one that moved the repository on its way out, so both are a new
-        // state for the panes to catch up with.
-        generation = generation.next();
         let _ = events.send(Event::Finished {
             name,
-            generation,
             outcome,
             done,
         });
@@ -213,7 +208,7 @@ mod tests {
     }
 
     #[test]
-    fn jobs_are_fifo_and_every_finish_advances_the_generation() {
+    fn jobs_are_fifo_and_a_refusal_is_a_finish_too() {
         let runner = Runner::new();
         let submit = runner.submitter();
         let ran = Arc::new(Mutex::new(Vec::new()));
@@ -231,7 +226,6 @@ mod tests {
         assert!(matches!(
             events[1],
             Event::Finished {
-                generation: Generation(1),
                 outcome: Ok(()),
                 ..
             }
@@ -241,7 +235,6 @@ mod tests {
         assert!(matches!(
             events[3],
             Event::Finished {
-                generation: Generation(2),
                 outcome: Err(_),
                 ..
             }
@@ -249,7 +242,6 @@ mod tests {
         assert!(matches!(
             events[5],
             Event::Finished {
-                generation: Generation(3),
                 outcome: Ok(()),
                 ..
             }
@@ -279,7 +271,6 @@ mod tests {
             receive(&runner, 2).pop(),
             Some(Event::Finished {
                 name: "announce".into(),
-                generation: Generation(1),
                 outcome: Err("declined".into()),
                 done: Some("sent".into()),
             })
@@ -349,12 +340,11 @@ mod tests {
             }))
             .is_ok());
         let events = receive(&runner, 4);
-        // The panic counts as a finish too — the worker's count is of
-        // answers, and the job after it comes back as the second one.
+        // The panic comes back as a finish too, and the job after it still
+        // runs.
         assert!(matches!(
             events[1],
             Event::Finished {
-                generation: Generation(1),
                 outcome: Err(_),
                 ..
             }
@@ -362,7 +352,6 @@ mod tests {
         assert!(matches!(
             events[3],
             Event::Finished {
-                generation: Generation(2),
                 outcome: Ok(()),
                 ..
             }

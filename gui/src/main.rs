@@ -3199,7 +3199,6 @@ impl DevShell {
                 }
                 JobEvent::Finished {
                     outcome: Err(error),
-                    generation,
                     name,
                     ..
                 } => {
@@ -3220,14 +3219,11 @@ impl DevShell {
                     // who cannot resolve what no pane shows. Nothing on this
                     // queue reads, so every finish schedules the same
                     // re-acquire wave a success does.
-                    if generation > self.generation {
-                        self.generation = generation;
-                        self.refresh_stale(cx);
-                    }
+                    self.generation = self.generation.advance();
+                    self.refresh_stale(cx);
                 }
                 JobEvent::Finished {
                     outcome: Ok(()),
-                    generation,
                     done,
                     name,
                     ..
@@ -3263,10 +3259,8 @@ impl DevShell {
                     } else if name.starts_with("push ") {
                         self.last_push = Some(Instant::now());
                     }
-                    if generation > self.generation {
-                        self.generation = generation;
-                        self.refresh_stale(cx);
-                    }
+                    self.generation = self.generation.advance();
+                    self.refresh_stale(cx);
                     // A job that named its finish gets its sentence in this
                     // band — the sync verbs' pushed/pulled/fetched. Said
                     // once, beside the facts the refresh above puts back on
@@ -9423,7 +9417,7 @@ mod tests {
     use crate::views::commits::Commits;
     use crate::views::workspace;
     use gitten_app::cli::{Source, View};
-    use gitten_app::jobs::{Event as JobEvent, Generation, Job, Runner, Submitter};
+    use gitten_app::jobs::{Generation, Job, Runner, Submitter};
     use gitten_core::host::Host;
     use gitten_core::status::Status;
     use gitten_core::Commit;
@@ -9724,29 +9718,6 @@ mod tests {
 
         fn run(self: Box<Self>) -> Result<(), String> {
             Ok(())
-        }
-    }
-
-    fn successful_generation() -> Generation {
-        let runner = Runner::new();
-        runner
-            .submitter()
-            .submit(Box::new(Succeed))
-            .unwrap_or_else(|_| panic!("runner rejected a job"));
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            while let Some(event) = runner.try_next() {
-                if let JobEvent::Finished {
-                    generation,
-                    outcome: Ok(()),
-                    ..
-                } = event
-                {
-                    return generation;
-                }
-            }
-            assert!(Instant::now() < deadline, "job did not finish");
-            std::thread::yield_now();
         }
     }
 
@@ -10186,7 +10157,7 @@ mod tests {
         let shell = shell(None, cx);
         let ran = Rc::new(Cell::new(false));
         let refreshed = Rc::new(Cell::new(Generation::default()));
-        let target = successful_generation();
+        let target = Generation::default().advance();
         shell.update(cx, |shell, cx| {
             cx.set_global(config::Active(Rc::new(Host::new())));
             shell.register_pane(
@@ -10220,7 +10191,7 @@ mod tests {
     #[gpui::test]
     fn one_generation_refreshes_every_visible_repository_pane(cx: &mut TestAppContext) {
         let shell = shell(None, cx);
-        let generation = successful_generation();
+        let generation = Generation::default().advance();
         let calls = Arc::new(AtomicUsize::new(0));
         let path = PathBuf::from("/fake");
         let source = Source::Repo {
@@ -13680,6 +13651,26 @@ diff --git a/fresh.txt b/fresh.txt
                 shell.generation > Generation::default(),
                 "a refusal left the panes believing they are current"
             );
+            assert_eq!(shell.refresh_pending, 0, "the wave never came home");
+        });
+    }
+
+    /// A write's finish refreshes however far the window's own epoch has
+    /// run ahead of the queue. A repository launch starts at the skeleton's
+    /// wave target and every watcher wave advances it, while the worker has
+    /// finished nothing; comparing the two once skipped the first write's
+    /// refresh, and every one after an outside change, until the watcher
+    /// caught up two seconds later.
+    #[gpui::test]
+    fn a_write_refreshes_after_the_window_moved_on_without_one(cx: &mut TestAppContext) {
+        let (shell, _repo, _handle) = files_shell(cx);
+        let submit = wire_runner(&shell, cx);
+        let ahead = Generation::default().advance().advance().advance();
+        shell.update(cx, |shell, _| shell.generation = ahead);
+        assert!(submit.submit(Box::new(Succeed)).is_ok());
+        pump_write(&shell, cx);
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(shell.generation, ahead.advance());
             assert_eq!(shell.refresh_pending, 0, "the wave never came home");
         });
     }

@@ -174,6 +174,10 @@ struct Outcome {
     state: Option<String>,
     /// Whether the settle after it ran out of time with work still in flight.
     unsettled: bool,
+    /// How long, in real milliseconds, the window stayed busy after the step
+    /// — the settle's wait, less the quiet it then holds out for. `None`
+    /// for a step that does not settle.
+    busy_ms: Option<f64>,
 }
 
 impl Outcome {
@@ -186,7 +190,12 @@ impl Outcome {
             shot: None,
             state: None,
             unsettled: false,
+            busy_ms: None,
         }
+    }
+    fn settled(&mut self, settle: Settle) {
+        self.unsettled = !settle.done;
+        self.busy_ms = Some(millis(settle.busy));
     }
     fn fail(mut self, error: impl Into<String>) -> Self {
         self.ok = false;
@@ -236,7 +245,7 @@ pub(crate) fn run(launch: Launch) -> ! {
     cx.allow_parking();
     let began = Instant::now();
     cx.update(|cx| crate::open_main_window(launch, cx));
-    let launch_settled = settle(&mut cx, Duration::from_millis(400));
+    let launched = settle(&mut cx, Duration::from_millis(400));
 
     let Some(window) = cx.update(|cx| cx.windows().first().copied()) else {
         fail(
@@ -361,7 +370,7 @@ pub(crate) fn run(launch: Launch) -> ! {
                 }
             }
             Step::Wait(ms) => {
-                outcome.unsettled = !settle(&mut cx, Duration::from_millis(*ms));
+                outcome.settled(settle(&mut cx, Duration::from_millis(*ms)));
             }
             Step::Shot(name) => {
                 let path = out.join(format!("{name}.png"));
@@ -378,7 +387,7 @@ pub(crate) fn run(launch: Launch) -> ! {
             }
         }
         if !matches!(step, Step::Wait(_) | Step::Shot(_) | Step::State) {
-            outcome.unsettled = !settle(&mut cx, Duration::from_millis(250));
+            outcome.settled(settle(&mut cx, Duration::from_millis(250)));
         }
         outcomes.push(outcome);
     }
@@ -386,12 +395,9 @@ pub(crate) fn run(launch: Launch) -> ! {
     let last = cx.update(|cx| state(&shell, window, cx));
     let failed = outcomes.iter().any(|o| !o.ok);
     if json {
-        println!(
-            "{}",
-            report_json(&out, launch_settled, began, &outcomes, &last)
-        );
+        println!("{}", report_json(&out, &launched, began, &outcomes, &last));
     } else {
-        report_human(&out, launch_settled, began, &outcomes, &last);
+        report_human(&out, &launched, began, &outcomes, &last);
     }
     // Leave without unwinding the app: dropping a headless context closes
     // its windows through the platform, and there is nothing to save.
@@ -421,11 +427,13 @@ fn input(cx: &mut HeadlessAppContext, window: AnyWindowHandle, event: PlatformIn
 /// each tick, and call it settled once the shell has been idle for both
 /// `quiet` of simulated time and 150 ms of real time. Ten seconds of real time
 /// is the ceiling; past it the step is reported as unsettled, not hidden.
-fn settle(cx: &mut HeadlessAppContext, quiet: Duration) -> bool {
+fn settle(cx: &mut HeadlessAppContext, quiet: Duration) -> Settle {
     const TICK: Duration = Duration::from_millis(25);
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let began = Instant::now();
+    let deadline = began + Duration::from_secs(10);
     let mut idle_sim = Duration::ZERO;
     let mut idle_since: Option<Instant> = None;
+    let mut busy_until = began;
     loop {
         cx.run_until_parked();
         cx.advance_clock(TICK);
@@ -438,18 +446,38 @@ fn settle(cx: &mut HeadlessAppContext, quiet: Duration) -> bool {
         if busy {
             idle_sim = Duration::ZERO;
             idle_since = None;
+            busy_until = Instant::now();
         } else {
             idle_sim += TICK;
             let since = *idle_since.get_or_insert_with(Instant::now);
             if idle_sim >= quiet && since.elapsed() >= Duration::from_millis(150) {
-                return true;
+                return Settle {
+                    done: true,
+                    busy: busy_until - began,
+                };
             }
         }
         if Instant::now() > deadline {
-            return false;
+            return Settle {
+                done: false,
+                busy: busy_until - began,
+            };
         }
         std::thread::sleep(Duration::from_millis(2));
     }
+}
+
+/// What a settle found: whether the window went quiet, and how long it was
+/// busy first. The second is the number a slow refresh shows up in — a
+/// write whose own wave lands reads tens of milliseconds, one that waits
+/// for the repository watcher reads seconds.
+struct Settle {
+    done: bool,
+    busy: Duration,
+}
+
+fn millis(d: Duration) -> f64 {
+    (d.as_secs_f64() * 1e6).round() / 1e3
 }
 
 fn shot(cx: &mut HeadlessAppContext, window: AnyWindowHandle, path: &Path) -> Result<(), String> {
@@ -468,16 +496,21 @@ fn shot(cx: &mut HeadlessAppContext, window: AnyWindowHandle, path: &Path) -> Re
 }
 
 impl DevShell {
-    /// Whether anything the window started is still running — a write, a
-    /// refresh wave, a main-view load — or is owed: a change the repository
-    /// watcher stamped that no wave has read yet. The last one is what a
-    /// person waits out after a write too, so a settle that ignored it would
-    /// photograph a window nobody ever sees.
+    /// Whether anything the window started is still running: a write, a
+    /// refresh wave, a main-view load.
+    ///
+    /// A change the watcher stamped and no wave has read yet is not counted.
+    /// A write's own wave is what puts it on screen, and the stamp its
+    /// index rename leaves behind is heard a few milliseconds after the
+    /// write finishes, which here is after that wave began. It buys a
+    /// second, identical wave once the watcher's two-second floor passes, in
+    /// real time, and waiting for that costs every write step two seconds
+    /// to photograph nothing new. Worse, it hid a write whose own refresh
+    /// was skipped: the settle sat out the watcher's catch-up and the shot
+    /// looked right. If the echo wave starts during a later step, that
+    /// step's settle waits for it like any other wave.
     fn busy(&self) -> bool {
-        self.running.is_some()
-            || self.refresh_pending > 0
-            || self.loading.get()
-            || self.repo_changed.load(std::sync::atomic::Ordering::Relaxed) > self.repo_seen
+        self.running.is_some() || self.refresh_pending > 0 || self.loading.get()
     }
 }
 
@@ -578,18 +611,15 @@ fn state(shell: &Entity<DevShell>, window: AnyWindowHandle, cx: &mut App) -> Str
 
 fn report_json(
     out: &Path,
-    settled: bool,
+    launch: &Settle,
     began: Instant,
     outcomes: &[Outcome],
     last: &str,
 ) -> String {
     let mut o = Obj::default();
     o.str("out", Some(&out.display().to_string()));
-    o.bool("launchSettled", settled);
-    o.num(
-        "wallMs",
-        (began.elapsed().as_secs_f64() * 1e6).round() / 1e3,
-    );
+    o.bool("launchSettled", launch.done);
+    o.num("wallMs", millis(began.elapsed()));
     let steps = outcomes
         .iter()
         .map(|s| {
@@ -601,6 +631,9 @@ fn report_json(
             }
             if s.unsettled {
                 p.bool("unsettled", true);
+            }
+            if let Some(ms) = s.busy_ms {
+                p.num("busyMs", ms);
             }
             p.str("error", s.error.as_deref());
             p.str(
@@ -618,8 +651,8 @@ fn report_json(
     o.finish()
 }
 
-fn report_human(out: &Path, settled: bool, began: Instant, outcomes: &[Outcome], last: &str) {
-    if !settled {
+fn report_human(out: &Path, launch: &Settle, began: Instant, outcomes: &[Outcome], last: &str) {
+    if !launch.done {
         println!("launch: still busy after 10 s — the first steps ran against a loading window");
     }
     for s in outcomes {
@@ -634,6 +667,8 @@ fn report_human(out: &Path, settled: bool, began: Instant, outcomes: &[Outcome],
         }
         if s.unsettled {
             line.push_str("  · still busy after 10 s");
+        } else if let Some(ms) = s.busy_ms.filter(|ms| *ms >= 1.0) {
+            line.push_str(&format!("  · busy {ms:.0} ms"));
         }
         println!("{line}");
         if let Some(state) = &s.state {

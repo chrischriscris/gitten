@@ -2034,18 +2034,16 @@ index 3e7a1b2..9c4d0f1 100644
         let job = Write::stage_patch(&handle, patch.clone()).expect("a non-empty patch");
         assert!(submit.submit(Box::new(job)).is_ok(), "queued");
         let events = wait(&runner, 2);
-        let Event::Finished {
-            generation,
-            outcome: Ok(()),
-            ..
-        } = &events[1]
-        else {
-            panic!("a clean stage: {:?}", events[1]);
-        };
-        assert_eq!(
-            generation.get(),
-            1,
-            "the first finish is the first generation"
+        assert!(
+            matches!(
+                events[1],
+                Event::Finished {
+                    outcome: Ok(()),
+                    ..
+                }
+            ),
+            "a clean stage: {:?}",
+            events[1]
         );
 
         // The index holds exactly the chosen hunk: git's own staged diff —
@@ -2100,18 +2098,16 @@ index 3e7a1b2..9c4d0f1 100644
         let job = Write::unstage_patch(&handle, reverse).expect("a non-empty patch");
         assert!(submit.submit(Box::new(job)).is_ok(), "queued");
         let events = wait(&runner, 2);
-        let Event::Finished {
-            generation,
-            outcome: Ok(()),
-            ..
-        } = &events[1]
-        else {
-            panic!("a clean unstage: {:?}", events[1]);
-        };
-        assert_eq!(
-            generation.get(),
-            2,
-            "the second finish is the second generation"
+        assert!(
+            matches!(
+                events[1],
+                Event::Finished {
+                    outcome: Ok(()),
+                    ..
+                }
+            ),
+            "a clean unstage: {:?}",
+            events[1]
         );
 
         // The index is back where HEAD is; the working tree keeps both
