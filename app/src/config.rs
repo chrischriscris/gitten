@@ -61,7 +61,11 @@
 //! the view *opens* on — `s` and `w` are what change them afterwards.
 //!
 //! All of them are applied to the `Host` regardless, so a relaunch picks them
-//! up, and [`apply`] says so in its warnings rather than leaving you guessing.
+//! up. A client that reloads the file asks [`relaunch`] which of them moved
+//! against the host it is running on, and says so rather than leaving you
+//! guessing. [`apply`] cannot answer that itself: it applies onto fresh
+//! defaults, so every value a file sets differs from what it is compared to,
+//! and the launch's own read would warn about a file nobody touched.
 
 use gitten_core::differ::Whitespace;
 use gitten_core::font::Font;
@@ -246,6 +250,41 @@ pub fn apply(host: &mut Host, text: &str) -> Vec<String> {
     warn
 }
 
+/// What a reload changed that only a relaunch shows: one warning per field the
+/// file moved away from the host the client is running on.
+///
+/// Compared against the running host, never the defaults, because this file
+/// is re-read on every save and a warning that fires for an unchanged value
+/// trains you to ignore all of them. The launch's own read has nothing running
+/// to compare against and says nothing, which is the point.
+pub fn relaunch(running: &Host, next: &Host) -> Vec<String> {
+    let (a, b) = (&running.differ, &next.differ);
+    [
+        ("diff.algorithm", a.selected() != b.selected()),
+        ("diff.context", a.context != b.context),
+        ("diff.whitespace", a.whitespace != b.whitespace),
+        ("diff.moves", a.min_moved != b.min_moved),
+        (
+            "diff.indent_heuristic",
+            a.indent_heuristic != b.indent_heuristic,
+        ),
+        ("diff.wrap", running.wrap.selected() != next.wrap.selected()),
+        ("diff.layout", running.layout != next.layout),
+        (
+            "font.advance",
+            (running.font.advance - next.font.advance).abs() > f32::EPSILON,
+        ),
+        (
+            "font.monospaced",
+            running.font.monospaced != next.font.monospaced,
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, moved)| *moved)
+    .map(|(field, _)| format!("config: {field} applies on the next launch"))
+    .collect()
+}
+
 /// `[view]` — how far a scroll goes, and how much lead the cursor keeps.
 ///
 /// Both apply to the *next* keypress rather than on the next launch: they are
@@ -393,10 +432,7 @@ fn apply_diff(host: &mut Host, value: &toml::Value, warn: &mut Vec<String>) {
     for (key, v) in t {
         match key.as_str() {
             "algorithm" => match v.as_str() {
-                Some(name) if name == host.differ.selected() => {}
-                Some(name) if host.differ.select(name) => {
-                    warn.push("config: diff.algorithm applies on the next launch".into())
-                }
+                Some(name) if host.differ.select(name) => {}
                 Some(name) => warn.push(format!(
                     "config: unknown diff.algorithm {name:?}; registered: {}",
                     host.differ.names().join(", ")
@@ -406,20 +442,11 @@ fn apply_diff(host: &mut Host, value: &toml::Value, warn: &mut Vec<String>) {
             "context" => match v.as_integer() {
                 // Zero is meaningful — just the changed lines — and past a few
                 // dozen a hunk is the whole file, which the diff already shows.
-                Some(n) if (0..=100).contains(&n) => {
-                    if n as usize != host.differ.context {
-                        host.differ.context = n as usize;
-                        warn.push("config: diff.context applies on the next launch".into());
-                    }
-                }
+                Some(n) if (0..=100).contains(&n) => host.differ.context = n as usize,
                 _ => warn.push("config: diff.context must be between 0 and 100".into()),
             },
             "whitespace" => match v.as_str().and_then(Whitespace::from_name) {
-                Some(w) if w == host.differ.whitespace => {}
-                Some(w) => {
-                    host.differ.whitespace = w;
-                    warn.push("config: diff.whitespace applies on the next launch".into());
-                }
+                Some(w) => host.differ.whitespace = w,
                 None => warn.push(format!(
                     "config: diff.whitespace must be one of {}",
                     Whitespace::ALL
@@ -432,33 +459,18 @@ fn apply_diff(host: &mut Host, value: &toml::Value, warn: &mut Vec<String>) {
             // A length, not a switch: the threshold is what keeps two matching
             // `}` lines out of it, and somebody tuning that wants the number.
             "moves" => match v.as_integer() {
-                Some(n) if (0..=1000).contains(&n) => {
-                    if n as usize != host.differ.min_moved {
-                        host.differ.min_moved = n as usize;
-                        warn.push("config: diff.moves applies on the next launch".into());
-                    }
-                }
+                Some(n) if (0..=1000).contains(&n) => host.differ.min_moved = n as usize,
                 _ => warn.push("config: diff.moves must be between 0 (off) and 1000 lines".into()),
             },
             "indent_heuristic" => match v.as_bool() {
-                Some(b) => {
-                    if b != host.differ.indent_heuristic {
-                        host.differ.indent_heuristic = b;
-                        warn.push(
-                            "config: diff.indent_heuristic applies on the next launch".into(),
-                        );
-                    }
-                }
+                Some(b) => host.differ.indent_heuristic = b,
                 None => warn.push("config: diff.indent_heuristic must be true or false".into()),
             },
             // Validated against the host's own registry, like `algorithm` and
             // unlike `layout`: the wraps live in `core`, so this layer can name
             // what is actually registered — including an extension's.
             "wrap" => match v.as_str() {
-                Some(name) if name == host.wrap.selected() => {}
-                Some(name) if host.wrap.select(name) => {
-                    warn.push("config: diff.wrap applies on the next launch".into())
-                }
+                Some(name) if host.wrap.select(name) => {}
                 Some(name) => warn.push(format!(
                     "config: unknown diff.wrap {name:?}; registered: {}",
                     host.wrap.names().join(", ")
@@ -466,11 +478,7 @@ fn apply_diff(host: &mut Host, value: &toml::Value, warn: &mut Vec<String>) {
                 None => warn.push("config: diff.wrap must be a string".into()),
             },
             "layout" => match v.as_str() {
-                Some(name) if name == host.layout => {}
-                Some(name) if !name.trim().is_empty() => {
-                    host.layout = name.to_string();
-                    warn.push("config: diff.layout applies on the next launch".into());
-                }
+                Some(name) if !name.trim().is_empty() => host.layout = name.to_string(),
                 _ => warn.push("config: diff.layout must be a non-empty string".into()),
             },
             other => warn.push(format!("config: unknown key diff.{other}")),
@@ -501,24 +509,11 @@ fn apply_font(
                 _ => warn.push("config: font.size must be between 4 and 96".into()),
             },
             "advance" => match number(v) {
-                Some(n) if (0.1..=2.0).contains(&n) => {
-                    // Only worth saying when it actually moved: this file is
-                    // re-read on every save, and a warning that fires for an
-                    // unchanged value trains you to ignore all of them.
-                    if (n - font.advance).abs() > f32::EPSILON {
-                        font.advance = n;
-                        warn.push("config: font.advance applies on the next launch".into());
-                    }
-                }
+                Some(n) if (0.1..=2.0).contains(&n) => font.advance = n,
                 _ => warn.push("config: font.advance must be between 0.1 and 2.0".into()),
             },
             "monospaced" => match v.as_bool() {
-                Some(b) => {
-                    if b != font.monospaced {
-                        font.monospaced = b;
-                        warn.push("config: font.monospaced applies on the next launch".into());
-                    }
-                }
+                Some(b) => font.monospaced = b,
                 None => warn.push("config: font.monospaced must be true or false".into()),
             },
             // The chrome face is a name only, never measured: sidebar,
@@ -1444,7 +1439,7 @@ mod tests {
             "[diff]\nalgorithm = \"myers\"\ncontext = 7\nlayout = \"split\"\n\
              whitespace = \"all\"\nmoves = 0\nindent_heuristic = false\n",
         );
-        assert!(warn.iter().all(|w| w.contains("next launch")), "{warn:?}");
+        assert!(warn.is_empty(), "{warn:?}");
         assert_eq!(h.differ.selected(), "myers");
         assert_eq!(h.differ.context, 7);
         assert_eq!(h.layout, "split");
@@ -1493,7 +1488,7 @@ mod tests {
         let mut h = host();
         h.differ.register(Semantic);
         let warn = apply(&mut h, "[diff]\nalgorithm = \"semantic\"\n");
-        assert!(warn.iter().all(|w| w.contains("next launch")), "{warn:?}");
+        assert!(warn.is_empty(), "{warn:?}");
         assert_eq!(h.differ.selected(), "semantic");
     }
 
@@ -1513,7 +1508,7 @@ mod tests {
         let mut h = host();
         h.wrap.register(Sentence);
         let warn = apply(&mut h, "[diff]\nwrap = \"sentence\"\n");
-        assert!(warn.iter().all(|w| w.contains("next launch")), "{warn:?}");
+        assert!(warn.is_empty(), "{warn:?}");
         assert_eq!(h.wrap.selected(), "sentence");
 
         // And a typo leaves it alone and says what is available.
@@ -1545,14 +1540,49 @@ mod tests {
         assert!(warn.iter().any(|w| w.contains("trailing")), "{warn:?}");
     }
 
+    /// The launch's own read is silent: a `[diff]` table set to anything
+    /// but the defaults once warned six times on every start, about a file
+    /// nobody had touched.
     #[test]
-    fn the_fields_that_need_a_relaunch_say_so() {
+    fn the_launch_read_says_nothing_about_relaunching() {
         let mut h = host();
-        let warn = apply(&mut h, "[font]\nmonospaced = false\n");
+        let warn = apply(
+            &mut h,
+            "[diff]\nalgorithm = \"myers\"\ncontext = 7\nwhitespace = \"all\"\n\
+             moves = 0\nindent_heuristic = false\nwrap = \"char\"\nlayout = \"split\"\n\
+             [font]\nmonospaced = false\nadvance = 0.5\n",
+        );
+        assert!(warn.is_empty(), "{warn:?}");
         assert!(!h.font.monospaced, "it was still applied");
-        assert!(
-            warn.iter().any(|w| w.contains("next launch")),
-            "no warning about needing a relaunch: {warn:?}"
+    }
+
+    /// A reload names exactly the launch-only fields the file moved against
+    /// the running host: none when the save changed nothing, one per field
+    /// that did.
+    #[test]
+    fn a_reload_names_only_the_relaunch_fields_that_moved() {
+        let file = "[diff]\nalgorithm = \"myers\"\ncontext = 7\nmoves = 0\n\
+                    indent_heuristic = false\nwrap = \"char\"\n";
+        let mut running = host();
+        assert!(apply(&mut running, file).is_empty());
+
+        let mut same = host();
+        apply(&mut same, file);
+        assert!(relaunch(&running, &same).is_empty());
+
+        let mut edited = host();
+        let file = file.replace("context = 7", "context = 9");
+        apply(
+            &mut edited,
+            &format!("{file}whitespace = \"all\"\n[font]\nmonospaced = false\n"),
+        );
+        assert_eq!(
+            relaunch(&running, &edited),
+            [
+                "config: diff.context applies on the next launch",
+                "config: diff.whitespace applies on the next launch",
+                "config: font.monospaced applies on the next launch",
+            ]
         );
     }
 
@@ -1661,8 +1691,8 @@ mod tests {
         let mut restored = Host::new();
         let warn = apply(&mut restored, &text);
         assert!(
-            warn.iter().all(|w| w.contains("next launch")),
-            "dump produced a file with real warnings: {warn:?}\n{text}"
+            warn.is_empty(),
+            "dump produced a file with warnings: {warn:?}\n{text}"
         );
         assert_eq!(
             restored.theme, original.theme,
@@ -1862,7 +1892,7 @@ mod tests {
         assert!(save_setting(&path, "diff", "algorithm", "\"myers\"").is_none());
         let mut h = host();
         let warn = load(&mut h, &path);
-        assert!(warn.iter().any(|w| w.contains("next launch")), "{warn:?}");
+        assert!(warn.is_empty(), "{warn:?}");
         assert_eq!(h.differ.context, 8);
         assert_eq!(h.differ.selected(), "myers");
         // Writing the value it already holds is a no-op, not a rewrite.

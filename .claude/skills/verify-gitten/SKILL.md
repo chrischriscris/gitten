@@ -74,8 +74,6 @@ R=$(mktemp -d) && (cd "$R" && git init -q && echo a > a.txt && git add . \
   didn't land and the repository watcher caught up instead, which is a bug. If
   a step reports `"unsettled": true`, the window really was still busy after
   10 s.
-- **Startup prints `config: diff.* applies on the next launch`** for a config
-  with a `[diff]` table. That's a known app quirk, not your change.
 - **Timings from a verify run are meaningless.** The clock is simulated. Use
   `./dev --release dump` or `fixtures/bench.sh`.
 

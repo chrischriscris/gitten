@@ -2463,6 +2463,7 @@ impl App {
     fn reload(&mut self, path: &std::path::Path) {
         let mut next = Host::new();
         let mut warnings = gitten_app::config::load(&mut next, path);
+        warnings.extend(gitten_app::config::relaunch(&self.host, &next));
         // A theme cycled with a key outlives a save of the file, the way the
         // view's own wrap and layout indices do: the file says what this opened
         // on, and the key says what is on screen now. It loses only when the
