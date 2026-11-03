@@ -44,7 +44,18 @@ shot NAME           the frame as NAME.png
 state               the shell as JSON: destination, keyboard, focused pane, every
                     pane's label, the notice and error band, running job, open
                     overlays, the write generation, viewport size and scale
+sh COMMAND          a shell command in the repository's directory: a change the
+                    window did not make. Takes the rest of its line, `;`s too:
+                    sh echo b >> a.txt; git add a.txt
 ```
+
+**`sh` is the outside world.** A save in an editor, a commit in a terminal, an
+edit to `gitten.toml`: everything the window has to notice rather than do.
+Its settle waits for the repository watcher's wave too (the two-second floor
+included, so expect `busyMs` near 2000), and its JSON carries the command's
+`exit` and `output`. A nonzero exit fails the step. Point it at a scratch
+repository, and set `GITTEN_CONFIG` to a scratch file before editing a config
+with it; the default is the user's own.
 
 **Coordinates are logical pixels.** A shot is at the window's scale factor
 (`scale` in `state`, 2 on a Retina display), so a point measured on a 2560×1600

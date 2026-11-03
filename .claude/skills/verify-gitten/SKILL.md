@@ -44,6 +44,8 @@ is what you are testing.
 | Stage the selected file / all | `cmd files.stage` / `cmd files.stage-all` |
 | A given palette | `GITTEN_QA_THEME=github-dark ./dev verify …` |
 | A given window size | `GITTEN_QA_GEOM=900x700 ./dev verify …` |
+| An outside change | `sh echo b >> a.txt` (runs in the repository; waits for the watcher's wave) |
+| A config edit while running | `GITTEN_CONFIG=/tmp/c.toml ./dev verify -s "sh sed -i '' 's/5/9/' /tmp/c.toml" …` |
 
 Every command name, and which file in `gui/` answers it, is in
 `docs/features.md`. A `—` in its gui column means the window probably can't do
