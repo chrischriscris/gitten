@@ -80,6 +80,10 @@ enum Step {
     Shot(String),
     /// The shell's state, as data.
     State,
+    /// A shell command, run in the repository's directory: a change the
+    /// window did not make, the way a terminal or an editor beside it makes
+    /// one. Takes the rest of its line, `;`s included.
+    Sh(String),
 }
 
 impl Step {
@@ -93,13 +97,42 @@ impl Step {
             Step::Wait(ms) => format!("wait {ms}"),
             Step::Shot(n) => format!("shot {n}"),
             Step::State => "state".into(),
+            Step::Sh(c) => format!("sh {c}"),
         }
     }
 }
 
+/// A script's steps, one per line or `;`-separated — except that `sh` takes
+/// the rest of its line, because a shell command has `;`s of its own, and a
+/// comment takes the rest of its line too.
+fn lines(script: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    for line in script.lines() {
+        let mut rest = line;
+        loop {
+            let head = rest.trim_start();
+            if head.starts_with("sh ") || head.starts_with("sh\t") || head.starts_with('#') {
+                out.push(head);
+                break;
+            }
+            match rest.split_once(';') {
+                Some((step, tail)) => {
+                    out.push(step);
+                    rest = tail;
+                }
+                None => {
+                    out.push(rest);
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
 fn parse(script: &str) -> Result<Vec<Step>, String> {
     let mut steps = Vec::new();
-    for raw in script.split(['\n', ';']) {
+    for raw in lines(script) {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
@@ -149,10 +182,11 @@ fn parse(script: &str) -> Result<Vec<Step>, String> {
                 Step::Shot(name)
             }
             "state" => Step::State,
+            "sh" => Step::Sh(need("a command, e.g. `sh echo c >> a.txt`")?),
             _ => {
                 return Err(format!(
                     "`{line}`: `{verb}` is not a step — one of cmd, key, type, click, \
-                     scroll, wait, shot, state"
+                     scroll, wait, shot, state, sh"
                 ))
             }
         });
@@ -178,6 +212,10 @@ struct Outcome {
     /// — the settle's wait, less the quiet it then holds out for. `None`
     /// for a step that does not settle.
     busy_ms: Option<f64>,
+    /// `sh` only: the command's exit status and what it printed, both
+    /// streams, the tail of it when it said a lot.
+    exit: Option<i32>,
+    output: Option<String>,
 }
 
 impl Outcome {
@@ -191,6 +229,8 @@ impl Outcome {
             state: None,
             unsettled: false,
             busy_ms: None,
+            exit: None,
+            output: None,
         }
     }
     fn settled(&mut self, settle: Settle) {
@@ -385,8 +425,18 @@ pub(crate) fn run(launch: Launch) -> ! {
             Step::State => {
                 outcome.state = Some(cx.update(|cx| state(&shell, window, cx)));
             }
+            Step::Sh(command) => {
+                let dir = cx.update(|cx| shell.read(cx).repo.as_ref().map(|(p, _)| p.clone()));
+                outcome = sh(command, dir.as_deref(), outcome);
+                // An outside change reaches the window through its watchers,
+                // so this settle waits for what they owe as well.
+                outcome.settled(settle_outside(&mut cx));
+            }
         }
-        if !matches!(step, Step::Wait(_) | Step::Shot(_) | Step::State) {
+        if !matches!(
+            step,
+            Step::Wait(_) | Step::Shot(_) | Step::State | Step::Sh(_)
+        ) {
             outcome.settled(settle(&mut cx, Duration::from_millis(250)));
         }
         outcomes.push(outcome);
@@ -402,6 +452,44 @@ pub(crate) fn run(launch: Launch) -> ! {
     // Leave without unwinding the app: dropping a headless context closes
     // its windows through the platform, and there is nothing to save.
     std::process::exit(if failed { 1 } else { 0 })
+}
+
+/// Runs `command` under `sh -c`, in the repository when there is one. A
+/// command that exits nonzero fails the step: it was there to change
+/// something, and the window cannot be judged against a change that did not
+/// happen.
+fn sh(command: &str, dir: Option<&Path>, mut outcome: Outcome) -> Outcome {
+    const KEEP: usize = 4000;
+    let mut run = std::process::Command::new("sh");
+    run.arg("-c")
+        .arg(command)
+        .stdin(std::process::Stdio::null());
+    if let Some(dir) = dir {
+        run.current_dir(dir);
+    }
+    let done = match run.output() {
+        Ok(done) => done,
+        Err(e) => return outcome.fail(format!("cannot run sh: {e}")),
+    };
+    let mut text = String::from_utf8_lossy(&done.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&done.stderr));
+    let text = text.trim_end();
+    let cut = text.len().saturating_sub(KEEP);
+    let cut = (cut..=text.len())
+        .find(|&i| text.is_char_boundary(i))
+        .unwrap_or(text.len());
+    outcome.exit = done.status.code();
+    outcome.output = (!text.is_empty()).then(|| text[cut..].to_string());
+    match done.status.success() {
+        true => outcome,
+        false => {
+            let code = done
+                .status
+                .code()
+                .map_or("a signal".to_string(), |c| c.to_string());
+            outcome.fail(format!("sh exited with {code}"))
+        }
+    }
 }
 
 fn keystroke(cx: &mut HeadlessAppContext, window: AnyWindowHandle, k: Keystroke) -> bool {
@@ -428,6 +516,29 @@ fn input(cx: &mut HeadlessAppContext, window: AnyWindowHandle, event: PlatformIn
 /// `quiet` of simulated time and 150 ms of real time. Ten seconds of real time
 /// is the ceiling; past it the step is reported as unsettled, not hidden.
 fn settle(cx: &mut HeadlessAppContext, quiet: Duration) -> Settle {
+    settle_for(cx, quiet, Duration::from_millis(150), false)
+}
+
+/// The settle after an outside change. Two differences, both because the
+/// change arrives through a watcher rather than through the window: the real
+/// quiet is long enough for notify to deliver the event at all, and a stamp
+/// no wave has read yet counts as busy — the window owes it a wave, and a
+/// person waits that out too, the watcher's two-second floor included.
+fn settle_outside(cx: &mut HeadlessAppContext) -> Settle {
+    settle_for(
+        cx,
+        Duration::from_millis(250),
+        Duration::from_millis(500),
+        true,
+    )
+}
+
+fn settle_for(
+    cx: &mut HeadlessAppContext,
+    quiet: Duration,
+    quiet_real: Duration,
+    owed: bool,
+) -> Settle {
     const TICK: Duration = Duration::from_millis(25);
     let began = Instant::now();
     let deadline = began + Duration::from_secs(10);
@@ -441,7 +552,10 @@ fn settle(cx: &mut HeadlessAppContext, quiet: Duration) -> Settle {
         let busy = cx.update(|cx| {
             cx.try_global::<Adopted>()
                 .and_then(|a| a.0.upgrade())
-                .is_some_and(|shell| shell.read(cx).busy())
+                .is_some_and(|shell| {
+                    let shell = shell.read(cx);
+                    shell.busy() || (owed && shell.owed())
+                })
         });
         if busy {
             idle_sim = Duration::ZERO;
@@ -450,7 +564,7 @@ fn settle(cx: &mut HeadlessAppContext, quiet: Duration) -> Settle {
         } else {
             idle_sim += TICK;
             let since = *idle_since.get_or_insert_with(Instant::now);
-            if idle_sim >= quiet && since.elapsed() >= Duration::from_millis(150) {
+            if idle_sim >= quiet && since.elapsed() >= quiet_real {
                 return Settle {
                     done: true,
                     busy: busy_until - began,
@@ -511,6 +625,13 @@ impl DevShell {
     /// step's settle waits for it like any other wave.
     fn busy(&self) -> bool {
         self.running.is_some() || self.refresh_pending > 0 || self.loading.get()
+    }
+
+    /// Whether the repository watcher stamped a change no wave has read.
+    /// Waited for only after `sh`, whose change arrives that way and no
+    /// other.
+    fn owed(&self) -> bool {
+        self.repo_changed.load(std::sync::atomic::Ordering::Relaxed) > self.repo_seen
     }
 }
 
@@ -635,6 +756,10 @@ fn report_json(
             if let Some(ms) = s.busy_ms {
                 p.num("busyMs", ms);
             }
+            if let Some(code) = s.exit {
+                p.num("exit", code as f64);
+            }
+            p.str("output", s.output.as_deref());
             p.str("error", s.error.as_deref());
             p.str(
                 "shot",
@@ -671,6 +796,11 @@ fn report_human(out: &Path, launch: &Settle, began: Instant, outcomes: &[Outcome
             line.push_str(&format!("  · busy {ms:.0} ms"));
         }
         println!("{line}");
+        if let Some(output) = &s.output {
+            for l in output.lines() {
+                println!("  | {l}");
+            }
+        }
         if let Some(state) = &s.state {
             println!("  {state}");
         }
@@ -743,7 +873,7 @@ fn quote(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse, quote, Step};
+    use super::{parse, quote, sh, Outcome, Step};
 
     #[test]
     fn a_script_reads_as_lines_or_semicolons_and_skips_comments() {
@@ -767,6 +897,38 @@ mod tests {
         assert!(parse("wait soon").unwrap_err().contains("milliseconds"));
         assert!(parse("shot ../escape").unwrap_err().contains("file stem"));
         assert!(parse("cmd").unwrap_err().contains("needs"));
+    }
+
+    #[test]
+    fn sh_and_comments_take_the_rest_of_their_line() {
+        let steps = parse("cmd files.focus; sh echo a > f; git add f\n# a; b\nstate").unwrap();
+        assert_eq!(
+            steps,
+            vec![
+                Step::Cmd("files.focus".into()),
+                Step::Sh("echo a > f; git add f".into()),
+                Step::State,
+            ]
+        );
+        assert!(parse("sh").unwrap_err().contains("needs"));
+    }
+
+    #[test]
+    fn sh_runs_where_it_is_pointed_and_fails_on_a_nonzero_exit() {
+        let dir = std::env::temp_dir();
+        let step = Step::Sh("pwd; echo oops >&2".into());
+        let ran = sh("pwd; echo oops >&2", Some(&dir), Outcome::new(&step));
+        assert!(ran.ok);
+        assert_eq!(ran.exit, Some(0));
+        let printed = ran.output.unwrap_or_default();
+        let want = dir.canonicalize().unwrap_or(dir);
+        assert!(printed.contains(want.to_str().unwrap_or("")), "{printed}");
+        assert!(printed.ends_with("oops"), "{printed}");
+
+        let failed = sh("exit 3", None, Outcome::new(&step));
+        assert!(!failed.ok);
+        assert_eq!(failed.exit, Some(3));
+        assert_eq!(failed.error.as_deref(), Some("sh exited with 3"));
     }
 
     #[test]
