@@ -208,7 +208,10 @@ pub(crate) fn render_inspector(deps: &InspectorDeps, cx: &mut App) -> AnyElement
                 ))
                 .child(div().my(px(5.0)).text_size(px(10.0)).text_color(dim).child(
                     if deps.can_commit {
-                        SharedString::from(format!("{} hunks staged", deps.staged_hunks))
+                        SharedString::from(match deps.staged_hunks {
+                            1 => "1 hunk staged".to_string(),
+                            n => format!("{n} hunks staged"),
+                        })
                     } else {
                         deps.commit_note.clone()
                     },
