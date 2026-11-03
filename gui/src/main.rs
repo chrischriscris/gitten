@@ -8,6 +8,7 @@ mod modal;
 mod palette;
 mod panes;
 mod qa;
+mod runnable;
 mod session;
 mod settings;
 mod settings_window;
@@ -505,6 +506,15 @@ trait Pane {
 
     fn select(&self, _all: bool, _cx: &mut App) -> bool {
         false
+    }
+
+    /// The command names [`run`](Self::run) answers. The window's
+    /// availability is strict, so a name not declared here is refused
+    /// before the pane is asked — and one declared is listed in the palette
+    /// beside the built-ins, which is what makes an extension's verb as
+    /// reachable as a shipped one.
+    fn commands(&self) -> &[&'static str] {
+        &[]
     }
 }
 
@@ -1004,6 +1014,15 @@ impl Screen {
         }
     }
 
+    /// What an extension tenant declared it answers; a built-in's names are
+    /// the shell's own and listed in `runnable.rs`.
+    fn commands(&self) -> &[&'static str] {
+        match self {
+            Screen::Custom(pane) => pane.commands(),
+            _ => &[],
+        }
+    }
+
     fn custom(pane: impl Pane + 'static) -> Self {
         Self::Custom(Rc::new(pane))
     }
@@ -1123,6 +1142,13 @@ impl std::ops::Deref for GitError {
     }
 }
 
+/// [`DevShell::availability`]'s answer and the two inputs it was built from.
+struct AvailabilityCache {
+    repo: bool,
+    declared: Vec<&'static str>,
+    built: Rc<gitten_core::command::Availability>,
+}
+
 struct DevShell {
     /// The app half of the title, drawn bright: which program this is. Which
     /// *view* it is showing is the focused region's to say, because a commit
@@ -1160,6 +1186,10 @@ struct DevShell {
     /// where a reader looks for them. `None` until the first selection (or
     /// forever, over a fixture).
     head: RefCell<Option<Commit>>,
+    /// The window's word on which names run, built on first ask and kept
+    /// until whether a repository stands behind the window, or what the
+    /// extension panes declare, changes. See [`DevShell::availability`].
+    availability: RefCell<Option<AvailabilityCache>>,
     /// The newest main-view request. Each schedule bumps it; a timer or a
     /// finished load applies only if it still equals the value it left with,
     /// which is how a fast cursor run collapses to exactly one load — the
@@ -1799,6 +1829,28 @@ impl DevShell {
     /// repository and its queue, or `None` over a fixture. The shell's own
     /// verbs go through the same value — there is no second path for a
     /// built-in.
+    /// The window's [`Availability`](gitten_core::command::Availability):
+    /// what the palette lists and the dispatch lets through. Cached, because
+    /// the palette reads it every frame it stands; rebuilt when a repository
+    /// appears or goes, or an extension pane's declared names change.
+    fn availability(&self) -> Rc<gitten_core::command::Availability> {
+        let repo = self.repo.is_some();
+        let declared = || self.panes.iter().flat_map(|p| p.commands().iter().copied());
+        if let Some(cache) = self.availability.borrow().as_ref() {
+            if cache.repo == repo && cache.declared.iter().copied().eq(declared()) {
+                return cache.built.clone();
+            }
+        }
+        let declared: Vec<&'static str> = declared().collect();
+        let built = Rc::new(runnable::window(repo, declared.iter().copied()));
+        *self.availability.borrow_mut() = Some(AvailabilityCache {
+            repo,
+            declared,
+            built: built.clone(),
+        });
+        built
+    }
+
     fn writes(&self) -> Option<Writes> {
         let (_, repo) = self.repo.as_ref()?;
         Some(Writes {
@@ -4304,6 +4356,14 @@ impl DevShell {
     /// only the screen's own verbs read the target — which is the same rule
     /// the terminal's `dispatch_to` runs under.
     fn run_command_from(&mut self, command: &str, over: Option<&Screen>, cx: &mut Context<Self>) {
+        // The palette's word, read again: a name it would not list, or would
+        // list with a reason, is refused here with that same sentence before
+        // any arm or pane is asked.
+        if let Some(refusal) = runnable::refusal(command, self.availability().state(command)) {
+            self.set_notice(refusal);
+            cx.notify();
+            return;
+        }
         match command {
             "message.show" => {
                 // Only meaningful while an error stands: the overlay is the
@@ -4500,11 +4560,10 @@ impl DevShell {
                     None => false,
                 };
                 if !known {
-                    // Resolvable, registered — and not implemented by anything
-                    // this client ships. Said, not swallowed: an extension's
-                    // command reaches this exact point without one line changing
-                    // here, and the honest answer to it is a sentence.
-                    self.set_notice(format!("{command} is not supported here"));
+                    // Runnable by the availability — an extension pane's
+                    // declared name — but the pane asked is not the one that
+                    // answers it. Said, not swallowed.
+                    self.set_notice(runnable::unsupported(command));
                 }
             }
         }
@@ -8912,6 +8971,7 @@ fn open_main_window(launch: Launch, cx: &mut App) {
                     false => Spot::Main,
                 },
                 head: RefCell::new(None),
+                availability: RefCell::new(None),
                 request: Cell::new(0),
                 loading: Cell::new(false),
                 stats,
@@ -9701,6 +9761,10 @@ mod tests {
             ))
         }
 
+        fn commands(&self) -> &[&'static str] {
+            &["extension.toggle", "extension.stage"]
+        }
+
         fn run(&self, command: &str, _: &Host, writes: Option<&Writes>, _: &mut gpui::App) -> bool {
             match (command, writes) {
                 ("extension.toggle", _) => {
@@ -9801,6 +9865,7 @@ mod tests {
                 has_column: true,
                 spot: super::Spot::List,
                 head: RefCell::new(None),
+                availability: RefCell::new(None),
                 request: Cell::new(0),
                 loading: Cell::new(false),
                 stats: None,
@@ -13892,26 +13957,26 @@ diff --git a/fresh.txt b/fresh.txt
 
     #[gpui::test]
     fn the_file_verbs_say_so_where_they_cannot_act(cx: &mut TestAppContext) {
-        // No repository at all (a fixture), commits pane focused.
+        // No repository at all (a fixture), commits pane focused: the
+        // availability turns both away with the fixture's own reason before
+        // any pane is asked, the same sentence the palette's row says.
         let shell = shell(None, cx);
         shell.update(cx, |shell, cx| shell.run_command("files.stage", cx));
         shell.read_with(cx, |shell, _| {
-            assert!(shell
-                .notice
-                .as_deref()
-                .unwrap_or_default()
-                .contains("not supported here"));
+            assert_eq!(
+                shell.notice.as_deref(),
+                Some("a fixture has no working tree to stage in")
+            );
         });
         shell.update(cx, |shell, cx| {
             shell.notice = None;
             shell.run_command("files.commit", cx);
         });
         shell.read_with(cx, |shell, _| {
-            assert!(shell
-                .notice
-                .as_deref()
-                .unwrap_or_default()
-                .contains("not supported here"));
+            assert_eq!(
+                shell.notice.as_deref(),
+                Some("a fixture has no repository to commit in")
+            );
         });
 
         // A files pane over a fixture: the pane is right, the repository is
@@ -13968,6 +14033,106 @@ diff --git a/fresh.txt b/fresh.txt
             );
         });
         assert!(repo.wrote().is_empty());
+    }
+
+    /// Slice 0 of plan 005: the palette lists what the window runs. A name
+    /// nothing here answers has no row; a write over a fixture keeps its row
+    /// and says why where its doc was; and the dispatch refuses both with the
+    /// same sentence the palette would have shown.
+    #[gpui::test]
+    fn the_palette_lists_only_what_the_window_runs(cx: &mut TestAppContext) {
+        let shell = shell(None, cx);
+        shell.update(cx, |shell, cx| {
+            shell.run_command("commands.palette", cx);
+            let rows = shell.palette_rows(cx);
+            let row = |name: &str| rows.iter().find(|r| r.name == name);
+            assert!(
+                row("remotes.fetch").is_none(),
+                "an unanswered name is listed"
+            );
+            assert!(row("patch.menu").is_none(), "an unanswered name is listed");
+            let push = row("repo.push").expect("a fixture still lists push");
+            assert!(push.disabled);
+            assert_eq!(push.doc, "a fixture has no repository to sync");
+            let palette = row("commands.palette").expect("the palette lists itself");
+            assert!(!palette.disabled);
+            // Most of the registry is the terminal's, and none of it shows.
+            let host = config::host(cx);
+            let unanswered = host
+                .commands
+                .all()
+                .iter()
+                .filter(|c| !rows.iter().any(|r| r.name == c.name))
+                .count();
+            assert!(unanswered > 50, "only {unanswered} rows were left out");
+        });
+        shell.update(cx, |shell, cx| shell.run_command("remotes.fetch", cx));
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(
+                shell.notice.as_deref(),
+                Some("remotes.fetch is not supported here")
+            );
+        });
+        shell.update(cx, |shell, cx| shell.run_command("repo.push", cx));
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(
+                shell.notice.as_deref(),
+                Some("a fixture has no repository to sync")
+            );
+        });
+    }
+
+    /// A row run from the palette keeps what the command said and where it
+    /// put the keyboard. Both used to be undone by the palette's own refocus
+    /// on the files pane: over a launch with no files pane it said "no files
+    /// pane" over the refusal, and `workspace.history` was walked straight
+    /// back to Changes.
+    #[gpui::test]
+    fn a_palette_run_keeps_the_commands_answer(cx: &mut TestAppContext) {
+        let shell = shell(None, cx);
+        shell.update(cx, |shell, cx| {
+            shell.open_palette(cx);
+            shell.palette_query = "repo.push".into();
+            shell.run_palette_selection(cx);
+        });
+        shell.read_with(cx, |shell, _| {
+            assert!(!shell.palette_open);
+            assert_eq!(
+                shell.notice.as_deref(),
+                Some("a fixture has no repository to sync")
+            );
+        });
+
+        let (shell, _repo, _handle) = files_shell(cx);
+        shell.update(cx, |shell, cx| {
+            shell.open_palette(cx);
+            shell.palette_query = "workspace.history".into();
+            shell.run_palette_selection(cx);
+        });
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(
+                shell.workspace.destination,
+                crate::views::workspace::Destination::History
+            );
+        });
+    }
+
+    /// With a repository behind the window the same rows run: nothing the
+    /// fixture disabled is still disabled, and an unanswered name is still
+    /// absent.
+    #[gpui::test]
+    fn a_repository_enables_what_a_fixture_turned_away(cx: &mut TestAppContext) {
+        let (shell, _repo, _handle) = files_shell(cx);
+        shell.update(cx, |shell, cx| {
+            shell.run_command("commands.palette", cx);
+            let rows = shell.palette_rows(cx);
+            assert!(
+                rows.iter().all(|r| !r.disabled),
+                "a repo-backed row is disabled"
+            );
+            assert!(rows.iter().any(|r| r.name == "repo.push"));
+            assert!(rows.iter().all(|r| r.name != "remotes.fetch"));
+        });
     }
 
     #[gpui::test]

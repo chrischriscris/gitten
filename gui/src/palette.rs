@@ -4,13 +4,19 @@
 //! per name with its doc line — so a command an extension registers appears
 //! here with no line changing anywhere else. Typing narrows by substring
 //! over name and doc; arrows move, Enter or a click runs through the one
-//! named dispatch, Esc leaves and hands focus back to the files pane. A
-//! name nothing here implements answers "not supported here" through the
-//! dispatch's own fallback — said, not swallowed. The help overlay used to
-//! stand here; a native window lists commands instead of describing keys.
+//! named dispatch, Esc leaves and hands focus back to the files pane.
+//!
+//! Only what the window runs is listed: the rows pass through the shell's
+//! strict [`Availability`](gitten_core::command::Availability), so a name
+//! nothing here answers has no row, and one this launch turns away (a
+//! fixture has no repository to write to) keeps its row and says why where
+//! the doc line was. The dispatch reads the same map, so choosing a
+//! disabled row says that same sentence in the band. The help overlay used
+//! to stand here; a native window lists commands instead of describing
+//! keys.
 
 use crate::{config, input, modal};
-use gitten_core::command::Command;
+use gitten_core::command::{Availability, Command, Usable};
 use gpui::*;
 
 /// Rows drawn before the list stops: enough to read, few enough to stay a
@@ -29,7 +35,11 @@ pub(crate) const VISIBLE_ROWS: usize = 14;
 /// its own in its chrome, where this one names `cmd-k` and `cmd-enter`.
 pub(crate) struct Row {
     pub name: String,
+    /// The doc line, or for a disabled row the reason it will not run.
     pub doc: String,
+    /// Listed but turned away by this launch; drawn quieter, and choosing it
+    /// says [`doc`](Self::doc) in the band.
+    pub disabled: bool,
     /// Empty for a command nothing is bound to — a name reached only from
     /// here, which is not a gap to paper over with a guess.
     pub keys: String,
@@ -46,16 +56,27 @@ pub(crate) fn key_column(keys: &[String]) -> String {
         .unwrap_or_default()
 }
 
-/// Registry order kept — the order `[keys]` and the terminal already agree
-/// on.
-pub(crate) fn filtered<'a>(commands: &'a [Command], query: &str) -> Vec<&'a Command> {
+/// The rows the window can show: registry order kept — the order `[keys]`
+/// and the terminal already agree on — with every name `availability` calls
+/// unsupported left out, and a disabled one's reason standing where its doc
+/// line was. The query matches what the row says, so a disabled row is
+/// found by its reason as well as by its name.
+pub(crate) fn filtered<'a>(
+    commands: &'a [Command],
+    availability: &'a Availability,
+    query: &str,
+) -> Vec<(&'a Command, Option<&'a str>)> {
     let q = query.trim().to_lowercase();
     commands
         .iter()
-        .filter(|c| {
-            // Runnable check needs the registry; the caller filters those.
-            // Here: the query only.
-            q.is_empty() || c.name.to_lowercase().contains(&q) || c.doc.to_lowercase().contains(&q)
+        .filter_map(|c| match availability.state(&c.name) {
+            Usable::Available => Some((c, None)),
+            Usable::Disabled(reason) => Some((c, Some(reason.as_str()))),
+            Usable::Unsupported => None,
+        })
+        .filter(|(c, reason)| {
+            let doc = reason.unwrap_or(&c.doc);
+            q.is_empty() || c.name.to_lowercase().contains(&q) || doc.to_lowercase().contains(&q)
         })
         .collect()
 }
@@ -92,22 +113,29 @@ impl crate::DevShell {
     }
 
     /// Close the palette and hand the keyboard back to the files pane —
-    /// the same restoration every dialog in this window keeps.
+    /// the same restoration every dialog in this window keeps — or, where
+    /// the launch has no files pane (a patch, a fixture), to the window
+    /// itself, without a "no files pane" sentence nobody asked for.
     pub(crate) fn close_palette(&mut self, cx: &mut Context<Self>) {
         self.palette_open = false;
         self.palette_sel = 0;
-        self.focus_named("files", cx);
+        match self.panes.position("files") {
+            Some(_) => self.focus_named("files", cx),
+            None => self.reclaim_focus(),
+        }
         cx.notify();
     }
 
     /// The registry rows under the current query, in registry order.
     pub(crate) fn palette_rows(&self, cx: &App) -> Vec<Row> {
         let host = config::host(cx);
-        filtered(host.commands.all(), &self.palette_query)
+        let availability = self.availability();
+        filtered(host.commands.all(), &availability, &self.palette_query)
             .into_iter()
-            .map(|c| Row {
+            .map(|(c, reason)| Row {
                 name: c.name.clone(),
-                doc: c.doc.clone(),
+                doc: reason.unwrap_or(&c.doc).to_string(),
+                disabled: reason.is_some(),
                 keys: key_column(&host.keys.keys_for(&c.name)),
             })
             .collect()
@@ -125,8 +153,15 @@ impl crate::DevShell {
         }
     }
 
-    /// Run the selected row through the one named dispatch, then leave the
-    /// way Esc would have — a run is one decision and not two.
+    /// Run the selected row through the one named dispatch and leave — a run
+    /// is one decision and not two.
+    ///
+    /// The keyboard goes where the command put it, not back to the files
+    /// pane: `workspace.history` from here used to land on History and be
+    /// walked straight back to Changes by that refocus, and over a launch
+    /// with no files pane the refocus's own "no files pane" overwrote the
+    /// sentence the command had just said. Only the filter's focus record is
+    /// cleared, so the window and not a vanished field holds the keys.
     pub(crate) fn run_palette_selection(&mut self, cx: &mut Context<Self>) {
         let rows = self.palette_rows(cx);
         let Some(name) = rows.get(self.palette_sel).map(|row| row.name.clone()) else {
@@ -134,8 +169,8 @@ impl crate::DevShell {
         };
         self.palette_open = false;
         self.palette_sel = 0;
+        self.reclaim_focus();
         self.run_command(&name, cx);
-        self.focus_named("files", cx);
     }
 
     pub(crate) fn render_palette(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -176,6 +211,11 @@ impl crate::DevShell {
                         let me = me.clone();
                         let (name, doc, keys) =
                             (row.name.clone(), row.doc.clone(), row.keys.clone());
+                        // A disabled row reads as furniture: the name in the
+                        // doc's ink, the reason in the quiet one, so the
+                        // runnable rows around it keep the accent to
+                        // themselves.
+                        let disabled = row.disabled;
                         div()
                             .id(SharedString::from(format!("palette-row-{i}")))
                             .flex()
@@ -192,9 +232,10 @@ impl crate::DevShell {
                             .child(
                                 div()
                                     .flex_none()
-                                    .text_color(rgb(match i == sel {
-                                        true => c.fg,
-                                        false => c.accent,
+                                    .text_color(rgb(match (i == sel, disabled) {
+                                        (true, _) => c.fg,
+                                        (false, true) => c.dim,
+                                        (false, false) => c.accent,
                                     }))
                                     .child(SharedString::from(name)),
                             )
@@ -203,7 +244,10 @@ impl crate::DevShell {
                                     .flex_1()
                                     .min_w_0()
                                     .truncate()
-                                    .text_color(rgb(c.dim))
+                                    .text_color(rgb(match disabled {
+                                        true => host.theme.quiet_on(c.bg),
+                                        false => c.dim,
+                                    }))
                                     .child(SharedString::from(doc)),
                             )
                             // The key, at the row's end, in the same ink as
@@ -233,7 +277,7 @@ impl crate::DevShell {
 #[cfg(test)]
 mod tests {
     use super::{filtered, key_column};
-    use gitten_core::command::{Command, Keymap};
+    use gitten_core::command::{Availability, Command, Keymap};
 
     fn command(name: &str, doc: &str) -> Command {
         Command {
@@ -250,9 +294,10 @@ mod tests {
             command("repo.push", "send the current branch"),
             command("files.stage", "stage the file"),
         ];
-        let out = filtered(&all, "");
+        let a = Availability::lenient();
+        let out = filtered(&all, &a, "");
         assert_eq!(out.len(), 2);
-        assert_eq!(out[0].name, "repo.push");
+        assert_eq!(out[0].0.name, "repo.push");
     }
 
     #[test]
@@ -261,10 +306,33 @@ mod tests {
             command("repo.push", "send the current branch"),
             command("files.stage", "stage the file"),
         ];
-        assert_eq!(filtered(&all, "PUSH").len(), 1);
-        assert_eq!(filtered(&all, "stage").len(), 1);
-        assert_eq!(filtered(&all, "branch").len(), 1);
-        assert!(filtered(&all, "zzz").is_empty());
+        let a = Availability::lenient();
+        assert_eq!(filtered(&all, &a, "PUSH").len(), 1);
+        assert_eq!(filtered(&all, &a, "stage").len(), 1);
+        assert_eq!(filtered(&all, &a, "branch").len(), 1);
+        assert!(filtered(&all, &a, "zzz").is_empty());
+    }
+
+    /// Strict: a name the window does not answer has no row at all, and a
+    /// disabled one keeps its row with the reason where the doc was — which
+    /// is also what the query reads.
+    #[test]
+    fn only_what_runs_is_listed_and_a_disabled_row_says_why() {
+        let all = vec![
+            command("repo.push", "send the current branch"),
+            command("files.stage", "stage the file"),
+            command("remotes.fetch", "fetch the remote"),
+        ];
+        let mut a = Availability::strict();
+        a.available(["files.stage"]);
+        a.disabled("repo.push", "a fixture has no repository to sync");
+        let out = filtered(&all, &a, "");
+        let names: Vec<_> = out.iter().map(|(c, _)| c.name.as_str()).collect();
+        assert_eq!(names, ["repo.push", "files.stage"]);
+        assert_eq!(out[0].1, Some("a fixture has no repository to sync"));
+        assert_eq!(out[1].1, None);
+        assert_eq!(filtered(&all, &a, "fixture").len(), 1);
+        assert!(filtered(&all, &a, "send the current").is_empty());
     }
 
     /// The column is the live map's answer and not a table beside it: a
