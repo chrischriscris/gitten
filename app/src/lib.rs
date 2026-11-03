@@ -418,10 +418,10 @@ mod tests {
 
     fn start(line: &str) -> Result<Started, Exit> {
         // Hermetic on purpose: `config::path` honours `GITTEN_CONFIG`, and a
-        // developer's real file must not decide what a startup test asserts —
-        // a `[diff]` table in it prints "applies on the next launch" warnings
-        // these tests have never been about. Every call pins the same
-        // non-path, so the file is simply absent and the defaults stand.
+        // developer's real file must not decide what a startup test asserts,
+        // and a typo in it prints warnings these tests have never been about.
+        // Every call pins the same non-path, so the file is simply absent and
+        // the defaults stand.
         std::env::set_var("GITTEN_CONFIG", "/nonexistent/gitten-test.toml");
         Startup::new("gitten-test", View::Commits)
             .args(line.split_whitespace().map(String::from).collect())

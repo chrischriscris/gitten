@@ -65,10 +65,28 @@ with `state` or `shot`.
 
 **Settling waits for the work a person would wait for.** After each step the run
 ticks simulated time and waits until no write is running, no refresh wave is in
-flight, no main-view load is pending and no repository change is owed a wave.
-It also waits until that has held for 150 ms of real time, because writes run on
-the job worker's own thread and the watcher on notify's. A step that is still
-busy after 10 s is marked `"unsettled": true` rather than hidden.
+flight and no main-view load is pending. It also waits until that has held for
+150 ms of real time, because writes run on the job worker's own thread and the
+watcher on notify's. A step that is still busy after 10 s is marked
+`"unsettled": true` rather than hidden.
+
+**Every settling step reports `busyMs`:** how long, in real milliseconds, the
+window stayed busy before it went quiet. It counts what runs off GPUI's
+executor, the job worker's thread and the watcher; a refresh's reads the test
+dispatcher finishes inside the settle's first tick read as 0. A write whose own
+refresh lands reads tens of milliseconds; a number near 2000 means something
+waited on the repository watcher, whose rate floor is two seconds of *real*
+time. That is
+also why `wait MS` cannot stand in for it: `wait` moves the simulated clock,
+and 3000 simulated milliseconds pass in a fraction of a real second.
+
+A change the watcher has stamped but not yet turned into a wave is not waited
+for. A write leaves one behind: its index rename is heard a few milliseconds
+after it finishes, and a run pumps the finish faster than that, so the stamp
+lands after the write's own wave began and buys a second, identical one about
+two seconds later. If that wave starts during a later step, the step's settle waits
+for it, so `generation` in `state` can read one higher than the writes alone
+explain.
 
 The config is the user's `gitten.toml`, so shots match what they see. Set
 `GITTEN_CONFIG` to a file of your own when a run has to be independent of it. The

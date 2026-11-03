@@ -67,10 +67,17 @@ pub(crate) fn render_inspector(deps: &InspectorDeps, cx: &mut App) -> AnyElement
                     (0, 0) => SharedString::from("staged"),
                     (staged, total) => SharedString::from(format!("{staged}/{total} hunks")),
                 };
+                // The badge and the count belong to the name, so the row
+                // hangs off its first line rather than centring on the
+                // pair: a directory under the name would pull them halfway
+                // down to it. A file at the root has no directory, and an
+                // empty line drawn for it would do the same.
+                let place = (!f.dir.is_empty())
+                    .then(|| div().truncate().text_color(dim).child(f.dir.clone()));
                 div()
                     .id(("ws-staged", i))
                     .flex()
-                    .items_center()
+                    .items_start()
                     .gap(chrome::gap_s(&host.font))
                     .child(
                         div()
@@ -79,9 +86,11 @@ pub(crate) fn render_inspector(deps: &InspectorDeps, cx: &mut App) -> AnyElement
                             .child("+"),
                     )
                     .child(
+                        // Takes the slack, so the counts stand in one
+                        // right-aligned column under the header's.
                         div()
+                            .flex_1()
                             .min_w_0()
-                            .flex_shrink(1.0)
                             .flex()
                             .flex_col()
                             .child(
@@ -90,7 +99,7 @@ pub(crate) fn render_inspector(deps: &InspectorDeps, cx: &mut App) -> AnyElement
                                     .text_color(rgb(host.theme.chrome.fg))
                                     .child(f.name.clone()),
                             )
-                            .child(div().truncate().text_color(dim).child(f.dir.clone())),
+                            .children(place),
                     )
                     .child(div().flex_none().text_color(dim).child(hunks))
                     .into_any_element()

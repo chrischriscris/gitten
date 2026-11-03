@@ -69,12 +69,11 @@ R=$(mktemp -d) && (cd "$R" && git init -q && echo a > a.txt && git add . \
 - **Pane labels don't show staging.** "2 changed" reads the same before and
   after a stage. Use a shot, or `generation` in `state`, which moves when a wave
   lands.
-- **The first write of a session lands late.** A write's own refresh is
-  currently skipped there, and the window catches up through the repository
-  watcher about 2 s later. The settle waits for it. If a step reports
-  `"unsettled": true`, the window really was still busy after 10 s.
-- **Startup prints `config: diff.* applies on the next launch`** for a config
-  with a `[diff]` table. That's a known app quirk, not your change.
+- **A write step should read `busyMs` in the tens.** Every settling step reports
+  how long the window stayed busy. Near 2000 means the write's own refresh
+  didn't land and the repository watcher caught up instead, which is a bug. If
+  a step reports `"unsettled": true`, the window really was still busy after
+  10 s.
 - **Timings from a verify run are meaningless.** The clock is simulated. Use
   `./dev --release dump` or `fixtures/bench.sh`.
 

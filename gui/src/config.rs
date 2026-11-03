@@ -61,6 +61,11 @@ impl Global for Chosen {}
 pub fn reload(path: &Path, cx: &mut App) -> Vec<String> {
     let mut next = desktop_defaults();
     let mut warnings = load(&mut next, path);
+    // Against the host on screen, so a save that moved nothing says nothing.
+    // There is none before the launch installs one.
+    if let Some(running) = cx.try_global::<Active>() {
+        warnings.extend(gitten_app::config::relaunch(&running.0, &next));
+    }
     let chosen = cx.try_global::<Chosen>().and_then(|c| c.0.clone());
     if let Some(name) = chosen {
         if !next.select_theme(&name) {
@@ -146,5 +151,34 @@ mod tests {
     fn the_desktop_opens_one_pixel_larger_without_changing_shared_defaults() {
         assert_eq!(desktop_defaults().font.size, 15.0);
         assert_eq!(Host::new().font.size, 14.0);
+    }
+
+    /// A save that moved nothing says nothing, and one that moved a
+    /// launch-only field says so once — compared against the host on screen,
+    /// not the defaults the file is applied onto.
+    #[gpui::test]
+    fn a_reload_warns_only_for_what_the_save_moved(cx: &mut gpui::TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("gitten-reload-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let path = dir.join("gitten.toml");
+        let file = "[diff]\nalgorithm = \"myers\"\ncontext = 7\nwrap = \"char\"\n";
+        std::fs::write(&path, file).expect("the file writes");
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            // What the launch does: the file onto defaults, without a word.
+            let mut launched = desktop_defaults();
+            assert!(load(&mut launched, &path).is_empty());
+            cx.set_global(Active(Rc::new(launched)));
+
+            assert!(reload(&path, cx).is_empty(), "an untouched file warned");
+            std::fs::write(&path, file.replace("context = 7", "context = 9"))
+                .expect("the file writes");
+            assert_eq!(
+                reload(&path, cx),
+                ["config: diff.context applies on the next launch"]
+            );
+            assert!(reload(&path, cx).is_empty(), "the same edit warned twice");
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
