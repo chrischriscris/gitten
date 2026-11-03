@@ -714,7 +714,7 @@ impl Branches {
     }
     /// Spelled for tests only (see [`Screen::label`]): the workspace reads
     /// only the files pane's note.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "verify"))]
     pub fn filter_note(&self) -> Option<String> {
         let shown = self
             .visible

@@ -6,7 +6,11 @@
 #   ./dev gui       commits
 #   ./dev web       diff --fixtures
 #   ./dev dump      commits ~/Projects/git 600     one frame, no takeover
+#   ./dev verify -s 'key j' -s 'shot j' -- diff .  the window, headless: steps,
+#                                                  PNGs and state, no focus taken
 #   ./dev check                                    everything headless
+#   ./dev lint                                     the AGENTS.md rules a grep holds
+#   ./dev features                                 regenerate docs/features.md
 #   ./dev config                                   a starting gitten.toml
 #   ./dev bundle                                   target/gitten.app, icon and all
 #   ./dev export                                   build prod and install to PATH
@@ -50,6 +54,10 @@ while true; do
   esac
 done
 
+# What the caller set, before the default below: `verify` wants the readout
+# off unless somebody asked for it, because it is drawn into every capture.
+CALLER_STATS="${GITTEN_STATS-}"
+
 # On unless it was deliberately turned off — both clients treat "0" as off, so
 # `GITTEN_STATS=0 ./dev tui` works and anything else the caller set is kept.
 export GITTEN_STATS="${GITTEN_STATS:-1}"
@@ -63,7 +71,8 @@ dim() { printf '\033[2m%s\033[0m\n' "$1" >&2; }
 red() { printf '\033[31m%s\033[0m\n' "$1" >&2; }
 
 usage() {
-  sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'
+  # The comment block at the top of this file, however long it grows.
+  awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
   exit "${1:-0}"
 }
 
@@ -253,6 +262,61 @@ PLIST
 
   check)
     exec ./check.sh
+    ;;
+
+  lint)
+    exec tools/lint.sh
+    ;;
+
+  features)
+    # Every command, its keys and where each client answers it — generated,
+    # because a hand-kept map is wrong by the second feature. check.sh fails
+    # when the checked-in copy differs from this.
+    cargo run -q -p gitten-core --example features > docs/features.md \
+      && echo "docs/features.md: $(grep -c '^| `' docs/features.md) commands"
+    ;;
+
+  verify)
+    # The window, driven and photographed with nothing on screen — see
+    # gui/src/verify.rs and docs/agent-verify.md. Its own target directory,
+    # because the feature compiles GPUI's test platform in: sharing
+    # target/debug would swap the binary under a running `./dev gui` and
+    # fight it for cargo's lock on every save.
+    STEPS="" OUT="target/verify-shots"
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -s|--step) STEPS="$STEPS$2"$'\n'; shift 2 ;;
+        -f|--file) STEPS="$STEPS$(cat "$2")"$'\n'; shift 2 ;;
+        -o|--out)  OUT="$2"; shift 2 ;;
+        --json)    export GITTEN_FORMAT=json; shift ;;
+        -h|--help) sed -n '/^## Steps/,/^## Not/p' docs/agent-verify.md | sed '$d'; exit 0 ;;
+        --)        shift; break ;;
+        *)         break ;;
+      esac
+    done
+    if [ -z "$STEPS" ]; then
+      red "verify: no steps — e.g. ./dev verify -s 'shot launch' -s state -- diff ."
+      exit 2
+    fi
+    [ $# -eq 0 ] && set -- commits .
+    log=$(mktemp)
+    if ! CARGO_TARGET_DIR=target/verify cargo build "${FLAGS[@]}" -p gitten-gui \
+         --features verify >"$log" 2>&1; then
+      grep -vE '^\s*(Compiling|Finished|Blocking|Downloaded|Updating)' "$log"
+      rm -f "$log"
+      red "── build failed ──────────────────────────"
+      exit 1
+    fi
+    rm -f "$log"
+    # Scratch session and recents: a run restores nothing a person left and
+    # records nothing a person will see in the project menu.
+    scratch=$(mktemp -d)
+    trap 'rm -rf "$scratch"' EXIT
+    mkdir -p "$OUT"
+    GITTEN_STATS="${CALLER_STATS:-0}" \
+    GITTEN_SESSION="$scratch/session" GITTEN_PROJECTS="$scratch/projects" \
+    GITTEN_VERIFY_OUT="$OUT" GITTEN_VERIFY_STEPS="$STEPS" \
+      "target/verify/$PROFILE/gitten-gui" "$@"
     ;;
 
   config)

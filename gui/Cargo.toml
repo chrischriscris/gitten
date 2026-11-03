@@ -14,5 +14,15 @@ gpui-component-assets = { git = "https://github.com/longbridge/gpui-component" }
 anyhow = "1.0"
 unicode-segmentation = "1.12"
 
+[features]
+# The window driven and photographed headless, for agents: GPUI's test
+# platform and its offscreen renderer, which are test-support only. Built by
+# `./dev verify` into its own target directory, never into a window a person
+# runs — see src/verify.rs.
+verify = ["gpui/test-support", "gpui_platform/test-support"]
+
 [dev-dependencies]
 gpui = { git = "https://github.com/zed-industries/zed", features = ["test-support"] }
+# So `verify` compiles — and its tests run — in every `cargo test`, not only
+# in the builds that ask for it: a door nobody builds is a door that rots.
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit", "test-support"] }

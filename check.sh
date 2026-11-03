@@ -41,6 +41,19 @@ trap '[ -f "$STASH/log.txt" ] && /bin/cp -f "$STASH/log.txt" fixtures/log.txt
 [ -f fixtures/log.txt ]  && /bin/cp -f fixtures/log.txt  "$STASH/"
 [ -f fixtures/big.diff ] && /bin/cp -f fixtures/big.diff "$STASH/"
 
+echo "── lint ────────────────────────────────────────────────"
+# The AGENTS.md rules a grep can hold — see tools/lint.sh. First, because it is
+# the cheapest thing here and a failure names the line and the fix.
+if ! tools/lint.sh; then
+  FAILED="$FAILED lint"
+fi
+# The feature map is generated; a stale one sends an agent to the wrong file.
+if ! cargo run -q -p gitten-core --example features | diff -q - docs/features.md >/dev/null; then
+  echo "docs/features.md is stale → ./dev features"
+  FAILED="$FAILED features"
+fi
+
+echo
 echo "── correctness ─────────────────────────────────────────"
 report core cargo test -q -p gitten-core
 # The shared startup: the config file, the command line, acquisition. Every
@@ -147,6 +160,33 @@ for layout in unified split; do
   frame "$layout" env COLS=120 ROWS=40 "LAYOUT=$layout" \
     cargo run -q -p gitten-tui --example dump --release -- diff --fixtures
 done
+
+echo
+echo "── window frames (headless) ────────────────────────────"
+# The desktop window, launched, driven and photographed through `./dev
+# verify` — GPUI's test platform with its offscreen renderer, so nothing
+# appears and nothing takes focus. A panic on the road to a first frame, or a
+# renderer that stopped producing one, fails here rather than in a person's
+# hands. Its own target directory: the first run builds GPUI once more.
+# GITTEN_VERIFY_CHECK=0 skips it.
+if [ "${GITTEN_VERIFY_CHECK:-1}" = "0" ]; then
+  echo "  skipped (GITTEN_VERIFY_CHECK=0)"
+else
+  shots=$(mktemp -d)
+  for launch in "diff --fixtures" "commits ."; do
+    # shellcheck disable=SC2086
+    if out=$(./dev verify --json -o "$shots" -s 'shot frame' -s state -- $launch 2>/dev/null) \
+       && printf '%s' "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert all(s["ok"] for s in d["steps"])' \
+       && [ -s "$shots/frame.png" ]; then
+      printf '  %-16s ok\n' "$launch"
+    else
+      FAILED="$FAILED verify:$launch"
+      printf '  ✗ %s: no frame — run ./dev verify -s "shot x" -- %s\n' "$launch" "$launch"
+    fi
+    rm -f "$shots/frame.png"
+  done
+  rm -rf "$shots"
+fi
 
 echo
 echo "── perf gate (advisory) ────────────────────────────────"

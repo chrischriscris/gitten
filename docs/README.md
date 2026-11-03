@@ -12,6 +12,9 @@ which numbers those decisions rest on, and the diagrams.
 | [architecture.md](architecture.md) | crates, the boundary, what flows where |
 | [clients.md](clients.md) | writing one: what is shared, what is yours, keys and commands |
 | [diff-pipeline.md](diff-pipeline.md) | raw diff → rows on screen, stage by stage |
+| [diff-rules.md](diff-rules.md) | differs, layouts and wrapping: what is wrong in the plausible direction |
+| [gpui-notes.md](gpui-notes.md) | what GPUI does that you would not guess — read before touching `gui/` |
+| [features.md](features.md) | every command, its keys, and where each client answers it (generated) |
 | [syntax-highlighting.md](syntax-highlighting.md) | the scanner, the tables, the routing |
 | [theming.md](theming.md) | colour as data, surfaces, contrast resolution |
 | [commit-graph.md](commit-graph.md) | lane assignment, hues, the cap, the drawing |
@@ -21,6 +24,24 @@ which numbers those decisions rest on, and the diagrams.
 | [extending.md](extending.md) | every seam, with a worked example each |
 | [roadmap.md](roadmap.md) | build order from viewer to product, one block at a time |
 | [competition.md](competition.md) | what else is out there, what to steal and when |
+
+## Agents
+
+The doors an agent works through, each with the command it runs. Start with
+the first: an agent that cannot see the window cannot check its own work on it.
+
+| | |
+|---|---|
+| [agent-verify.md](agent-verify.md) | the window, driven and photographed headless — no focus taken |
+| [agent-inspect.md](agent-inspect.md) | `gitten inspect` / `dispatch`: rows, meta and keys as data |
+| [agent-json.md](agent-json.md) | the `--json` contract every headless tool shares |
+| [agent-mcp.md](agent-mcp.md) | the same tools over MCP |
+| [agent-web.md](agent-web.md) | the loopback HTTP API |
+| [agent-perf.md](agent-perf.md) | the perf gate: is it slower, without fooling yourself |
+
+`tools/lint.sh` (`./dev lint`) holds the `AGENTS.md` rules a grep can check,
+and both the pre-commit hook and `./check.sh` run it. `./dev features`
+regenerates [features.md](features.md), and `./check.sh` fails when it is stale.
 
 ## Decisions
 

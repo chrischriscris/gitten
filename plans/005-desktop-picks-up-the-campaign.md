@@ -1,233 +1,210 @@
 # 005 — The window picks up what the campaign landed
 
-A lane for the **desktop app**, running beside the terminal packets of
-[001](001-tui-lazygit-parity-swarm.md) and touching none of their files. One
-worker, four slices. Read 001 §"Architectural requirements" and
-§"Swarm execution contract", `AGENTS.md`, and `docs/clients.md` before starting.
+A lane for the **desktop app**: one worker, five slices, `gui/` only. Rewritten
+2026-11-02 against `main` after #84; the 2026-09-07 version assumed `shell/`,
+a W6 base and a worker that could not see the window, and all three are gone.
+
+Read before starting: `AGENTS.md` (and its "Read before you touch it" table),
+`docs/clients.md`, `docs/gpui-notes.md`, `docs/agent-verify.md`.
 
 ## Why this exists
 
-AGENTS.md: **the desktop app is the product**, the other doors exist to keep the
-shared layers honest, and a shared seam is never worth a worse window.
-`docs/clients.md` says the same from the other side: the implementation belongs
-only where it was asked for.
+AGENTS.md: **the desktop app is the product**, and a feature asked for without
+a client named means the window. The terminal campaign (001, W0–W9, #73) put
+availability, diff sources, search, partial staging, sync, the operation
+lifecycle, conflict answers, history editing, stash, tags, reflog and
+worktrees into `core`, `gitten-git` and `gitten-app`, where every client can
+reach them. The consequence is that **the window has less of gitten in it than
+the terminal does**, and the gap is mostly not features that need building. It
+is features that are built, tested, shared, and unreachable from the product.
 
-A week of campaign asked for the terminal. That was right, and it worked — W0 to W7
-put availability, diff sources, search, partial staging, sync, the operation
-lifecycle, conflict answers and history editing into `core`, `gitten-git` and
-`gitten-app`, where every client can reach them. The consequence is that **the window
-now has less of gitten in it than the terminal does**, and the gap is not features
-that need building: it is features that are built, tested, shared, and unreachable
-from the product.
+`docs/features.md` is the inventory, generated from the registry: today 124 of
+218 commands are not named anywhere in `gui/`. That is the list this lane
+works down. It is not "port the TUI": the window is mouse-first with a
+palette and `cmd-` chords (desktop-v2, `plans/desktop-v2/PLAN.md`), so a row
+lands when a person can reach it the way the window is used, not when a
+letter key is bound.
 
-So this lane is not "port the TUI". It is: walk the chain tip's command registry,
-find every name the window cannot answer, and answer the ones that need no new
-design. And because the window may only reach through the seams, it is also the
-campaign's cheapest audit of whether those seams are real — **every place you would
-have to add something to `core`, `app` or `gitten-git` to finish a row is a finding,
-not a patch you write.**
+And because the window may only reach through the shared seams, the lane is
+also the cheapest audit of whether those seams are real. **Every place you
+would have to change `core`, `app` or `git` to finish a row is a finding, not
+a patch you write.**
 
-## Base, worktree, ownership
+## Base, ownership
 
-```sh
-# from /Users/chus/Projects/gitten, once:
-git worktree add .worktrees/desktop-pickup -b feat/desktop-pickup 529ec80
-```
+- Branch `feat/desktop-pickup` in its own worktree, from `main` once #84 and
+  the verify-findings fix (the first-write refresh bug in `drain_jobs`) have
+  merged. Before that, stack it on `fix/verify-findings`; every write in
+  slices 2–4 depends on that refresh firing.
+- **You own `gui/` and nothing else.** If a row needs a change outside it,
+  write the contract into your report (the exact signature, and why the
+  window cannot get there) and move on to the next row.
+- New panes and views go in `gui/src/views/*.rs`. `gui/src/main.rs` is 690 KB:
+  add only registrations and dispatch arms to it, and **do not refactor it**.
+  A lane that spends its budget moving code lands nothing.
+- Commit locally, one commit per slice, and push only when asked. After each
+  slice, run `./dev features` and commit the regenerated map with it, so the
+  gap visibly closes.
 
-`529ec80` is the W6 tip: the shared seams you need are in it. W7 (stash, tags,
-reflog) is in flight and lands later; nothing you write may assume it.
+## Slice 0 — the palette stops offering what the window cannot do
 
-- **Your only working directory** is `.worktrees/desktop-pickup`. Never write to
-  `/Users/chus/Projects/gitten`, `/Users/chus/Projects/gitten-ux-polish`, or another
-  `.worktrees/*`. Never push, never write to a remote, never open a PR. Commit
-  locally, one commit per working increment.
-- **You own `shell/` and nothing else.** Not `core/`, not `app/`, not `git/`, not
-  `tui/`, not `web/`, not `cli/`. If a row cannot be finished without a change
-  outside `shell/`, write the contract proposal into your report — the exact
-  signature you need and why the window cannot get there — and move on to the next
-  row. That rule is the point of the lane, not an inconvenience in it.
-- New panes and views go in `shell/src/views/*.rs` beside the existing
-  `files.rs` / `branches.rs` / `commits.rs` / `diff.rs` / `stashes.rs` / `split.rs`.
-  `shell/src/main.rs` is 528 KB and the largest file in the tree: add to it only the
-  registration and the dispatch arm. **Do not refactor it** — 001 explicitly forbids
-  a wholesale dispatcher refactor as a prerequisite, and a lane that spends its
-  budget moving code lands nothing.
+The palette lists the whole registry, so 124 of its rows answer "not
+supported here" when chosen. The terminal already solved this: it builds a
+strict `core::command::Availability` (`tui/src/main.rs`, `fn tui_availability`)
+and both its help and its dispatch read it. Do the same in the window:
 
-## Slice 1 — the inventory, then the operation lifecycle
+- a strict `Availability` naming every command the window dispatches, with
+  `Disabled(reason)` where the launch turns one away (a fixture view with no
+  repository);
+- the palette lists `Available` and `Disabled` rows only, and a disabled row
+  says its reason where the doc line was;
+- the dispatch's fallback refuses through it instead of through ad-hoc
+  `"… is not supported here"` notices;
+- a test that every name the window's dispatch matches is `Available`, so
+  the list and the `match` cannot drift.
 
-**The inventory is mechanical and comes first**, because it is the map for the rest
-and it is the artifact the coordinator wants even if the lane stops early. The
-command registry is data: `Commands::builtin()` at your base lists every name, and
-the window's dispatch answers a subset. Produce a table — name, whether the window
-dispatches it, whether it is refused, and which slice would land it — as
-`docs/desktop-gaps.md`, and keep it accurate as you work. Generate it from the
-registry rather than by reading `main.rs` with your eyes; a name you miss is a row
-nobody knows is missing.
+This comes first because every later slice then has a visible effect, which
+is a command appearing in the palette.
 
-Then land the first family: **the standing operation**. W5 put it in `app`
-(`operation.abort` / `operation.continue` / `operation.skip`, and the lifecycle that
-knows a rebase, a cherry-pick, a revert or a merge is in progress). The window ships
-`rebase.abort` / `rebase.continue` names and no lifecycle behind them.
+## Slice 1 — the standing operation
 
-- The chrome says what is standing, with the words the shared layer supplies — a
-  half-finished rebase is the single most important thing a git client can tell you,
-  and the window currently does not.
-- The three verbs dispatch, refuse honestly when nothing is standing (W0's contract:
-  a command that is available but reaches no handler says so; one the client does not
-  support says *that* instead), and refresh on finish either way.
-- A repository switch drops the standing operation — the shared layer already does
-  this and W4 has the test; the window must not cache its own copy that outlives it.
+W5 put the lifecycle in `app`: it knows a rebase, cherry-pick, revert or merge
+is in progress, and `operation.abort` / `operation.continue` /
+`operation.skip` act on it. The window ships `rebase.abort` and
+`rebase.continue` and no lifecycle behind them.
+
+- The chrome says what is standing, in the words the shared layer supplies. A
+  half-finished rebase is the most important thing a git client can tell you,
+  and the window currently does not say it.
+- The three verbs dispatch, refuse honestly when nothing is standing, and
+  refresh on finish either way. Abort and continue get buttons beside the
+  statement. Skip goes in the palette only.
+- A repository switch drops the standing operation. The shared layer does this
+  already; the window must not cache a copy that outlives it.
 
 ## Slice 2 — conflicts, at the level the window can honestly draw
 
-W5 landed whole-file and region conflict answers: `files.resolve-ours`,
-`files.resolve-theirs`, `files.resolve-both`, `files.resolve-keep`, plus the
-merge-side commands. The window already models `Section::Conflicts` in its files view
-and already knows that staging a conflicted file records a resolution. What it lacks
-is the answer commands, the reset menus (`files.reset-menu`,
-`files.reset-upstream-*`), and `files.nuke`.
+The files view already models `Section::Conflicts`. Add the answers:
+`files.resolve-ours` / `-theirs` / `-both` / `-keep` on a conflicted row,
+plus the merge-side `merge.take-*`, `merge.undo` and
+`merge.next-conflict` / `prev-conflict`. Also the reset menu
+(`files.reset-menu`, `files.reset-upstream-*`) and `files.nuke`.
 
-Two things stay out, deliberately:
+Out, deliberately:
 
-- **The inline three-way merge editor is not in this lane.** `docs/roadmap.md` #19
-  calls it lazygit's actual differentiator and says it deserves a supervised design
-  session rather than an overnight. Believe it. Whole-file and region answers are
-  reachable through the shared seam and are what this slice ships.
-- **The rebase-todo screen's window presentation** is design work too (the terminal's
-  is a screen; the window's is not a port). Land the verbs W6 exposed that need no
-  new surface — reword, mark-base, move up/down, squash/fixup/drop from the commits
-  pane — and park the plan editor with a note.
+- **The inline three-way merge editor.** `docs/roadmap.md` #19 calls it the
+  differentiator, and it needs a supervised design session.
+- **A window presentation of the rebase-todo plan** (`todo.*`,
+  `commits.interactive-rebase`). The terminal's is a screen; the window's is
+  not a port. Park it with a note.
 
-**The confirmation idiom is a decision to record, not to make twice.** The terminal
-asks twice with a repeated key (`D D`, `d d`) because a modal in a terminal costs a
-screen. The window has modal plumbing (`shell/src/modal.rs`, and
-`settings_window.rs` landed a real window). Recommendation to put to the
-coordinator: keep the twice-pressed key as the *keyboard* path so muscle memory
-transfers, and use the modal only where the terminal shows a menu — but write the
-case, and do not redesign the destructive-verb idiom on your own authority.
+**Destructive confirmation is a decision to record, not to make.** The
+terminal asks twice with a repeated key. The window has `modal.rs` and a
+question band with clickable answers (`Notice::Question`). Recommend one
+idiom for the window in the report, use it, and don't invent a third.
 
-## Slice 3 — the ref panes
+## Slice 3 — the ref sections
 
-- **A remotes pane.** `Repo::remotes` and the `remotes.*` command family exist and W4
-  proved them in the terminal; the window's sidebar is a registry
-  (`shell/src/panes.rs`: register a name and a value, `canonical_rank` orders it), so
-  a tenant is a registration and a view file, not a layout change. Rows read names
-  and URLs; `remotes.new` / `remotes.edit` / `remotes.remove` / `remotes.fetch`
-  behind them, with removal asked twice and never retargeting after the selection
-  moves (W4's test names the hazard: `a_remote_removal_asks_twice_and_never_retargets`).
-- **Branch verb breadth**: `branches.fast-forward`, `branches.force-checkout`,
-  `branches.merge`, `branches.merge-squash`, `branches.set-upstream`,
-  `branches.unset-upstream`, `branches.checkout-name`, `branches.checkout-previous`,
-  `branches.open-log`. All shared, all tested in the terminal, none reachable in the
-  window.
-- **Commits verb breadth**: `commits.checkout`, `commits.revert`, `commits.copy` /
-  `commits.paste` / `commits.clear-copies` (the cherry-pick register),
-  `commits.reset-*`, `commits.reword`, `commits.mark-base`, `commits.move-up` /
-  `move-down`, `commits.reset-author`.
-- Every one of these is a write, so every one goes through the existing queue and the
-  generation refresh the window already has. A verb that draws its own optimistic
-  state is a bug: the generation bump is what makes three panes agree.
+The sidebar is tabbed sections (decision 0031) over a pane registry
+(`gui/src/panes.rs`), so a new tenant is a registration and a view file.
 
-## Slice 4 — navigation and input parity
+- **Remotes**: names and URLs, plus `remotes.fetch` / `new` / `edit` /
+  `remove`. Removal asks once more and never retargets after the selection
+  moves; the terminal's
+  `tui_parity_a_remote_removal_asks_twice_and_never_retargets` names the
+  hazard.
+- **Tags**: `tags.checkout` / `new` / `delete` / `push`.
+- **Worktrees**: `worktrees.switch` / `new` / `remove`. Removal follows
+  `docs/worktrees.md`'s checklist.
+- **Reflog** is the stretch row: `reflog.recover` and the focus. Park it if
+  it does not fit.
 
-The small things that make the window feel a generation behind the terminal, all of
-them shared already: `search.next` / `search.prev` / `search.clear` (the window has
-`/` and no `n`), `select.mark` and the range it enables, `input.newline` (a multi-line
-commit message), `files.toggle-side`, `files.open-diff`, `diff.next-hunk` /
-`diff.prev-hunk`, `diff.toggle-line-selection`, `diff.search`, and the per-pane
-previews W1 landed (a branch, a stash or a remote row driving the main view instead
-of the commits pane always driving it).
+Every one of these is a write, so every one goes through the existing job
+queue and the generation refresh. A verb that draws its own optimistic state
+is a bug: the refresh is what makes three panes agree.
 
-Prefer the shared model in every case: `core::search` holds the matcher, `core::select`
-holds selection, W1's source model holds which pair the main view shows. The window
-writing its own is how the row flattening and the branch colours came to be written
-twice before they were written once.
+## Slice 4 — verb breadth on existing panes
 
-## GPUI rules that will bite
+All shared, all tested in the terminal, none reachable in the window:
 
-All of these are in AGENTS.md; they are repeated because each one has already cost a
-day in this repository.
+- **branches**: `merge`, `merge-squash`, `fast-forward`, `force-checkout`,
+  `checkout-name`, `checkout-previous`, `set-upstream`, `unset-upstream`,
+  `delete-remote`, `open-log`.
+- **commits**: `reword`, `move-up` / `move-down`, `mark-base`,
+  `reset-author`, the cherry-pick register (`copy` / `paste` /
+  `clear-copies`), and the fixup trio (`create-fixup`, `find-fixup-base`,
+  `apply-fixups`).
+- **stashes**: `rename`, `new-branch`, `open-diff`; **files**: the
+  `stash-*` variants, `toggle-side`, `open-diff`.
 
-- **Interactivity requires identity**: `.id()` before scroll, click, hover, drag —
-  and an element's identity is its *path*, so two unnamed wrappers around two
-  `.id("list")` children are the same element and drive each other's state.
-- **`uniform_list` for anything long**, never wrapped in another scroll container;
-  `min_w_full` on every row so a background runs to the edge; `flex_1` + `min_w(0)`
-  for a row that draws columns.
-- **Anything that floats needs `deferred`** plus `.occlude()`, or it paints under its
-  sibling and the rows underneath take its clicks. Every menu in slices 2 and 3 is
-  this case.
-- **Read the host on the render path** (`config::host(cx)`), never a captured clone,
-  or your new pane silently stops hot-reloading its font and colours.
-- `gpui_component`'s theme must be pushed at ours (`config::sync_widgets`) or a new
-  scrollbar paints a light track over a near-black diff.
-- A column of numbers is right-aligned; a view cannot know its own size during
-  `render`; custom drawing is `canvas()` + `PathBuilder` + `paint_path`, kept per row
-  so it virtualizes with the list.
-- Never run a bare `cargo update`, never bump GPUI, never touch
-  `rust-toolchain.toml`. The four GPUI git dependencies are pinned by `Cargo.lock`
-  and nothing else.
+Reach them through the row's context menu, where the row already has one,
+and the palette, rather than new chrome.
+
+## Out of this lane, and why
+
+- **The patch builder** (`patch.*`, 16 commands). It needs a selection model
+  in the diff view the window does not have yet, and that is design.
+- **Navigation keys** (`search.next`/`prev`/`clear`, `select.mark`,
+  `diff.next-hunk`/`prev-hunk`, `diff.toggle-line-selection`, `tab.*`,
+  `input.newline`). In a mouse-first window most of these are a `cmd-`
+  chord, a shift-click or a field behaviour. Which one is a keyboard-model
+  decision for the owner, not a dispatch arm. List them in the report with a
+  recommendation for each.
+- **Bisect** (`commits.bisect-*`): its own surface. **Undo/redo**
+  (`history.*`): needs the reflog section first.
+- Any change outside `gui/`. New visual language: this lane closes a
+  capability gap in the existing design.
 
 ## Verification
 
-The desktop has real headless tests: `check.sh` runs `cargo test -q -p gitten-shell`
-with GPUI's test context and no window appears. Two patterns to copy, both already in
-the tree:
+Two halves, and both are required for a row to count.
 
-- `#[gpui::test]` with `TestAppContext` — `shell/src/input.rs`.
-- Plain `#[test]` over the pure geometry/metric functions — `shell/src/help.rs`,
-  which also documents the trap: **import by name, never `use gpui::*` in a test
-  module**, or GPUI's attribute macro shadows `#[test]` and nothing expands.
+**Behaviour**: every dispatch arm you add gets a `#[gpui::test]` that runs the
+command against a fake `Repo` and asserts the write or the refusal wording.
+The existing fakes in `gui/src/main.rs`'s tests are the pattern, including the
+one whose `AtomicBool` makes the next revert conflict.
 
-Every dispatch arm you add gets a test that presses the key against a fake `Repo` and
-asserts the resulting write or the refusal wording — the shell's existing fakes
-(including the one whose `AtomicBool` makes the next revert conflict) are the pattern.
+**Sight**: `./dev verify`, headless, never `./dev gui`. For each slice, take a
+shot of each new surface in the state it is about. Use a scratch repository
+for anything that writes. A conflict, a half-finished rebase and a remote are
+all a few lines of `git` in a `mktemp -d`; put those scripts in the report so
+the shots can be retaken. **Read every PNG yourself** before calling a row
+done. A step that passed only means the window answered, not that the result
+looks right. The `verify-gitten` skill has the loop.
 
 ```sh
+./dev lint
 cargo fmt --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo test --locked -p gitten-shell
-cargo test --locked --workspace
+cargo test --locked -p gitten-gui
+./check.sh                      # once, at the end
 ```
-
-**You cannot see the window, and you may not open it.** AGENTS.md: never launch a
-client unless asked; a window appearing unannounced interrupts whoever is at the
-keyboard. So the visual half of this lane is a handover, not a screenshot: finish
-with the exact command the user runs (`./dev desktop`, plus the pane and key
-sequence) and a short checklist of what to look at per slice. Do not substitute a
-`./dev dump` frame for it — that is the terminal's renderer, not the window's, and
-saying otherwise would be a false claim about verification.
 
 ## Proof protocol
 
-Two lanes in this campaign fabricated completion reports. So:
+Two lanes in the last campaign fabricated completion reports. So:
 
-1. End the report with verbatim `git log --oneline 529ec80..HEAD` and
-   `git diff --stat 529ec80..HEAD`.
-2. Every claimed commit resolves under `git cat-file -e`.
-3. Every claimed test is named from captured test-binary output.
-4. Gate tails pasted with exit statuses, not summarized.
-5. Say plainly which rows are landed, which are parked for design, and which are
-   blocked on a seam that does not exist — with the signature you would need. **A
-   smaller true report beats a larger false one.**
-
-## Out of scope
-
-Any change to `core/`, `app/`, `git/`, `tui/`, `web/` or `cli/`. The inline three-way
-merge editor. A window presentation for the rebase-todo plan. W7's stash/tag/reflog
-family. New visual language: this lane closes a capability gap in the existing
-design, and an aesthetics pass is its own branch (`feat/ux-aesthetics-pass` in the
-overnight notes).
+1. End with verbatim `git log --oneline <base>..HEAD` and
+   `git diff --stat <base>..HEAD`.
+2. Name every claimed test from captured test output, and paste the gate
+   tails with exit statuses.
+3. Attach every shot path, the scratch-repo script that produced it, and one
+   sentence on what each shot shows.
+4. Paste `docs/features.md`'s gui-column dash count before and after.
+5. Say plainly which rows landed, which are parked for design, and which are
+   blocked on a seam that does not exist, with the signature you would need.
+   **A smaller true report beats a larger false one.**
+6. List where the agent tooling (`./dev verify`, the skills, the feature map)
+   slowed you down or was wrong.
 
 ## Dispatch text
 
 > You are the desktop pickup lane for gitten. Read
-> `plans/005-desktop-picks-up-the-campaign.md` in full, then `AGENTS.md`,
-> `docs/clients.md` and `plans/001-tui-lazygit-parity-swarm.md`. Work only in
-> `.worktrees/desktop-pickup` on `feat/desktop-pickup`, based on 529ec80. You may
-> change `shell/` only: if a row needs anything outside it, record the contract you
-> would need and move on. Slice 1's inventory (`docs/desktop-gaps.md`, generated from
-> the command registry) comes first and is committed before any feature work. Add
-> headless `gitten-shell` tests for every dispatch arm you add. Never push, never
-> touch another worktree, and never open the window — hand over the command and a
-> checklist instead. Finish with the plan's proof protocol.
+> `plans/005-desktop-picks-up-the-campaign.md` in full, then what it tells you
+> to read. Work in your own worktree on `feat/desktop-pickup`, based where
+> the plan says. Change `gui/` only. If a row needs anything outside it,
+> record the contract you would need and move on. Slice 0 lands and is
+> committed before any other slice. Every dispatch arm gets a headless test,
+> and every surface gets a `./dev verify` shot you have looked at. Never open
+> the window, and never push unless asked. Finish with the plan's proof
+> protocol.

@@ -82,9 +82,9 @@ The exceptions are honest and few, and they are exceptions rather than a
 pattern. `./dev bundle` is `sips` and `iconutil` and will never be anything else;
 an `.app` is a macOS artifact and the Linux equivalent is a different script
 nobody has asked for. The traffic lights, the application menu and the
-appless-process quit in the GPUI notes below are macOS platform facts, not layout
-choices — a Linux window has its own and GPUI hands them over. Neither is a
-licence for a third.
+appless-process quit in [docs/gpui-notes.md](docs/gpui-notes.md) are macOS
+platform facts, not layout choices — a Linux window has its own and GPUI hands
+them over. Neither is a licence for a third.
 
 Windows is not a target and not a promise.
 
@@ -126,140 +126,22 @@ algorithm, which makes `trait Differ` decoration and rule 1 false for the most
 important thing this app does. Two processes for a whole diff however many files:
 one `git diff --raw`, one `git cat-file --batch`.
 
-## Diffs
+## Read before you touch it
 
-Histogram — not Myers. Histogram anchors on lines appearing exactly once, so
-function signatures become anchors and a moved block reads as a move instead of
-dissolving into line-soup. Git defaults to Myers. We deliberately don't.
+The rules below this file's philosophy live beside the code they govern, and
+each has already cost a day once. Read the row before the change, not after.
 
-Diffing is a `trait Differ` and the algorithms are written out in `core`, not
-pulled in — `core` has no dependencies and that is the rule, not housekeeping.
-Histogram, patience and Myers are the first three; semantic and language-aware
-differs arrive as extensions. The view never calls a differ directly, and an
-implementation returns only the edit script: line numbers, context and hunk
-headers are shared.
+| touching | read first |
+|---|---|
+| anything in `gui/` | [docs/gpui-notes.md](docs/gpui-notes.md), then check it with `./dev verify` ([docs/agent-verify.md](docs/agent-verify.md)) |
+| a differ, `align`, wrapping, a layout, a diff view | [docs/diff-rules.md](docs/diff-rules.md) |
+| the commit graph | [docs/commit-graph.md](docs/commit-graph.md) — the gutter is capped at 12 lanes, hard |
+| a command or a key | [docs/features.md](docs/features.md): every command, its keys, and the file in each client that answers it |
+| colour, a surface, contrast | [docs/theming.md](docs/theming.md) |
+| a new seam | [docs/extending.md](docs/extending.md) |
 
-**Check a differ against git, don't argue about it.** `diffcheck` compares
-changed-line counts *and every hunk position* against six git invocations over
-four repositories. Three bugs so far were invisible in the totals: two showed up
-in the per-file deltas, and the third only in the positions — identical counts,
-hunks in places git does not put them. Compare the positions.
-
-Two things in histogram are wrong in the plausible direction, so read them before
-touching them: a run is scored by its **rarest** line, not its most common one,
-and the threshold **tightens** as the search runs. Getting either backwards costs
-hundreds of spurious changed lines and still looks like a working diff.
-
-Both algorithms are quadratic in the number of differing lines in the worst case.
-Bound them and degrade to "this region was replaced"; a line-for-line pairing of a
-generated file is not worth a visible pause and nobody was reading it. Recurse on
-an explicit stack — a file whose every anchor peels off one line is as deep as it
-is long, and generated code has that shape.
-
-**Everything except the edit script is shared.** Whitespace normalisation, the
-indent-heuristic slide, hunk assembly and move detection all live beside the trait
-and run for every implementation, including one an extension compiles in. A
-`Differ` decides which lines correspond and nothing else.
-
-Ignoring whitespace is an **equivalence relation, not an algorithm** — normalise
-per line, length-preserving, and the script still addresses the original lines
-while the hunks show the real text. That is what stops `histogram-ignore-ws` from
-having to exist.
-
-A **moved** block is deleted here and added there, and it is the one thing in a
-diff a reader may skip. Flag it beside `kind`, never as a fourth `LineKind`: it is
-still an addition or a removal, and `align`, `replace_pairs` and the adds/dels
-counts must not learn about it. Require three lines — two matching lines are a
-coincidence and `}` is everywhere.
-
-**Port git's heuristics; don't approximate them.** The indent heuristic's weights
-are xdiff's because an approximation produces boundaries no test can call right.
-Its one trap: a position's indentation is compared by *sign*, not magnitude.
-
-**Two contrast floors, because reading and glancing are different.** `min_contrast`
-3.5 for token text, `min_furniture` 3.0 for line numbers and hunk coordinates —
-resolved through the same `readable` against the same `Surface`, because a single
-literal drawn on five row backgrounds measured 2.05:1 on context and 1.60:1 on a
-moved line. And a *hairline* has no floor at all: `chrome.border` and `diff.rule`
-exist because nothing in a near-black palette is more than ~1.2:1 from anything
-else, so a tint cannot carry an edge and one pixel can.
-
-**Fence a code block; never indent one.** The renderer knows fences and nothing
-else, so a four-space block is prose — emphasis, links and list markers all get
-interpreted inside it. `#` was the worst of it: a `# comment` trailing an
-indented command read as an `<h1>` until `heading_level` started counting the
-indent, which is CommonMark's rule and now shared by the block pass and the token
-pass. Applies to this file too.
-
-Intraline highlighting is a **second pass**: line diff first, then re-diff only the
-changed pairs at word level. Words, not characters — char diffs on code are
-confetti. Never diff untokenized text; it degrades badly.
-
-**Which removal pairs with which addition is decided once, in `core::align`.** The
-intraline pass and the side-by-side layout both read it. Pair differently in a
-renderer and you draw a removal beside an addition whose changed words were
-computed against another line — highlighting that corresponds to nothing on
-screen.
-
-## Layouts
-
-Unified and side-by-side are two entries in a registry, not two branches of a
-`render`. A `Layout` is a name and a closure that builds a set of `Rows`; `s`
-cycles them and `[diff] layout` picks the one to open in. The registry is
-shell-side because a `Rows` implementation returns a UI element; the *name* is on
-`Host`, because a name is data.
-
-Adding a presentation must need no edit to the existing ones. `SplitRows` needed
-no new trait, no new argument and no change to `TextRows` — that is the only test
-of a seam that counts. A registered layout appears in the title-bar dropdown
-without being told to; if a new seam needs a control written for it by hand, the
-seam is shaped wrong.
-
-Cache diffs by blob OID. They never change. Acquisition yields both OIDs for
-exactly this reason; the cache lives in `core::differ`.
-
-## Wrapping
-
-**A wrapped line is more rows, never a taller one.** `uniform_list` is the only
-reason 714k rows scroll, and it needs every row the same height. So a wrap returns
-byte ranges into a line and the line stays one line — because the edit script, the
-hunk numbers, `replace_pairs`, `align`, the spans and the tokens all address
-lines, and splitting one in two before those ran pairs a removal with the wrong
-addition.
-
-Two things are wrong in the plausible direction. **Word wrap searches backwards
-from the column**, so the row is never wider than the budget; forwards overflows
-by however long the next word is and looks right on prose. And **the budget is per
-line, not per diff** — a bullet, an indent and an 18px heading each cost
-characters, and one number for the whole diff is what makes a presentation write
-its own wrap.
-
-**A grid is not prose, so it is not broken — it is laid out again.** A Markdown
-table wider than the window has its columns *squeezed* and its cells wrapped
-inside them, at reflow, because the width is the one part of a table's layout the
-load pass cannot know. Breaking a table row at a column instead is the obvious
-thing and it shears the grid: the second half of row three lands under the first
-half of row four, in a column that means something else. Squeezing is
-water-filling and not proportional — a column that already fits keeps what it
-wants, and the paragraph beside it gives — and it has a floor: below one character
-a column there is nothing honest to draw, so the table is left whole and scrolled
-to. `core::markdown::flow_table` does it and `wrap::Budget::At` is how the rows it
-decided survive the wrap.
-
-And the rule *between* two rows of that table is **pixels, not glyphs**. Every
-horizontal line a table has as text is a line of the file — the `|---|` separator,
-redrawn — so an inner rule drawn the same way is a row of the list that no line
-produced, with a blank gutter the numbers either side have to skip. A row count is
-not a presentation's to change, so anything between two rows is a hairline: 1px,
-as wide as the grid and no wider, under the *last* sub-row of a row so a squeezed
-cell keeps its sentence.
-
-`off` is an entry in the registry, not a flag beside one — the pickers are a pure
-function of a registry, so that is what puts it in the menu for free. Unlike the
-layouts this registry *is* on `Host`: a break point is a property of text, so
-`core` can hold the implementations, and what the frontend supplies is the column
-count. Everything else is shared — the range partition, the validation, the flat
-table — so a `Wrap` decides where a line breaks and nothing else.
+`./dev lint` holds the rules here that a grep can check, and runs before every
+commit.
 
 ## Building
 
@@ -274,6 +156,10 @@ table — so a `Wrap` decides where a line breaks and nothing else.
 ./dev dump    commits ~/src 600     one frame on stdout, timing on stderr.
                                     COLS, ROWS, LAYOUT, WRAP, THEME, AT, FRAMES
 ./dev check                         everything headless
+./dev verify -s 'shot x' -- diff .  the window, headless: driven, photographed,
+                                    and no focus taken — docs/agent-verify.md
+./dev lint                          the rules here that a grep can hold
+./dev features                      regenerate docs/features.md, the command map
 ./dev config > gitten.toml           a complete, correct starting file
 ./dev bundle                        target/gitten.app — icon, name, a real app
 
@@ -322,6 +208,14 @@ the keyboard. Say it's ready and
 hand over the command. The terminal frontend's `dump` example is the exception
 and exists for it — a frame on stdout interrupts nobody, so look at a colour or
 a glyph there rather than asking someone to open something.
+
+**`./dev verify` is the window's `dump`, and it is how a change to the window
+is checked before anyone else looks at it.** The real launch, on GPUI's test
+platform with the offscreen renderer: steps in, PNGs and state out, and no
+window anywhere for focus to go to. A desktop change is not done when it
+compiles; it is done when a shot of it says so. What the run cannot tell you —
+timing, IME, the platform's own chrome — is in `docs/agent-verify.md`; say so
+rather than claiming it.
 
 **A window's state is reproducible from the environment, because a hand is not.**
 `GITTEN_QA_GEOM=1280x800`, `GITTEN_QA_VIEW=history`, `GITTEN_QA_DIALOG=commands`
@@ -383,148 +277,6 @@ lanes) and widens cmux (19 -> 73). Correctness, not compactness.
 **Never `read_to_string` anything from git.** Commit metadata is not guaranteed
 UTF-8 and real history carries Latin-1 author names; `git/git` panics it outright.
 Read bytes and `String::from_utf8_lossy`. Never fail to show a repo over one bad byte.
-
-## The graph gutter is capped
-
-12 lanes, hard. git/git runs 280 concurrent lanes, which is a 3,920px gutter that
-pushes the commit text clean off the screen. Lanes past the cap collapse onto the
-last column in a dim grey so the overflow is visible rather than silently misdrawn.
-Nobody reads past a dozen lanes; git's own `--graph` is unreadable well before that.
-
-## GPUI notes
-
-Interactivity requires identity. `.id()` before `.overflow_y_scroll()`, clicks,
-hover, drag — those methods live on `StatefulInteractiveElement` and there is no
-way in without an id.
-
-`uniform_list` for anything long. It builds only visible rows and brings its own
-scrolling, so don't wrap it in another scroll container. To scroll a *whole row*
-sideways, use its own `with_horizontal_sizing_behavior(Unconstrained)`, make rows
-`flex_none` (anything `overflow_hidden` clips instead of scrolling), **and** point
-it at the widest row with `with_width_from_item(Some(i))`. That last one is the
-trap: the list measures exactly ONE row to decide its scrollable width and
-defaults to row 0, so a short first row means nothing scrolls no matter how long
-the rest are. Compute the widest index at load.
-
-**A gutter that stays put is not that, though — it is the view's own offset.** The
-list scrolls a row, and a row is the line numbers *and* the text; nothing outside
-it can hold one of them still. So a diff row is exactly as wide as the viewport,
-the furniture is drawn first, and the text goes in a clipping window inside the
-row with a negative margin on it — which is `Pen::scroll` written in pixels, and
-the same reason: the tokens and the intraline spans address the *line*, so
-slicing the string instead pairs styling with the wrong bytes. What that costs is
-the wheel, the bound and the scrollbar; `gpui_component`'s `ScrollbarHandle` is a
-public trait, so the bar is four methods over your own `Cell` and it drags the
-thumb for you. What it buys, beyond the gutter: no `with_width_from_item`, so the
-list stops shaping a 2000-character line every frame to size a scroll nothing
-uses.
-
-**A list that scrolls one axis will happily scroll it with the other axis's
-delta.** `uniform_list` leaves `overflow.x` visible, and `div`'s scroll handler
-reads that as permission: `Overflow::Scroll if !restrict_scroll_to_axis &&
-overflow.x != Scroll => delta.x`. So a sideways flick scrolls the rows *down* —
-and with the text panning from the same event, diagonally. Whoever owns the other
-axis has to take the event away, and `on_scroll_wheel` cannot: it is bubble-phase
-and the list is a child, so it has already run. Register on the window in the
-**capture** phase, `stop_propagation` when the gesture is horizontal, and lock the
-axis for the whole gesture with `gpui::OngoingScroll` — the same lock `div` uses.
-Deciding per event is a coin flip fifty times a second, which is the drift you
-feel rather than see.
-
-**A row's background is the row's width, so give every row `min_w_full`.** A bg
-that stops after the last character is a ragged margin down a wall of additions;
-Bitbucket, GitHub and git's own pager all run the colour to the edge. `min_w_full`
-is what does it, because `uniform_list` lays each visible row out as its own root
-against an available width of *the viewport plus however far it is scrolled
-horizontally* — so 100% means "to the right edge of the window, wherever the
-window is scrolled to" and the fill follows the scroll for nothing. A *minimum*,
-so a long line keeps the width there is to scroll to; and it does not disturb
-`with_width_from_item`, whose one measurement runs against `MaxContent`, where a
-percentage minimum has no parent width to resolve against and drops out. A row
-that draws columns rather than one run of text (a side-by-side pair) gives them
-`flex_1` and `min_w(0)` instead: two halves and a rule come out at exactly the
-row's width however the window is dragged, and without the `min_w` a flex item is
-never narrower than its content, so one long line pushes the second column off
-the screen.
-
-Closing the last window does not end the process; macOS keeps appless processes
-alive. `cx.on_window_closed` + `cx.quit()`. Cmd-Q is separate and equally manual:
-no application menu exists, so register the action, bind the key, and set a menu
-(`on_action` + `bind_keys` + `set_menus`).
-
-**The window has no titlebar of its own.** `WindowOptions::default()` leaves
-`appears_transparent: false`, which is an opaque system titlebar — titled with the
-executable's name, because `title` is `None` — stacked on whatever strip the app
-draws itself. Two title bars. So: transparent, set the title anyway (Mission
-Control and the Window menu read it), and `traffic_light_position` at `(10, 10)`,
-because macOS uses that inset above *and* below the 12px button to size the band
-and 32 is what comes out. Leave `app_owns_titlebar_drag` false and the platform
-still moves the window from the empty part of the strip.
-
-**Another library's theme is not ours.** `gpui_component::init` sets its theme to
-*Light*, and the two scrollbars are the only widgets from it this app uses — so
-they painted a light track and an accent thumb over a near-black diff until
-something pushed our palette at them. Two writes per colour, because it reads the
-track off `ThemeColor` and the thumb off `ThemeTokens`, and `Theme::sync_base` is
-what actually reaches the layer that paints: setting the fields alone does
-nothing. `config::sync_widgets`, on startup and on every reload.
-
-**A column of numbers is right-aligned.** Line numbers were `w(52).child(n)`,
-which puts the units digit of `9` and of `1234` four characters apart — the one
-thing the eye does with that column is run down it. `justify_end` and a pad.
-
-A bare binary is not an `.app` bundle, so the window opens behind everything,
-the menu bar is titled with the executable's name and there is no icon.
-`cx.activate(true)` is the dev fix for the first of those; `./dev bundle` is the
-answer to all three. The mark is `gui/assets/icon.svg` — three lanes of a
-commit graph weaving past each other, which is what the word means — and the
-iconset is re-rendered from the vector at every size rather than downscaled from
-one PNG, because at 16 and 32 pixels that is the whole legibility of it.
-
-Custom drawing is `canvas()` + `PathBuilder` + `window.paint_path`. Keep it
-per-row where the geometry allows and it virtualizes with the list for free.
-
-**A view cannot know its own size during `render`.** It is handed a box by
-whatever assembled it, and that happens after. A zero-height `canvas` reports the
-box during paint, so anything sized by it lands on the frame *after* — which is
-correct and one frame late, and is what wrapping runs on. Reaching for
-`window.viewport_size()` instead is the shortcut, and it is a view assuming it
-owns the window: right until there are panes.
-
-**Anything that floats needs `deferred`.** Siblings paint in order, so a dropdown
-overflowing the *first* child of a column is painted under the second — visible
-nowhere, and it looks like the element was never built. `gpui::deferred(child)`
-keeps the layout where it is and moves the paint after every ancestor.
-`.occlude()` on top of that, or the rows underneath take the clicks: hit-testing
-is paint order too, and an absolutely positioned child does not claim the space it
-covers.
-
-**An element's identity is its path, and unnamed ancestors are not in it.** Two
-controls whose inner elements are both `.id("list")` are the *same* element, so
-one drives the other's hover and click state. Give the wrapper an id, or make the
-inner ones unique.
-
-**Read the host on the render path, never a captured clone.** `DevShell` held an
-`Rc<Host>` from startup, so the window chrome and the font for the whole window
-silently did not hot-reload while every view inside them did. `config::host(cx)`
-per frame is a refcount bump.
-
-**Five traps, none of them visible in a screenshot.** A `flex_none()` after
-`flex_1()` zeroes the growth — split halves are `flex_1` **and** `min_w(0)`, and
-it is the pair that keeps them from shearing, not either one. A `subscribe`
-callback runs **inside an update of the subscriber**, so a callback that updates
-its own subscriber re-enters it and aborts the process (`entity_map.rs`, "cannot
-update X while it is already being updated"); reach for `cx.defer` past the
-effect cycle instead. The same shape bites through focus: a floating field that
-focuses itself from its own `render` never tells the frame loop, so on the frame
-it disappears nothing takes the keyboard back and the window answers no key at
-all for the rest of its life — `DevShell::reclaim_focus`, called from every path
-that moves the keyboard by name. A test module that does `use super::*` where
-`gpui` is also in scope shadows the builtin `#[test]` with gpui's `test` macro
-and recurses to the limit; import the names the test uses. And a graph curve's
-two halves each anchor on their **own** dot — `core::graph::Curve` says which one
-leaves and which reaches — so a fixture that mirrors one half to make the other
-tears at the row boundary.
 
 ## Don't
 
